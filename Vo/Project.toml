@@ -15,6 +15,8 @@ Tempus = "e6262be2-5787-4bdc-bc3f-4b5a3442fa30"
 TimeZones = "f269a46b-ccf7-5d73-abea-4c690281aa53"
 
 [weakdeps]
+GitHub = "bc5e4493-9b4d-5f90-b8aa-2b2bcaad7a26"
+JMAP = "40da3204-f0f7-47a6-9ee8-6f8207b67b8d"
 MSTeams = "730ab40b-c28c-4fcb-83ce-ff189233d76d"
 Signal = "0944c9af-6677-4ce2-950b-62b1fa25f333"
 Slack = "4d517630-ce0d-4555-8fa7-416d9f8f5684"
@@ -22,6 +24,8 @@ Telegram = "0f099131-46f3-42ed-8989-d9c7888465f9"
 
 [sources]
 Agentif = {path = "../Agentif"}
+GitHub = {path = "../../GitHub"}
+JMAP = {path = "../../JMAP"}
 LLMTools = {path = "../LLMTools"}
 LocalSearch = {url = "https://github.com/quinnj/LocalSearch.jl.git"}
 MSTeams = {url = "https://github.com/quinnj/MSTeams.jl.git"}
@@ -29,9 +33,11 @@ Mattermost = {url = "https://github.com/quinnj/Mattermost.jl.git"}
 Signal = {url = "https://github.com/quinnj/Signal.jl.git"}
 Slack = {url = "https://github.com/quinnj/Slack.jl.git"}
 Telegram = {url = "https://github.com/quinnj/Telegram.jl.git"}
-Tempus = {url = "https://github.com/JuliaServices/Tempus.jl.git", rev = "main"}
+Tempus = {rev = "main", url = "https://github.com/JuliaServices/Tempus.jl.git"}
 
 [extensions]
+VoGitHubExt = "GitHub"
+VoJMAPExt = "JMAP"
 VoMSTeamsExt = "MSTeams"
 VoMattermostExt = "Mattermost"
 VoSignalExt = "Signal"
@@ -40,6 +46,8 @@ VoTelegramExt = "Telegram"
 
 [compat]
 Agentif = "1"
+GitHub = "5"
+JMAP = "0.1.0"
 MSTeams = "0.1.0"
 Mattermost = "0.1.0"
 Signal = "0.1.0"
@@ -49,6 +57,8 @@ TimeZones = "1"
 julia = "1.10"
 
 [extras]
+GitHub = "bc5e4493-9b4d-5f90-b8aa-2b2bcaad7a26"
+JMAP = "40da3204-f0f7-47a6-9ee8-6f8207b67b8d"
 MSTeams = "730ab40b-c28c-4fcb-83ce-ff189233d76d"
 Mattermost = "c9a394b0-b131-4b99-aeb4-b011b7b7f934"
 Signal = "0944c9af-6677-4ce2-950b-62b1fa25f333"
@@ -57,4 +67,4 @@ Telegram = "0f099131-46f3-42ed-8989-d9c7888465f9"
 Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
 
 [targets]
-test = ["Test", "MSTeams", "Mattermost", "Signal", "Slack", "Telegram"]
+test = ["Test", "GitHub", "JMAP", "MSTeams", "Mattermost", "Signal", "Slack", "Telegram"]

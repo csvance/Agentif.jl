@@ -2,11 +2,111 @@ module ExtensionTests
 
 using Test
 using Agentif
+using GitHub
 using Mattermost
 using MSTeams
 using Signal
 using Slack
 using Vo
+
+@testset "VoGitHubExt event mapping" begin
+    ext = Base.get_extension(Vo, :VoGitHubExt)
+    @test ext !== nothing
+
+    source = ext.GitHubEventSource(; secret="test-secret", port=19876, app_id=12345, private_key_path="/tmp/fake.pem")
+    @test source.app_id == 12345
+    @test source.private_key_path == "/tmp/fake.pem"
+    event_types = Vo.get_event_types(source)
+    et_names = Set(et.name for et in event_types)
+
+    # One event type per webhook kind
+    @test "github_push" in et_names
+    @test "github_fork" in et_names
+    @test "github_ping" in et_names
+    @test "github_pull_request" in et_names
+    @test "github_issues" in et_names
+    @test "github_issue_comment" in et_names
+    @test "github_release" in et_names
+    @test "github_workflow_run" in et_names
+    @test "github_star" in et_names
+    @test length(event_types) == length(ext.GITHUB_WEBHOOK_KINDS)
+
+    # No default handlers (non-channel event source)
+    @test isempty(Vo.get_event_handlers(source))
+    @test isempty(Vo.get_channels(source))
+    @test isempty(Vo.get_tools(source))
+
+    # Event name is always per-kind (action is in event_content, not name)
+    ev_push = ext.GitHubWebhookEvent("push", "", Dict{String,Any}("ref" => "refs/heads/main"), "owner/repo", "alice")
+    @test Vo.get_name(ev_push) == "github_push"
+
+    ev_pr = ext.GitHubWebhookEvent("pull_request", "opened",
+        Dict{String,Any}("action" => "opened", "pull_request" => Dict{String,Any}(
+            "title" => "Add feature", "body" => "Description here",
+            "html_url" => "https://github.com/owner/repo/pull/42",
+            "number" => 42, "base" => Dict("ref" => "main"), "head" => Dict("ref" => "feature"),
+        )),
+        "owner/repo", "bob")
+    @test Vo.get_name(ev_pr) == "github_pull_request"
+
+    # Session key for PR events groups by PR number
+    @test Vo.get_session_key(ev_pr) == "github:owner/repo:pull_request:42"
+
+    # Session key for issue events
+    ev_issue = ext.GitHubWebhookEvent("issues", "opened",
+        Dict{String,Any}("action" => "opened", "issue" => Dict{String,Any}(
+            "title" => "Bug report", "number" => 7, "html_url" => "https://github.com/owner/repo/issues/7",
+        )),
+        "owner/repo", "carol")
+    @test Vo.get_session_key(ev_issue) == "github:owner/repo:issue:7"
+
+    # Session key for push events
+    @test Vo.get_session_key(ev_push) == "github:owner/repo:push:refs/heads/main"
+
+    # Event content formatting
+    content_pr = Vo.event_content(ev_pr)
+    @test occursin("owner/repo", content_pr)
+    @test occursin("Add feature", content_pr)
+    @test occursin("opened", content_pr)
+
+    content_push = Vo.event_content(ev_push)
+    @test occursin("push", content_push)
+    @test occursin("refs/heads/main", content_push)
+
+    # Push with commits
+    ev_push_commits = ext.GitHubWebhookEvent("push", "",
+        Dict{String,Any}(
+            "ref" => "refs/heads/main",
+            "commits" => [
+                Dict{String,Any}("id" => "abc1234567890", "message" => "Fix bug"),
+                Dict{String,Any}("id" => "def4567890123", "message" => "Update docs"),
+            ],
+        ),
+        "owner/repo", "dave")
+    content_commits = Vo.event_content(ev_push_commits)
+    @test occursin("abc1234", content_commits)
+    @test occursin("Fix bug", content_commits)
+    @test occursin("Commits (2)", content_commits)
+
+    # Issue comment event
+    ev_comment = ext.GitHubWebhookEvent("issue_comment", "created",
+        Dict{String,Any}("action" => "created",
+            "comment" => Dict{String,Any}("body" => "LGTM!", "html_url" => "https://github.com/owner/repo/issues/7#issuecomment-1"),
+            "issue" => Dict{String,Any}("title" => "Bug report", "number" => 7),
+        ),
+        "owner/repo", "eve")
+    @test Vo.get_session_key(ev_comment) == "github:owner/repo:issue:7"
+    content_comment = Vo.event_content(ev_comment)
+    @test occursin("LGTM!", content_comment)
+    @test occursin("Bug report", content_comment)
+
+    # Generic event fallback
+    ev_star = ext.GitHubWebhookEvent("star", "created", Dict{String,Any}("action" => "created"), "owner/repo", "fan")
+    @test Vo.get_name(ev_star) == "github_star"
+    content_star = Vo.event_content(ev_star)
+    @test occursin("star", content_star)
+    @test occursin("fan", content_star)
+end
 
 @testset "VoSlackExt event mapping" begin
     ext = Base.get_extension(Vo, :VoSlackExt)

@@ -1,10 +1,13 @@
+using JMAP
 using LLMOAuth
 using Slack
 using Telegram
 using Vo
 
+const VoJMAPExt = Base.get_extension(Vo, :VoJMAPExt)
 const VoSlackExt = Base.get_extension(Vo, :VoSlackExt)
 const VoTelegramExt = Base.get_extension(Vo, :VoTelegramExt)
+VoJMAPExt === nothing && error("VoJMAPExt did not load; ensure JMAP is available in this project")
 VoSlackExt === nothing && error("VoSlackExt did not load; ensure Slack is available in this project")
 VoTelegramExt === nothing && error("VoTelegramExt did not load; ensure Telegram is available in this project")
 
@@ -19,6 +22,7 @@ base_dir = get(ENV, "VO_BASE_DIR", abspath(joinpath(@__DIR__, "..", "..")))
 db_path = joinpath(@__DIR__, "vo.sqlite")
 
 sources = Vo.EventSource[
+    VoJMAPExt.FastmailEventSource(),
     VoSlackExt.SlackEventSource(),
     VoTelegramExt.TelegramEventSource(),
 ]
