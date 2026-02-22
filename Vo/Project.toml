@@ -25,6 +25,7 @@ Telegram = "0f099131-46f3-42ed-8989-d9c7888465f9"
 [sources]
 Agentif = {path = "../Agentif"}
 GitHub = {path = "../../GitHub"}
+HTTP = {url = "https://github.com/JuliaWeb/HTTP.jl.git", rev = "master"}
 JMAP = {path = "../../JMAP"}
 LLMTools = {path = "../LLMTools"}
 LocalSearch = {url = "https://github.com/quinnj/LocalSearch.jl.git"}

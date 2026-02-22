@@ -6,7 +6,8 @@ Telegram = "0f099131-46f3-42ed-8989-d9c7888465f9"
 Vo = "46916a23-5c37-4b23-b62b-45b422578c04"
 
 [sources]
-JMAP = {url = "https://github.com/quinnj/JMAP.jl.git"}
+HTTP = {url = "https://github.com/JuliaWeb/HTTP.jl.git", rev = "master"}
+JMAP = {path = "../../../JMAP"}
 LLMOAuth = {path = "../../LLMOAuth"}
 Slack = {url = "https://github.com/quinnj/Slack.jl.git"}
 Telegram = {url = "https://github.com/quinnj/Telegram.jl.git"}

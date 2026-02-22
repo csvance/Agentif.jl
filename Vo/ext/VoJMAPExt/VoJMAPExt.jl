@@ -1,26 +1,12 @@
 module VoJMAPExt
 
 using JMAP
-using JMAP: HTTP, JSON
 import Agentif
 import Vo
 
 export FastmailEventSource
 
 # ─── Helpers ───
-
-function _to_snake_case(s::AbstractString)
-    buf = IOBuffer()
-    for (i, c) in enumerate(s)
-        if isuppercase(c)
-            i > 1 && write(buf, '_')
-            write(buf, lowercase(c))
-        else
-            write(buf, c)
-        end
-    end
-    return String(take!(buf))
-end
 
 function _fmt_addrs(addrs)
     addrs === nothing && return ""
@@ -37,38 +23,47 @@ end
 
 # ─── Event ───
 
-struct JMAPStateChangeEvent <: Vo.Event
-    kind::String                    # "Email", "EmailDelivery", "Mailbox", etc.
+struct JMAPNewEmailEvent <: Vo.Event
     account_id::String
-    new_state::String
-    created::Vector{String}
-    updated::Vector{String}
-    destroyed::Vector{String}
+    email_id::String
+    thread_id::Union{Nothing, String}
+    mailbox_ids::Vector{String}
+    from::String
+    subject::String
+    received_at::String
+    preview::String
+    unread::Bool
+    has_attachment::Bool
 end
 
-Vo.get_name(ev::JMAPStateChangeEvent) = "jmap_$(_to_snake_case(ev.kind))"
-Vo.get_session_key(ev::JMAPStateChangeEvent) = "jmap:$(ev.account_id):$(ev.kind)"
+Vo.get_name(::JMAPNewEmailEvent) = "jmap_new_email"
+Vo.get_session_key(ev::JMAPNewEmailEvent) = "jmap:$(ev.account_id):thread:$(something(ev.thread_id, ev.email_id))"
 
-function Vo.event_content(ev::JMAPStateChangeEvent)
-    lines = String["[JMAP $(ev.kind) state change for account $(ev.account_id)]"]
-    !isempty(ev.created) && push!(lines, "Created ($(length(ev.created))): $(join(first(ev.created, 10), ", "))$(length(ev.created) > 10 ? "..." : "")")
-    !isempty(ev.updated) && push!(lines, "Updated ($(length(ev.updated))): $(join(first(ev.updated, 10), ", "))$(length(ev.updated) > 10 ? "..." : "")")
-    !isempty(ev.destroyed) && push!(lines, "Destroyed ($(length(ev.destroyed))): $(join(first(ev.destroyed, 10), ", "))$(length(ev.destroyed) > 10 ? "..." : "")")
-    isempty(ev.created) && isempty(ev.updated) && isempty(ev.destroyed) && push!(lines, "State updated to: $(ev.new_state)")
+function Vo.event_content(ev::JMAPNewEmailEvent)
+    lines = String[
+        "[JMAP new email arrived]",
+        "Account: $(ev.account_id)",
+        "Email ID: $(ev.email_id)",
+        "Thread ID: $(something(ev.thread_id, "(none)"))",
+        "From: $(ev.from)",
+        "Subject: $(ev.subject)",
+        "Received: $(ev.received_at)",
+    ]
+    !isempty(ev.mailbox_ids) && push!(lines, "Mailbox IDs: $(join(ev.mailbox_ids, ", "))")
+    flags = String[]
+    ev.unread && push!(flags, "UNREAD")
+    ev.has_attachment && push!(flags, "ATTACHMENT")
+    !isempty(flags) && push!(lines, "Flags: $(join(flags, ", "))")
+    !isempty(ev.preview) && push!(lines, "Preview: $(ev.preview)")
     return join(lines, "\n")
 end
 
 # ─── Event types ───
 
-const JMAP_STATE_CHANGE_TYPES = [
-    "Email", "EmailDelivery", "Mailbox", "Thread",
-    "Identity", "EmailSubmission", "VacationResponse",
-]
-
-const ALL_EVENT_TYPES = [
-    Vo.EventType("jmap_$(_to_snake_case(t))", "JMAP $t state change")
-    for t in JMAP_STATE_CHANGE_TYPES
-]
+const NEW_EMAIL_EVENT_TYPE = Vo.EventType(
+    "jmap_new_email",
+    "A new email arrived in the inbox",
+)
 
 # ─── Session holder (set during start!) ───
 
@@ -88,31 +83,162 @@ Base.@kwdef mutable struct FastmailEventSource <: Vo.EventSource
     types::String = "*"
     ping::Int = 30
     _states::Dict{String, Dict{String, String}} = Dict{String, Dict{String, String}}()
+    _inbox_mailbox_ids::Dict{String, Set{String}} = Dict{String, Set{String}}()
+    _lock::ReentrantLock = ReentrantLock()
     _session::Union{Nothing, JMAP.Session} = nothing
 end
 
-Vo.get_event_types(::FastmailEventSource) = ALL_EVENT_TYPES
+Vo.get_event_types(::FastmailEventSource) = Vo.EventType[NEW_EMAIL_EVENT_TYPE]
 Vo.get_channels(::FastmailEventSource) = Agentif.AbstractChannel[]
 Vo.get_event_handlers(::FastmailEventSource) = Vo.EventHandler[]
 Vo.get_tools(::FastmailEventSource) = JMAP_TOOLS
 
 # ─── Changes dispatch ───
 
-const CHANGES_FUNCTIONS = Dict{String, Function}(
-    "Email" => JMAP.email_changes,
-    "Mailbox" => JMAP.mailbox_changes,
-    "Thread" => JMAP.thread_changes,
-)
+const EMAIL_CHANGES_FN = Ref{Function}(JMAP.email_changes)
+const FETCH_EMAILS_FN = Ref{Function}(JMAP.fetch_emails)
+const LIST_MAILBOXES_FN = Ref{Function}(JMAP.list_mailboxes)
 
-function _fetch_changes(session::JMAP.Session, type_name::String, since_state::String, account_id::String)
-    changes_fn = get(CHANGES_FUNCTIONS, type_name, nothing)
-    changes_fn === nothing && return (String[], String[], String[], since_state)
+function _mailbox_ids(email::JMAP.Email)
+    ids = String[]
+    for (mailbox_id, present) in email.mailboxIds
+        present && push!(ids, mailbox_id)
+    end
+    return ids
+end
+
+function _refresh_mailbox_cache!(source::FastmailEventSource, session::JMAP.Session, account_id::String)
     try
-        resp = changes_fn(session, since_state; account_id=account_id)
-        return (resp.created, resp.updated, resp.destroyed, resp.newState)
+        mailboxes = LIST_MAILBOXES_FN[](session; account_id=account_id)
+        inbox_ids = Set{String}()
+        for mb in mailboxes
+            role = something(mb.role, "")
+            role == "inbox" && push!(inbox_ids, mb.id)
+        end
+        lock(source._lock) do
+            source._inbox_mailbox_ids[account_id] = inbox_ids
+        end
+        isempty(inbox_ids) && @warn "VoJMAPExt: no inbox mailbox role found; new-email events will be skipped until resolved" account=account_id
     catch e
-        @warn "VoJMAPExt: failed to fetch $type_name/changes" exception=(e, catch_backtrace())
-        return (String[], String[], String[], since_state)
+        @warn "VoJMAPExt: failed to refresh mailbox cache" account=account_id exception=(e, catch_backtrace())
+    end
+    return
+end
+
+function _ensure_inbox_mailboxes!(source::FastmailEventSource, session::JMAP.Session, account_id::String)
+    has_inbox = lock(source._lock) do
+        haskey(source._inbox_mailbox_ids, account_id) && !isempty(source._inbox_mailbox_ids[account_id])
+    end
+    has_inbox && return
+    _refresh_mailbox_cache!(source, session, account_id)
+    return
+end
+
+function _is_in_inbox(source::FastmailEventSource, account_id::String, mailbox_ids::Vector{String})
+    lock(source._lock) do
+        inbox_ids = get(() -> Set{String}(), source._inbox_mailbox_ids, account_id)
+        isempty(inbox_ids) && return false
+        for mailbox_id in mailbox_ids
+            mailbox_id in inbox_ids && return true
+        end
+        return false
+    end
+end
+
+function _dedupe_ids(ids::Vector{String})
+    seen = Set{String}()
+    out = String[]
+    for id in ids
+        id in seen && continue
+        push!(seen, id)
+        push!(out, id)
+    end
+    return out
+end
+
+function _fetch_created_email_ids(session::JMAP.Session, since_state::String, account_id::String)
+    created = String[]
+    cursor = since_state
+    final_state = since_state
+    max_pages = 20
+
+    for page in 1:max_pages
+        resp = EMAIL_CHANGES_FN[](session, cursor; account_id=account_id)
+        append!(created, resp.created)
+        final_state = resp.newState
+        cursor = resp.newState
+        !resp.hasMoreChanges && return _dedupe_ids(created), final_state
+        page == max_pages && @warn "VoJMAPExt: reached max Email/changes pages while collecting created IDs" account=account_id pages=max_pages
+    end
+
+    return _dedupe_ids(created), final_state
+end
+
+function _fetch_created_emails(session::JMAP.Session, account_id::String, ids::Vector{String})
+    isempty(ids) && return JMAP.Email[]
+    return FETCH_EMAILS_FN[](session, ids;
+        account_id=account_id,
+        properties=["id", "threadId", "mailboxIds", "keywords", "from", "subject", "receivedAt", "preview", "hasAttachment"])
+end
+
+function _handle_state_change!(source::FastmailEventSource, assistant::Vo.AgentAssistant, sc::JMAP.StateChange)
+    session = source._session
+    session === nothing && return
+
+    for (account_id, type_states) in sc.changed
+        email_state = get(() -> "", type_states, "Email")
+        isempty(email_state) && continue
+
+        account_states = get!(() -> Dict{String,String}(), source._states, account_id)
+        old_state = get(() -> "", account_states, "Email")
+        email_state == old_state && continue
+
+        # First observation is baseline seeding, not an event.
+        if isempty(old_state)
+            account_states["Email"] = email_state
+            continue
+        end
+
+        created_ids, resolved_state = try
+            _fetch_created_email_ids(session, old_state, account_id)
+        catch e
+            @warn "VoJMAPExt: failed to fetch Email/changes" account=account_id exception=(e, catch_backtrace())
+            account_states["Email"] = email_state
+            continue
+        end
+
+        account_states["Email"] = resolved_state
+        isempty(created_ids) && continue
+
+        _ensure_inbox_mailboxes!(source, session, account_id)
+        emails = try
+            _fetch_created_emails(session, account_id, created_ids)
+        catch e
+            @warn "VoJMAPExt: failed to fetch created email details" account=account_id count=length(created_ids) exception=(e, catch_backtrace())
+            JMAP.Email[]
+        end
+
+        for email in emails
+            mailbox_ids = _mailbox_ids(email)
+            _is_in_inbox(source, account_id, mailbox_ids) || continue
+
+            from_str = _fmt_addrs(email.from)
+            isempty(from_str) && (from_str = "(unknown)")
+            ev = JMAPNewEmailEvent(
+                account_id,
+                email.id,
+                email.threadId,
+                mailbox_ids,
+                from_str,
+                something(email.subject, "(no subject)"),
+                something(email.receivedAt, "(unknown)"),
+                something(email.preview, ""),
+                !haskey(email.keywords, "\$seen"),
+                email.hasAttachment === true,
+            )
+            @info "VoJMAPExt: new email arrived" account=account_id email_id=email.id thread_id=email.threadId
+            put!(assistant.event_queue, ev)
+        end
     end
 end
 
@@ -130,24 +256,7 @@ function _sse_loop(source::FastmailEventSource, assistant::Vo.AgentAssistant)
             @info "VoJMAPExt: connecting to SSE" types=source.types ping=source.ping
             JMAP.listen_events(session; types=source.types, ping=source.ping) do sc::JMAP.StateChange
                 backoff = 1.0  # reset on successful event
-                for (account_id, type_states) in sc.changed
-                    account_states = get!(() -> Dict{String,String}(), source._states, account_id)
-                    for (type_name, new_state) in type_states
-                        old_state = get(account_states, type_name, "")
-                        new_state == old_state && continue
-
-                        created, updated, destroyed, resolved_state = if !isempty(old_state)
-                            _fetch_changes(session, type_name, old_state, account_id)
-                        else
-                            (String[], String[], String[], new_state)
-                        end
-                        account_states[type_name] = resolved_state
-
-                        ev = JMAPStateChangeEvent(type_name, account_id, resolved_state, created, updated, destroyed)
-                        @info "VoJMAPExt: state change" type=type_name account=account_id created=length(created) updated=length(updated) destroyed=length(destroyed)
-                        put!(assistant.event_queue, ev)
-                    end
-                end
+                _handle_state_change!(source, assistant, sc)
             end
         catch e
             if e isa InterruptException
@@ -172,20 +281,18 @@ function _seed_initial_states!(source::FastmailEventSource)
     account_states = get!(() -> Dict{String,String}(), source._states, account_id)
 
     try
-        resp = JMAP.email_get(session; ids=String[])
+        resp = JMAP.email_get(session; account_id=account_id, ids=String[])
         account_states["Email"] = resp.state
     catch e
         @warn "VoJMAPExt: failed to seed Email state" exception=(e, catch_backtrace())
     end
 
-    try
-        resp = JMAP.mailbox_get(session)
-        account_states["Mailbox"] = resp.state
-    catch e
-        @warn "VoJMAPExt: failed to seed Mailbox state" exception=(e, catch_backtrace())
-    end
+    _refresh_mailbox_cache!(source, session, account_id)
 
-    @info "VoJMAPExt: seeded initial states" account=account_id types=collect(keys(account_states))
+    inbox_count = lock(source._lock) do
+        length(get(() -> Set{String}(), source._inbox_mailbox_ids, account_id))
+    end
+    @info "VoJMAPExt: seeded initial state" account=account_id email_state_seeded=haskey(account_states, "Email") inbox_mailbox_count=inbox_count
 end
 
 # ─── start! ───
@@ -203,6 +310,10 @@ function Vo.start!(source::FastmailEventSource, assistant::Vo.AgentAssistant)
 
     source._session = session
     JMAP_SESSION[] = session
+    lock(source._lock) do
+        empty!(source._states)
+        empty!(source._inbox_mailbox_ids)
+    end
 
     _seed_initial_states!(source)
 
@@ -210,7 +321,6 @@ function Vo.start!(source::FastmailEventSource, assistant::Vo.AgentAssistant)
         _sse_loop(source, assistant)
     end)
 end
-
 # ═══════════════════════════════════════════════════════════
 # Tools
 # ═══════════════════════════════════════════════════════════

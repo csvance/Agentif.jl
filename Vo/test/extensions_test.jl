@@ -3,6 +3,7 @@ module ExtensionTests
 using Test
 using Agentif
 using GitHub
+using JMAP
 using Mattermost
 using MSTeams
 using Signal
@@ -106,6 +107,140 @@ using Vo
     content_star = Vo.event_content(ev_star)
     @test occursin("star", content_star)
     @test occursin("fan", content_star)
+end
+
+@testset "VoJMAPExt new email events" begin
+    ext = Base.get_extension(Vo, :VoJMAPExt)
+    @test ext !== nothing
+
+    source = ext.FastmailEventSource(; token="test-token")
+    assistant = Vo.AgentAssistant(":memory:";
+        provider="openai-completions",
+        model_id="gpt-4o-mini",
+        apikey="test-key",
+    )
+
+    session = JMAP.Session("https://example.invalid")
+    session.mailAccountId = "acct-1"
+    source._session = session
+    source._inbox_mailbox_ids["acct-1"] = Set(["mb-inbox"])
+
+    function drain_events!()
+        while isready(assistant.event_queue)
+            take!(assistant.event_queue)
+        end
+    end
+
+    event_types = Vo.get_event_types(source)
+    @test length(event_types) == 1
+    @test event_types[1].name == "jmap_new_email"
+    @test occursin("inbox", lowercase(event_types[1].description))
+
+    original_email_changes_fn = ext.EMAIL_CHANGES_FN[]
+    original_fetch_emails_fn = ext.FETCH_EMAILS_FN[]
+    try
+        ext.EMAIL_CHANGES_FN[] = (_session, _since_state; account_id) -> JMAP.ChangesResponse(
+            accountId=account_id,
+            oldState="E1",
+            newState="E2",
+            hasMoreChanges=false,
+            created=["m1"],
+            updated=String[],
+            destroyed=String[],
+        )
+        ext.FETCH_EMAILS_FN[] = (_session, ids; account_id, properties) -> begin
+            @test ids == ["m1"]
+            @test account_id == "acct-1"
+            @test "mailboxIds" in properties
+            return JMAP.Email[
+                JMAP.Email(
+                    id="m1",
+                    threadId="t1",
+                    mailboxIds=Dict("mb-inbox" => true),
+                    keywords=Dict{String,Bool}(),
+                    from=[JMAP.EmailAddress(name="Alice", email="alice@example.com")],
+                    subject="Hello",
+                    receivedAt="2026-02-22T12:00:00Z",
+                    preview="Test preview",
+                ),
+            ]
+        end
+
+        # First observation seeds baseline and emits nothing.
+        sc_seed = JMAP.StateChange("StateChange", Dict("acct-1" => Dict("Email" => "E1")))
+        ext._handle_state_change!(source, assistant, sc_seed)
+        @test source._states["acct-1"]["Email"] == "E1"
+        @test !isready(assistant.event_queue)
+
+        # Email created in inbox emits one high-level new-email event.
+        sc_new = JMAP.StateChange("StateChange", Dict("acct-1" => Dict("Email" => "E2")))
+        ext._handle_state_change!(source, assistant, sc_new)
+        @test isready(assistant.event_queue)
+        ev = take!(assistant.event_queue)
+        @test ev isa ext.JMAPNewEmailEvent
+        @test Vo.get_name(ev) == "jmap_new_email"
+        @test ev.email_id == "m1"
+        @test ev.thread_id == "t1"
+        @test ev.unread
+        @test !ev.has_attachment
+        @test occursin("new email arrived", lowercase(Vo.event_content(ev)))
+
+        # Updates without creates do not emit events.
+        drain_events!()
+        ext.EMAIL_CHANGES_FN[] = (_session, _since_state; account_id) -> JMAP.ChangesResponse(
+            accountId=account_id,
+            oldState="E2",
+            newState="E3",
+            hasMoreChanges=false,
+            created=String[],
+            updated=["m1"],
+            destroyed=String[],
+        )
+        sc_update = JMAP.StateChange("StateChange", Dict("acct-1" => Dict("Email" => "E3")))
+        ext._handle_state_change!(source, assistant, sc_update)
+        @test source._states["acct-1"]["Email"] == "E3"
+        @test !isready(assistant.event_queue)
+
+        # Created email outside inbox is ignored.
+        ext.EMAIL_CHANGES_FN[] = (_session, _since_state; account_id) -> JMAP.ChangesResponse(
+            accountId=account_id,
+            oldState="E3",
+            newState="E4",
+            hasMoreChanges=false,
+            created=["m2"],
+            updated=String[],
+            destroyed=String[],
+        )
+        ext.FETCH_EMAILS_FN[] = (_session, ids; account_id, properties) -> begin
+            @test ids == ["m2"]
+            return JMAP.Email[
+                JMAP.Email(
+                    id="m2",
+                    threadId="t2",
+                    mailboxIds=Dict("mb-sent" => true),
+                    keywords=Dict("\$seen" => true),
+                    from=[JMAP.EmailAddress(name="Me", email="me@example.com")],
+                    subject="Sent message",
+                ),
+            ]
+        end
+        sc_non_inbox = JMAP.StateChange("StateChange", Dict("acct-1" => Dict("Email" => "E4")))
+        ext._handle_state_change!(source, assistant, sc_non_inbox)
+        @test source._states["acct-1"]["Email"] == "E4"
+        @test !isready(assistant.event_queue)
+
+        # If Email/changes fails, state still advances to avoid stale replay loops.
+        ext.EMAIL_CHANGES_FN[] = (_session, _since_state; account_id) -> error("boom for $account_id")
+        sc_error = JMAP.StateChange("StateChange", Dict("acct-1" => Dict("Email" => "E5")))
+        ext._handle_state_change!(source, assistant, sc_error)
+        @test source._states["acct-1"]["Email"] == "E5"
+        @test !isready(assistant.event_queue)
+    finally
+        ext.EMAIL_CHANGES_FN[] = original_email_changes_fn
+        ext.FETCH_EMAILS_FN[] = original_fetch_emails_fn
+    end
+
+    close(assistant.db)
 end
 
 @testset "VoSlackExt event mapping" begin
