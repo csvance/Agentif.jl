@@ -564,15 +564,15 @@ end
         @test msgs[cut] isa UserMessage
 
         # With keep_recent=10 tokens, candidate is near the end
-        # but if no UserMessage exists after the candidate, returns 0
+        # Valid cut points are UserMessage or AssistantMessage not preceded by
+        # an AssistantMessage with tool calls
         cut2 = Agentif.find_cut_point(msgs, 10)
-        @test cut2 == 0 || msgs[cut2] isa UserMessage
+        @test cut2 == 0 || msgs[cut2] isa UserMessage || msgs[cut2] isa AssistantMessage
 
         # With keep_recent very large, nothing to compact
         @test Agentif.find_cut_point(msgs, 100000) == 0
 
-        # Cut point must land on UserMessage
-        # If candidate is an AssistantMessage, walk forward to next UserMessage
+        # Cut point can land on UserMessage or AssistantMessage (at valid boundary)
         msgs2 = AgentMessage[
             UserMessage("a" ^ 100),
             AssistantMessage(; provider = "t", api = "t", model = "t"),
@@ -580,9 +580,9 @@ end
         ]
         Agentif.append_text!(msgs2[2], "x" ^ 100)
         # keep_recent=30 → walks back, candidate hits msg2 (AssistantMessage)
-        # walks forward → msg3 (UserMessage)
+        # msg2 is a valid cut point (not preceded by an assistant with tool calls)
         cut3 = Agentif.find_cut_point(msgs2, 30)
-        @test cut3 == 0 || msgs2[cut3] isa UserMessage
+        @test cut3 == 0 || msgs2[cut3] isa UserMessage || msgs2[cut3] isa AssistantMessage
     end
 
     @testset "format_messages_for_summary" begin
