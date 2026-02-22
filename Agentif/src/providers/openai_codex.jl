@@ -1,5 +1,6 @@
 using JSON
 using HTTP
+using ConcurrentUtilities: Pool, acquire, release
 
 const CODEX_BASE_URL = "https://chatgpt.com/backend-api"
 
@@ -185,9 +186,8 @@ function transform_request_body!(
             if item_type == "item_reference"
                 continue
             end
-            if haskey(item, "id")
-                delete!(item, "id")
-            end
+            # Keep "id" on function_call and message items (needed for prompt cache pairing)
+            # Only strip "id" from other item types (e.g. stale references)
             if item_type == "function_call"
                 call_id = get(item, "call_id", nothing)
                 call_id isa String && push!(function_call_ids, call_id)
@@ -260,6 +260,20 @@ function transform_request_body!(
     return body
 end
 
+"""
+    _split_compound_id(id::String) -> (call_id, item_id_or_nothing)
+
+Split a compound `callId|itemId` tool call ID into its parts.
+Returns (call_id, nothing) if no `|` separator is present.
+"""
+function _split_compound_id(id::AbstractString)
+    idx = findfirst('|', id)
+    if idx === nothing
+        return (String(id), nothing)
+    end
+    return (String(id[1:idx-1]), String(id[idx+1:end]))
+end
+
 function codex_input_from_message(msg::AgentMessage)
     if msg isa UserMessage
         content = Any[]
@@ -274,61 +288,75 @@ function codex_input_from_message(msg::AgentMessage)
         return Any[Dict("role" => "user", "content" => content)]
     elseif msg isa AssistantMessage
         parts = Any[]
-        thinking = message_thinking(msg)
-        if !isempty(thinking)
-            push!(
-                parts, Dict(
-                    "type" => "reasoning",
-                    "summary" => [Dict("type" => "summary_text", "text" => thinking)],
-                    "status" => "completed",
+        # Iterate content blocks in order to preserve signatures
+        for block in msg.content
+            if block isa ThinkingContent
+                if block.thinkingSignature !== nothing
+                    # Send back the entire opaque reasoning item (includes encrypted_content)
+                    try
+                        push!(parts, JSON.parse(block.thinkingSignature))
+                        continue
+                    catch
+                    end
+                end
+                # Fallback: reconstruct from summary text
+                !isempty(block.thinking) && push!(
+                    parts, Dict(
+                        "type" => "reasoning",
+                        "summary" => [Dict("type" => "summary_text", "text" => block.thinking)],
+                        "status" => "completed",
+                    )
                 )
-            )
-        end
-        text = message_text(msg)
-        if !isempty(text)
-            push!(
-                parts, Dict(
+            elseif block isa TextContent
+                !isempty(block.text) || continue
+                msg_item = Dict{String, Any}(
                     "type" => "message",
                     "role" => "assistant",
-                    "content" => [Dict("type" => "output_text", "text" => text)],
+                    "content" => [Dict("type" => "output_text", "text" => block.text)],
                     "status" => "completed",
                 )
-            )
-        end
-        tool_blocks = ToolCallContent[]
-        for block in msg.content
-            block isa ToolCallContent && push!(tool_blocks, block)
-        end
-        if isempty(tool_blocks)
-            for tc in msg.tool_calls
-                push!(
-                    parts, Dict(
-                        "type" => "function_call",
-                        "call_id" => tc.call_id,
-                        "name" => tc.name,
-                        "arguments" => tc.arguments,
-                    )
+                # Include id from textSignature for prompt cache pairing
+                if block.textSignature !== nothing
+                    sig = block.textSignature
+                    msg_item["id"] = length(sig) > 64 ? first(sig, 64) : sig
+                end
+                push!(parts, msg_item)
+            elseif block isa ToolCallContent
+                call_id_raw, item_id = _split_compound_id(block.id)
+                fc = Dict{String, Any}(
+                    "type" => "function_call",
+                    "call_id" => call_id_raw,
+                    "name" => block.name,
+                    "arguments" => JSON.json(block.arguments),
                 )
+                item_id !== nothing && (fc["id"] = item_id)
+                push!(parts, fc)
             end
-        else
-            for block in tool_blocks
-                push!(
-                    parts, Dict(
-                        "type" => "function_call",
-                        "call_id" => block.id,
-                        "name" => block.name,
-                        "arguments" => JSON.json(block.arguments),
-                    )
+        end
+        # Fallback: if no ToolCallContent blocks, use tool_calls field
+        has_tc_blocks = any(b -> b isa ToolCallContent, msg.content)
+        if !has_tc_blocks
+            for tc in msg.tool_calls
+                call_id_raw, item_id = _split_compound_id(tc.call_id)
+                fc = Dict{String, Any}(
+                    "type" => "function_call",
+                    "call_id" => call_id_raw,
+                    "name" => tc.name,
+                    "arguments" => tc.arguments,
                 )
+                item_id !== nothing && (fc["id"] = item_id)
+                push!(parts, fc)
             end
         end
         return parts
     elseif msg isa ToolResultMessage
         output = message_text(msg)
+        # Use only the callId portion (before |) for function_call_output
+        call_id_raw, _ = _split_compound_id(msg.call_id)
         return Any[
             Dict(
                 "type" => "function_call_output",
-                "call_id" => msg.call_id,
+                "call_id" => call_id_raw,
                 "output" => output,
             ),
         ]
@@ -352,7 +380,8 @@ function codex_build_input(agent::Agent, state::AgentState, input::AgentTurnInpu
         append!(items, codex_input_from_message(UserMessage(input)))
     elseif input isa Vector{ToolResultMessage}
         for result in input
-            push!(items, Dict("type" => "function_call_output", "call_id" => result.call_id, "output" => message_text(result)))
+            call_id_raw, _ = _split_compound_id(result.call_id)
+            push!(items, Dict("type" => "function_call_output", "call_id" => call_id_raw, "output" => message_text(result)))
         end
     end
     return items
@@ -446,9 +475,12 @@ function openai_codex_event_callback(
             item isa AbstractDict || return
             item_type = get(() -> "", item, "type")
             if item_type == "function_call"
-                call_id = string(get(() -> get(() -> new_call_id("codex"), item, "id"), item, "call_id"))
+                raw_call_id = string(get(() -> new_call_id("codex"), item, "call_id"))
+                item_id = get(() -> nothing, item, "id")
+                # Use compound callId|itemId format (matching pi-mono)
+                compound_id = item_id !== nothing ? "$(raw_call_id)|$(item_id)" : raw_call_id
                 name = string(get(() -> "", item, "name"))
-                tool_call_accumulators[call_id] = ToolCallAccumulator(get(() -> nothing, item, "id"), name, "")
+                tool_call_accumulators[compound_id] = ToolCallAccumulator(item_id !== nothing ? string(item_id) : nothing, name, "")
             end
         elseif event_type == "response.reasoning_summary_part.added"
             ensure_started()
@@ -471,10 +503,20 @@ function openai_codex_event_callback(
             ensure_started()
             delta = String(get(() -> "", raw, "delta"))
             item_id = get(() -> nothing, raw, "item_id")
-            call_id = string(get(() -> something(item_id, "codex_call"), raw, "call_id"))
-            acc = get(() -> ToolCallAccumulator(item_id, get(() -> nothing, raw, "name"), ""), tool_call_accumulators, call_id)
+            raw_call_id = get(() -> nothing, raw, "call_id")
+            # Build compound key matching what we stored in response.output_item.added
+            compound_id = if raw_call_id !== nothing && item_id !== nothing
+                "$(raw_call_id)|$(item_id)"
+            elseif raw_call_id !== nothing
+                string(raw_call_id)
+            elseif item_id !== nothing
+                string(item_id)
+            else
+                "codex_call"
+            end
+            acc = get(() -> ToolCallAccumulator(item_id !== nothing ? string(item_id) : nothing, get(() -> nothing, raw, "name"), ""), tool_call_accumulators, compound_id)
             acc.arguments *= delta
-            tool_call_accumulators[call_id] = acc
+            tool_call_accumulators[compound_id] = acc
             f(MessageUpdateEvent(:assistant, assistant_message, :tool_arguments, delta, item_id))
         elseif event_type == "response.output_item.done"
             ensure_started()
@@ -491,6 +533,15 @@ function openai_codex_event_callback(
                     end
                     set_last_thinking!(assistant_message, join(text_parts, "\n\n"))
                 end
+                # Store entire opaque reasoning item (includes encrypted_content)
+                # for prompt cache continuity on subsequent turns
+                for idx in length(assistant_message.content):-1:1
+                    block = assistant_message.content[idx]
+                    if block isa ThinkingContent
+                        block.thinkingSignature = JSON.json(item)
+                        break
+                    end
+                end
             elseif item_type == "message"
                 content = get(() -> nothing, item, "content")
                 if content isa AbstractVector
@@ -506,17 +557,31 @@ function openai_codex_event_callback(
                     end
                     set_last_text!(assistant_message, String(take!(io)))
                 end
+                # Store item id as textSignature for prompt cache pairing
+                item_id = get(() -> nothing, item, "id")
+                if item_id !== nothing
+                    for idx in length(assistant_message.content):-1:1
+                        block = assistant_message.content[idx]
+                        if block isa TextContent
+                            block.textSignature = string(item_id)
+                            break
+                        end
+                    end
+                end
             elseif item_type == "function_call"
-                call_id = string(get(() -> get(() -> new_call_id("codex"), item, "id"), item, "call_id"))
+                raw_call_id = string(get(() -> new_call_id("codex"), item, "call_id"))
+                item_id = get(() -> nothing, item, "id")
+                # Compound ID: callId|itemId (matching pi-mono format)
+                compound_id = item_id !== nothing ? "$(raw_call_id)|$(item_id)" : raw_call_id
                 name = String(get(() -> "", item, "name"))
                 args = String(get(() -> "{}", item, "arguments"))
-                acc = get(() -> nothing, tool_call_accumulators, call_id)
+                acc = get(() -> nothing, tool_call_accumulators, compound_id)
                 if acc !== nothing && !isempty(acc.arguments)
                     args = acc.arguments
                 end
-                call = AgentToolCall(; call_id = call_id, name = name, arguments = args)
+                call = AgentToolCall(; call_id = compound_id, name = name, arguments = args)
                 push!(assistant_message.tool_calls, call)
-                push!(assistant_message.content, ToolCallContent(; id = call_id, name, arguments = parse_tool_arguments(args)))
+                push!(assistant_message.content, ToolCallContent(; id = compound_id, name, arguments = parse_tool_arguments(args)))
                 findtool(agent.tools, call.name)
                 ptc = PendingToolCall(; call_id = call.call_id, name = call.name, arguments = call.arguments)
                 f(ToolCallRequestEvent(ptc))
@@ -538,6 +603,18 @@ function openai_codex_event_callback(
                 usage !== nothing && (response_usage[] = usage)
                 status = get(() -> nothing, response, "status")
                 status !== nothing && (response_status[] = String(status))
+                # Emit error event (pi-mono throws on response.failed)
+                error_obj = get(() -> nothing, response, "error")
+                error_msg = if error_obj isa AbstractDict
+                    String(get(() -> "Response $(event_type)", error_obj, "message"))
+                else
+                    "Codex response $(event_type)"
+                end
+                if started[] && !ended[]
+                    ended[] = true
+                    f(MessageEndEvent(:assistant, assistant_message))
+                end
+                f(AgentErrorEvent(ErrorException(error_msg)))
             end
         elseif event_type == "error"
             code = String(get(() -> "", raw, "code"))
@@ -629,7 +706,7 @@ function truncate_text(text::String, limit::Int)
     return string(text[1:limit], "...[truncated $(length(text) - limit)]")
 end
 
-function format_codex_failure(raw_event::Dict{String, Any})
+function format_codex_failure(raw_event::AbstractDict{String, Any})
     response = as_record(get(raw_event, "response", nothing))
     error = as_record(get(raw_event, "error", nothing))
     if error === nothing && response !== nothing
@@ -665,7 +742,7 @@ function format_codex_failure(raw_event::Dict{String, Any})
     end
 end
 
-function format_codex_error_event(raw_event::Dict{String, Any}, code::String, message::String)
+function format_codex_error_event(raw_event::AbstractDict{String, Any}, code::String, message::String)
     detail = format_codex_failure(raw_event)
     if detail !== nothing
         return replace(detail, "response failed" => "error event")
@@ -880,6 +957,54 @@ function codex_stream_sse_with_retry!(
     end
 end
 
+# ── WebSocket connection pooling ──────────────────────────────────────────────
+# Keeps WebSocket connections alive for reuse across multiple API calls.
+# Uses ConcurrentUtilities.Pool for concurrency-safe acquire/release.
+
+mutable struct PooledWebSocket
+    ws::HTTP.WebSockets.WebSocket
+    done::Channel{Nothing}   # close to signal background task to exit
+    created_at::Float64
+end
+
+const _CODEX_WS_POOL = Pool{String, PooledWebSocket}(16)
+const _CODEX_WS_TTL = 300.0  # 5 minutes
+
+function _open_pooled_websocket(ws_url::String, ws_headers, ws_open_kw)
+    ready = Channel{Any}(1)
+    done = Channel{Nothing}(1)
+    Threads.@spawn begin
+        try
+            HTTP.WebSockets.open(ws_url;
+                headers = collect(pairs(ws_headers)),
+                suppress_close_error = true,
+                ws_open_kw...,
+            ) do ws
+                put!(ready, ws)
+                try
+                    take!(done)  # block until signaled to close
+                catch
+                end
+            end
+        catch e
+            try; put!(ready, e); catch; end
+        end
+    end
+    result = take!(ready)
+    result isa Exception && throw(result)
+    return PooledWebSocket(result::HTTP.WebSockets.WebSocket, done, time())
+end
+
+function _close_pooled_websocket(pws::PooledWebSocket)
+    try; close(pws.done); catch; end
+end
+
+function _pooled_ws_isvalid(pws::PooledWebSocket)
+    valid = !HTTP.WebSockets.isclosed(pws.ws) && (time() - pws.created_at) < _CODEX_WS_TTL
+    valid || _close_pooled_websocket(pws)
+    return valid
+end
+
 function codex_stream_websocket!(
         callback::Function,
         ws_url::String,
@@ -895,7 +1020,12 @@ function codex_stream_websocket!(
     start_request["type"] = "response.create"
     saw_terminal = false
 
-    HTTP.WebSockets.open(ws_url; headers = collect(pairs(ws_headers)), suppress_close_error = true, ws_open_kw...) do ws
+    pws = acquire(_CODEX_WS_POOL, ws_url; isvalid = _pooled_ws_isvalid) do
+        _open_pooled_websocket(ws_url, ws_headers, ws_open_kw)
+    end
+
+    try
+        ws = pws.ws
         maybe_abort!(abort, ws)
         HTTP.WebSockets.send(ws, JSON.json(start_request))
         while true
@@ -909,12 +1039,21 @@ function codex_stream_websocket!(
                 rethrow()
             end
             data = msg isa AbstractString ? String(msg) : String(msg)
-            callback(ws, (; data))
             event_type = codex_event_type_from_payload(data)
+            callback(ws, (; data))
             if codex_terminal_event_type(event_type)
                 saw_terminal = true
                 break
             end
+        end
+    finally
+        if saw_terminal
+            # Connection completed normally; return to pool for reuse
+            release(_CODEX_WS_POOL, ws_url, pws)
+        else
+            # Error or incomplete; close connection and return permit only
+            _close_pooled_websocket(pws)
+            release(_CODEX_WS_POOL, ws_url, nothing)
         end
     end
 

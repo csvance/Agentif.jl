@@ -69,6 +69,124 @@ function openai_responses_build_input(input::AgentTurnInput)
     throw(ArgumentError("unsupported turn input: $(typeof(input))"))
 end
 
+function _responses_split_compound_id(id::AbstractString)
+    idx = findfirst('|', id)
+    if idx === nothing
+        return (String(id), nothing)
+    end
+    return (String(id[1:idx-1]), String(id[idx+1:end]))
+end
+
+function openai_responses_input_from_message(msg::AgentMessage)
+    if msg isa UserMessage
+        content = Any[]
+        for block in msg.content
+            if block isa TextContent
+                push!(content, Dict("type" => "input_text", "text" => block.text))
+            elseif block isa ImageContent
+                push!(content, Dict("type" => "input_image", "image_url" => "data:$(block.mimeType);base64,$(block.data)"))
+            end
+        end
+        isempty(content) && return Any[]
+        return Any[Dict("role" => "user", "content" => content)]
+    elseif msg isa AssistantMessage
+        parts = Any[]
+        for block in msg.content
+            if block isa ThinkingContent
+                if block.thinkingSignature !== nothing
+                    # Send back the entire opaque reasoning item (includes encrypted_content)
+                    try
+                        push!(parts, JSON.parse(block.thinkingSignature))
+                        continue
+                    catch
+                    end
+                end
+                # Fallback: reconstruct from summary text (no encrypted_content)
+                !isempty(block.thinking) && push!(
+                    parts, Dict(
+                        "type" => "reasoning",
+                        "summary" => [Dict("type" => "summary_text", "text" => block.thinking)],
+                        "status" => "completed",
+                    )
+                )
+            elseif block isa TextContent
+                !isempty(block.text) || continue
+                msg_item = Dict{String, Any}(
+                    "type" => "message",
+                    "role" => "assistant",
+                    "content" => [Dict("type" => "output_text", "text" => block.text)],
+                    "status" => "completed",
+                )
+                if block.textSignature !== nothing
+                    sig = block.textSignature
+                    msg_item["id"] = length(sig) > 64 ? first(sig, 64) : sig
+                end
+                push!(parts, msg_item)
+            elseif block isa ToolCallContent
+                call_id_raw, item_id = _responses_split_compound_id(block.id)
+                fc = Dict{String, Any}(
+                    "type" => "function_call",
+                    "call_id" => call_id_raw,
+                    "name" => block.name,
+                    "arguments" => JSON.json(block.arguments),
+                )
+                item_id !== nothing && (fc["id"] = item_id)
+                push!(parts, fc)
+            end
+        end
+        # Fallback: if no ToolCallContent blocks, use tool_calls field
+        has_tc_blocks = any(b -> b isa ToolCallContent, msg.content)
+        if !has_tc_blocks
+            for tc in msg.tool_calls
+                call_id_raw, item_id = _responses_split_compound_id(tc.call_id)
+                fc = Dict{String, Any}(
+                    "type" => "function_call",
+                    "call_id" => call_id_raw,
+                    "name" => tc.name,
+                    "arguments" => tc.arguments,
+                )
+                item_id !== nothing && (fc["id"] = item_id)
+                push!(parts, fc)
+            end
+        end
+        return parts
+    elseif msg isa ToolResultMessage
+        output = message_text(msg)
+        call_id_raw, _ = _responses_split_compound_id(msg.call_id)
+        return Any[
+            Dict(
+                "type" => "function_call_output",
+                "call_id" => call_id_raw,
+                "output" => output,
+            ),
+        ]
+    elseif msg isa CompactionSummaryMessage
+        return Any[Dict("role" => "user", "content" => [Dict("type" => "input_text", "text" => "[Previous conversation summary]\n\n$(msg.summary)")])]
+    end
+    return Any[]
+end
+
+function openai_responses_build_full_input(agent::Agent, state::AgentState, input::AgentTurnInput)
+    items = Any[]
+    for msg in state.messages
+        include_in_context(msg) || continue
+        append!(items, openai_responses_input_from_message(msg))
+    end
+    if input isa String
+        push!(items, Dict("role" => "user", "content" => [Dict("type" => "input_text", "text" => input)]))
+    elseif input isa UserMessage
+        append!(items, openai_responses_input_from_message(input))
+    elseif input isa Vector{UserContentBlock}
+        append!(items, openai_responses_input_from_message(UserMessage(input)))
+    elseif input isa Vector{ToolResultMessage}
+        for result in input
+            call_id_raw, _ = _responses_split_compound_id(result.call_id)
+            push!(items, Dict("type" => "function_call_output", "call_id" => call_id_raw, "output" => message_text(result)))
+        end
+    end
+    return items
+end
+
 function openai_responses_usage_from_response(u::Union{Nothing, OpenAIResponses.Usage})
     u === nothing && return Usage()
     input = something(u.input_tokens, 0)
@@ -186,17 +304,61 @@ function openai_responses_event_callback(
         elseif parsed isa OpenAIResponses.StreamOutputItemDoneEvent
             item_type = parsed.item.type
             if item_type == "function_call"
-                args = parse_tool_arguments(parsed.item.arguments)
+                item = parsed.item::OpenAIResponses.FunctionToolCall
+                raw_call_id = item.call_id
+                item_id = item.id
+                # Compound callId|itemId format (matching pi-mono)
+                compound_id = item_id !== nothing ? "$(raw_call_id)|$(item_id)" : raw_call_id
+                args = parse_tool_arguments(item.arguments)
                 call = AgentToolCall(
-                    call_id = parsed.item.call_id,
-                    name = parsed.item.name,
-                    arguments = parsed.item.arguments,
+                    call_id = compound_id,
+                    name = item.name,
+                    arguments = item.arguments,
                 )
                 push!(assistant_message.tool_calls, call)
-                push!(assistant_message.content, ToolCallContent(; id = parsed.item.call_id, name = parsed.item.name, arguments = args))
+                push!(assistant_message.content, ToolCallContent(; id = compound_id, name = item.name, arguments = args))
                 findtool(agent.tools, call.name)
                 ptc = PendingToolCall(; call_id = call.call_id, name = call.name, arguments = call.arguments)
                 f(ToolCallRequestEvent(ptc))
+            elseif item_type == "reasoning"
+                item = parsed.item::OpenAIResponses.ReasoningOutput
+                # Build final thinking text from summary
+                if item.summary !== nothing
+                    text = join([something(s.text, "") for s in item.summary], "\n\n")
+                    set_last_thinking!(assistant_message, text)
+                end
+                # Store entire opaque reasoning item (includes encrypted_content) for roundtripping
+                for idx in length(assistant_message.content):-1:1
+                    block = assistant_message.content[idx]
+                    if block isa ThinkingContent
+                        block.thinkingSignature = JSON.json(item)
+                        break
+                    end
+                end
+            elseif item_type == "message"
+                item = parsed.item::OpenAIResponses.Message
+                # Build final text from content
+                if item.content isa Vector
+                    io = IOBuffer()
+                    for part in item.content
+                        if part isa OpenAIResponses.OutputTextContent
+                            print(io, something(part.text, ""))
+                        elseif part isa OpenAIResponses.Refusal
+                            print(io, something(part.refusal, ""))
+                        end
+                    end
+                    set_last_text!(assistant_message, String(take!(io)))
+                end
+                # Store item.id as textSignature for prompt cache pairing
+                if item.id !== nothing
+                    for idx in length(assistant_message.content):-1:1
+                        block = assistant_message.content[idx]
+                        if block isa TextContent
+                            block.textSignature = string(item.id)
+                            break
+                        end
+                    end
+                end
             end
         elseif parsed isa OpenAIResponses.StreamResponseCompletedEvent
             response_status[] = parsed.response.status
@@ -208,20 +370,52 @@ function openai_responses_event_callback(
         elseif parsed isa OpenAIResponses.StreamResponseFailedEvent
             response_status[] = parsed.response.status
             response_usage[] = parsed.response.usage
+            already_ended = ended[]
+            if started[] && !ended[]
+                ended[] = true
+                f(MessageEndEvent(:assistant, assistant_message))
+            end
+            # Only emit error if not already reported (e.g. by a preceding StreamErrorEvent)
+            if !already_ended
+                error_obj = parsed.response.error
+                error_msg = if error_obj !== nothing && error_obj.message !== nothing
+                    String(error_obj.message)
+                else
+                    "Response failed"
+                end
+                f(AgentErrorEvent(ErrorException(error_msg)))
+            end
         elseif parsed isa OpenAIResponses.StreamResponseIncompleteEvent
             response_status[] = parsed.response.status
             response_usage[] = parsed.response.usage
+            already_ended = ended[]
+            if started[] && !ended[]
+                ended[] = true
+                f(MessageEndEvent(:assistant, assistant_message))
+            end
+            if !already_ended
+                f(AgentErrorEvent(ErrorException("Response incomplete")))
+            end
         elseif parsed isa OpenAIResponses.StreamOutputDoneEvent || parsed isa OpenAIResponses.StreamDoneEvent
             if started[] && !ended[]
                 ended[] = true
                 f(MessageEndEvent(:assistant, assistant_message))
             end
         elseif parsed isa OpenAIResponses.StreamErrorEvent
+            response_status[] = "failed"
             if started[] && !ended[]
                 ended[] = true
                 f(MessageEndEvent(:assistant, assistant_message))
             end
-            f(AgentErrorEvent(ErrorException(parsed.message)))
+            # Extract message from top-level or nested error object
+            error_msg = if parsed.message !== nothing
+                parsed.message
+            elseif parsed.error !== nothing && parsed.error.message !== nothing
+                parsed.error.message
+            else
+                "Unknown error"
+            end
+            f(AgentErrorEvent(ErrorException(error_msg)))
         end
     end
 end

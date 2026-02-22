@@ -35,7 +35,14 @@ function tool_call_middleware(agent_handler::AgentHandler)
             try
                 current_state = agent_handler(f, agent, current_state, next_input, abort; kw...)
 
-                isempty(current_state.pending_tool_calls) && return current_state
+                if isempty(current_state.pending_tool_calls)
+                    # Warn on empty responses (no text, no tool calls) which may indicate API issues
+                    am = last_assistant_message(current_state)
+                    if am !== nothing && isempty(message_text(am)) && isempty(am.tool_calls)
+                        @warn "Model returned empty response (no text, no tool calls)" stop_reason=current_state.most_recent_stop_reason
+                    end
+                    return current_state
+                end
 
                 empty!(futures) # empty futures before we push new tool call evals
                 for tc in current_state.pending_tool_calls
@@ -283,7 +290,7 @@ function evaluate(
         input::AgentTurnInput;
         state::AgentState = AgentState(),
         base_handler::AgentHandler = stream,
-        compaction_config::Union{Nothing, CompactionConfig} = nothing,
+        compaction_config::Union{Nothing, CompactionConfig} = CompactionConfig(),
         steer_queue::Union{Nothing, Channel{AgentTurnInput}} = nothing,
         message_queue::Union{Nothing, Channel{AgentTurnInput}} = nothing,
         session_store::Union{Nothing, SessionStore} = nothing,

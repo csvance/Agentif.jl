@@ -87,7 +87,10 @@ end
 Walk backwards from the end of messages, accumulating token estimates.
 Returns the index of the first message to KEEP (messages[1:idx-1] get compacted).
 Returns 0 if no valid cut point found.
-Cut points are always at UserMessage boundaries to avoid splitting tool-call/result pairs.
+Cut points must be at turn boundaries: before a UserMessage or before an
+AssistantMessage that is not preceded by an unresolved tool call. This avoids
+splitting tool-call/result pairs while still allowing compaction in long
+tool-call loops that have no intermediate UserMessages.
 """
 function find_cut_point(messages::Vector{AgentMessage}, keep_recent_tokens::Int)
     length(messages) <= 1 && return 0
@@ -106,9 +109,21 @@ function find_cut_point(messages::Vector{AgentMessage}, keep_recent_tokens::Int)
     # If we never hit the threshold, nothing to compact
     candidate == 0 && return 0
 
-    # Walk forward to nearest UserMessage (valid cut boundary)
+    # Walk forward to nearest valid turn boundary.
+    # Valid boundaries: UserMessage, or AssistantMessage not preceded by
+    # an AssistantMessage with tool_calls (which would need its tool results).
     for i in candidate:length(messages)
-        messages[i] isa UserMessage && return i
+        msg = messages[i]
+        if msg isa UserMessage
+            return i
+        elseif msg isa AssistantMessage
+            # Valid cut point if the previous message is NOT an AssistantMessage
+            # with pending tool calls (i.e., we're not between a tool call and
+            # its results).
+            if i == 1 || !(messages[i-1] isa AssistantMessage && !isempty(messages[i-1].tool_calls))
+                return i
+            end
+        end
     end
 
     return 0  # no valid cut point found
@@ -260,14 +275,19 @@ function compaction_middleware(agent_handler::AgentHandler, config::CompactionCo
         threshold = compaction_threshold(config, resolved_model)
         threshold <= 0 && return agent_handler(f, agent, state, current_input, abort; model, kw...)
 
-        # Compact if previous call's input tokens exceeded threshold
+        # Compact if previous call's total input tokens (including cached)
+        # exceeded the context window threshold.
         if last_input_tokens[] > 0 && last_input_tokens[] > threshold
             compact!(agent, state, config, resolved_model)
         end
 
-        usage_before = state.usage.input
+        # Track full input token count (including cached) for accurate
+        # context window utilization. usage.input has cached tokens
+        # subtracted, so we add cacheRead back.
+        total_before = state.usage.input + state.usage.cacheRead
         result = agent_handler(f, agent, state, current_input, abort; model, kw...)
-        last_input_tokens[] = result.usage.input - usage_before
+        total_after = result.usage.input + result.usage.cacheRead
+        last_input_tokens[] = total_after - total_before
 
         return result
     end

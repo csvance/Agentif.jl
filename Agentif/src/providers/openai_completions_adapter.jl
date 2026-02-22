@@ -367,7 +367,11 @@ function openai_completions_usage_from_response(u::Union{Nothing, OpenAICompleti
     input = something(u.prompt_tokens, 0)
     output = something(u.completion_tokens, 0)
     total = something(u.total_tokens, input + output)
-    return Usage(; input, output, total)
+    cached = 0
+    if u.prompt_tokens_details !== nothing
+        cached = something(u.prompt_tokens_details.cached_tokens, 0)
+    end
+    return Usage(; input, output, cacheRead = cached, total)
 end
 
 function openai_completions_stop_reason(reason::Union{Nothing, String}, tool_calls::Vector{AgentToolCall})
@@ -663,7 +667,16 @@ function openai_completions_event_callback(
                     started[] = true
                     f(MessageStartEvent(:assistant, assistant_message))
                 end
-                append_thinking!(assistant_message, value)
+                # Store field name as thinkingSignature so message building can
+                # replay thinking to the correct field (matching pi-mono behavior).
+                sig = string(field)
+                if isempty(assistant_message.content) || !(assistant_message.content[end] isa ThinkingContent)
+                    push!(assistant_message.content, ThinkingContent(; thinking = value, thinkingSignature = sig))
+                else
+                    block = assistant_message.content[end]
+                    block.thinking *= value
+                    block.thinkingSignature === nothing && (block.thinkingSignature = sig)
+                end
                 f(MessageUpdateEvent(:assistant, assistant_message, :reasoning, value, nothing))
             end
         end

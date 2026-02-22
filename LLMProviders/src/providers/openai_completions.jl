@@ -76,6 +76,7 @@ end
     prompt_tokens::Union{Nothing, Int} = nothing
     completion_tokens::Union{Nothing, Int} = nothing
     total_tokens::Union{Nothing, Int} = nothing
+    prompt_tokens_details::Union{Nothing, @NamedTuple{cached_tokens::Union{Nothing, Int}}} = nothing
 end
 
 @omit_null @kwarg struct ResponseChoice

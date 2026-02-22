@@ -1394,8 +1394,10 @@ end
     type::String = "error"
     sequence_number::Union{Nothing, Int} = nothing
     code::Union{Nothing, String} = nothing
-    message::String
+    message::Union{Nothing, String} = nothing
     param::Union{Nothing, String} = nothing
+    # OpenAI wraps error details in an "error" object: {"type":"error","error":{"message":"...",...}}
+    error::Union{Nothing, Error} = nothing
 end
 
 @omit_null @kwarg struct UnknownStreamEvent <: StreamEvent

@@ -396,21 +396,21 @@ const LIST_EVENT_HANDLERS_TOOL = @tool "List all registered event handlers with 
     isempty(lines) ? "No event handlers registered" : join(lines, "\n")
 end
 
-const ADD_EVENT_HANDLER_TOOL = @tool "Register a new event handler. event_type_names is comma-separated. Use list_event_types and list_channels first." function add_event_handler(id::String, event_type_names::String, prompt::String, channel_id::Union{Nothing, String} = nothing)
+const ADD_EVENT_HANDLER_TOOL = @tool "Register a new event handler. event_type_names is comma-separated. channel_id is required — use list_channels first to find available channel IDs." function add_event_handler(id::String, event_type_names::String, prompt::String, channel_id::String)
     a = get_current_assistant()
     a === nothing && return "No assistant initialized"
+    cid = strip(channel_id)
+    isempty(cid) && return "channel_id is required. Use list_channels to see available channels and provide a valid channel ID."
     names = strip.(split(event_type_names, ","))
     for n in names
         result = iterate(SQLite.DBInterface.execute(a.db,
             "SELECT 1 FROM vo_event_types WHERE name = ?", (n,)))
         result === nothing && return "Unknown event type: $n"
     end
-    if channel_id !== nothing
-        haskey(a._channels, channel_id) || return "Unknown channel: $channel_id"
-    end
-    eh = EventHandler(id, names, prompt, channel_id)
+    haskey(a._channels, cid) || return "Unknown channel: $cid. Use list_channels to see available channels."
+    eh = EventHandler(id, names, prompt, cid)
     register_event_handler!(a, eh)
-    "Event handler '$id' registered"
+    "Event handler '$id' registered for channel '$cid'"
 end
 
 const REMOVE_EVENT_HANDLER_TOOL = @tool "Remove an event handler by its ID." function remove_event_handler(id::String)
@@ -751,6 +751,7 @@ function evaluate(assistant::AgentAssistant, input; session_id::String, channel:
         session_store = assistant.session_store,
         session_id = session_id,
         channel = channel,
+        compaction_config = Agentif.CompactionConfig(),
         kw...,
     )
 end
@@ -827,7 +828,12 @@ end
 
 function _resolve_event_channel(assistant::AgentAssistant, ev::Event, handler_channel_id::Union{Nothing, String})
     if ev isa ChannelEvent
-        return get_channel(ev)
+        ch = get_channel(ev)
+        # Register dynamically-created channels so non-ChannelEvent handlers
+        # (e.g. JMAP email → telegram) can look them up by channel_id.
+        id = Agentif.channel_id(ch)
+        assistant._channels[id] = ch
+        return ch
     end
     handler_channel_id === nothing && return nothing
     return get(assistant._channels, handler_channel_id, nothing)
@@ -850,23 +856,29 @@ end
 
 function start_event_loop!(assistant::AgentAssistant)
     errormonitor(@async begin
+        @info "Vo: event loop started"
         for ev in assistant.event_queue
+            @info "Vo: event received" event_type=typeof(ev)
             nm = try
                 get_name(ev)
             catch e
                 @error "Event dropped: failed to compute event name" event_type=typeof(ev) exception=(e, catch_backtrace())
                 continue
             end
+            @info "Vo: event name resolved" event_name=nm
             handlers = try
                 _event_handlers_for(assistant, nm)
             catch e
                 @error "Event handler lookup failed" event=nm exception=(e, catch_backtrace())
                 continue
             end
+            @info "Vo: found handlers" event_name=nm handler_count=length(handlers)
             for handler in handlers
                 errormonitor(@async begin
                     try
+                        @info "Vo: running handler" handler_id=handler.id event_name=nm
                         _run_event_handler!(assistant, ev, handler)
+                        @info "Vo: handler completed" handler_id=handler.id event_name=nm
                     catch e
                         @error "Event handler failed" handler=handler.id event=nm exception=(e, catch_backtrace())
                     end

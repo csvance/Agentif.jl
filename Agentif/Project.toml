@@ -4,6 +4,7 @@ version = "1.0.0"
 
 [deps]
 Base64 = "2a0f44e3-6c83-55bd-87e4-b1978d98bd5f"
+ConcurrentUtilities = "f0e56b4a-5159-44fe-b623-3e5288b988bb"
 Dates = "ade2ca70-3891-5945-98fb-dc099432e06a"
 Encid = "22e113d6-bca1-46f4-8715-c46169ad70b7"
 HTTP = "cd3eb016-35fb-5094-929b-558a96fad6f3"
@@ -35,6 +36,7 @@ LocalSearch = {url = "https://github.com/quinnj/LocalSearch.jl.git"}
 PtySessions = {url = "https://github.com/quinnj/PtySessions.jl.git"}
 
 [compat]
+ConcurrentUtilities = "2"
 Encid = "1.0.0"
 HTTP = "1"
 InteractiveUtils = "1"

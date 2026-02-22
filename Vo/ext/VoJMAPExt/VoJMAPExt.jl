@@ -191,10 +191,10 @@ end
 # ─── start! ───
 
 function Vo.start!(source::FastmailEventSource, assistant::Vo.AgentAssistant)
-    token = strip(source.token)
+    token = String(strip(source.token))
     isempty(token) && error("VoJMAPExt: JMAP_API_TOKEN not set")
 
-    session_url = strip(source.session_url)
+    session_url = String(strip(source.session_url))
     session = if isempty(session_url)
         JMAP.Session(token=token)
     else

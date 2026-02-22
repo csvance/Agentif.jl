@@ -347,6 +347,11 @@ function anthropic_event_callback(
             end
         elseif parsed isa AnthropicMessages.StreamMessageDeltaEvent
             parsed.usage !== nothing && (latest_usage[] = parsed.usage)
+            delta = parsed.delta
+            if delta isa AbstractDict
+                sr = get(delta, "stop_reason", nothing)
+                sr isa AbstractString && !isempty(sr) && (stop_reason[] = sr)
+            end
         elseif parsed isa AnthropicMessages.StreamMessageStopEvent
             if started[] && !ended[]
                 ended[] = true
@@ -357,7 +362,12 @@ function anthropic_event_callback(
                 ended[] = true
                 f(MessageEndEvent(:assistant, assistant_message))
             end
-            f(AgentErrorEvent(ErrorException("anthropic stream error")))
+            error_msg = if parsed.error isa AbstractDict
+                get(() -> "anthropic stream error", parsed.error, "message")
+            else
+                "anthropic stream error"
+            end
+            f(AgentErrorEvent(ErrorException(error_msg)))
         end
     end
 end

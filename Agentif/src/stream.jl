@@ -262,27 +262,60 @@ function stream(
 
     if model.api == "openai-responses"
         apikey isa AbstractString || throw(ArgumentError("apikey must be a String for provider $(model.provider)"))
-        tools = openai_responses_build_tools(agent.tools)
-        current_input = openai_responses_build_input(input)
         assistant_message = assistant_message_for_model(model; response_id = state.response_id)
         started = Ref(false)
         ended = Ref(false)
         response_usage = Ref{Union{Nothing, OpenAIResponses.Usage}}(nothing)
         response_status = Ref{Union{Nothing, String}}(nothing)
 
-        stream_kw = haskey(kw_nt, :instructions) ? Base.structdiff(kw_nt, (; instructions = nothing)) : kw_nt
         system_prompt = agent_system_prompt(agent)
-        request_kw = merge(
-            (; tools, previous_response_id = state.response_id, instructions = system_prompt),
-            stream_kw,
+        full_input = openai_responses_build_full_input(agent, state, input)
+
+        # Build Dict-based request body (allows raw Dict items for opaque reasoning roundtripping)
+        body = Dict{String, Any}(
+            "model" => model.id,
+            "input" => full_input,
+            "stream" => true,
+            "store" => false,
         )
-        req = OpenAIResponses.Request(
-            ; model = model.id,
-            input = current_input,
-            stream = true,
-            model.kw...,
-            request_kw...,
-        )
+        system_prompt !== nothing && !isempty(system_prompt) && (body["instructions"] = system_prompt)
+
+        # Tools
+        tools = openai_responses_build_tools(agent.tools)
+        if tools !== nothing
+            body["tools"] = tools
+            body["tool_choice"] = "auto"
+            body["parallel_tool_calls"] = true
+        end
+
+        # Reasoning config (for reasoning models)
+        reasoning_effort = get(() -> nothing, kw_nt, :reasoning_effort)
+        reasoning_summary = get(() -> nothing, kw_nt, :reasoning_summary)
+        if model.reasoning
+            if reasoning_effort !== nothing || reasoning_summary !== nothing
+                body["reasoning"] = Dict(
+                    "effort" => something(reasoning_effort, "medium"),
+                    "summary" => something(reasoning_summary, "auto"),
+                )
+            end
+            body["include"] = ["reasoning.encrypted_content"]
+        end
+
+        # Pass through model.kw (temperature, max_output_tokens, etc.)
+        for (k, v) in pairs(model.kw)
+            k_str = string(k)
+            # Skip fields we already set or that don't belong in the body
+            k_str in ("api", "provider", "baseUrl", "reasoning", "input", "cost", "contextWindow", "maxTokens", "headers", "compat", "name", "id") && continue
+            body[k_str] = v
+        end
+
+        # Pass through stream kwargs (except ones we handle specially)
+        for k in keys(kw_nt)
+            k in (:instructions, :apikey, :reasoning_effort, :reasoning_summary, :model, :http_kw, :session_id) && continue
+            k_str = string(k)
+            haskey(body, k_str) || (body[k_str] = kw_nt[k])
+        end
+
         headers = Dict(
             "Authorization" => "Bearer $apikey",
             "Content-Type" => "application/json",
@@ -293,7 +326,7 @@ function stream(
             HTTP.post(
                 url,
                 headers;
-                body = JSON.json(req),
+                body = JSON.json(body),
                 sse_callback = openai_responses_event_callback(
                     f,
                     agent,
@@ -307,7 +340,27 @@ function stream(
                 merged_http_kw...,
             )
         catch e
-            if !(e isa StopStreaming)
+            if e isa StopStreaming
+                # Expected abort
+            elseif e isa HTTP.StatusError
+                if !started[]
+                    started[] = true
+                    f(MessageStartEvent(:assistant, assistant_message))
+                end
+                if !ended[]
+                    ended[] = true
+                    f(MessageEndEvent(:assistant, assistant_message))
+                end
+                error_body = String(e.response.body)
+                error_msg = try
+                    err_json = JSON.parse(error_body)
+                    get(get(() -> Dict(), err_json, "error"), "message", "HTTP $(e.status)")
+                catch
+                    "HTTP $(e.status): $error_body"
+                end
+                f(AgentErrorEvent(ErrorException(error_msg)))
+                response_status[] = "failed"
+            else
                 rethrow()
             end
         end
@@ -431,7 +484,27 @@ function stream(
                     merged_http_kw...,
                 )
             catch e
-                if !(e isa StopStreaming)
+                if e isa StopStreaming
+                    # Expected abort
+                elseif e isa HTTP.StatusError
+                    if !started[]
+                        started[] = true
+                        f(MessageStartEvent(:assistant, assistant_message))
+                    end
+                    if !ended[]
+                        ended[] = true
+                        f(MessageEndEvent(:assistant, assistant_message))
+                    end
+                    error_body = String(e.response.body)
+                    error_msg = try
+                        err_json = JSON.parse(error_body)
+                        get(get(() -> Dict(), err_json, "error"), "message", "HTTP $(e.status)")
+                    catch
+                        "HTTP $(e.status): $error_body"
+                    end
+                    f(AgentErrorEvent(ErrorException(error_msg)))
+                    latest_finish[] = "error"
+                else
                     rethrow()
                 end
             end
@@ -659,7 +732,27 @@ function stream(
                     merged_http_kw...,
                 )
             catch e
-                if !(e isa StopStreaming)
+                if e isa StopStreaming
+                elseif e isa HTTP.StatusError
+                    if !started[]
+                        started[] = true
+                        f(MessageStartEvent(:assistant, assistant_message))
+                    end
+                    if !ended[]
+                        ended[] = true
+                        f(MessageEndEvent(:assistant, assistant_message))
+                    end
+                    error_body = String(e.response.body)
+                    error_msg = try
+                        err_json = JSON.parse(error_body)
+                        err_obj = get(() -> Dict(), err_json, "error")
+                        get(() -> "HTTP $(e.status)", err_obj, "message")
+                    catch
+                        "HTTP $(e.status): $error_body"
+                    end
+                    f(AgentErrorEvent(ErrorException(error_msg)))
+                    stop_reason[] = "error"
+                else
                     rethrow()
                 end
             end
@@ -830,6 +923,9 @@ function stream(
 
         session_id = pop!(codex_kw, :session_id, nothing)
         session_id === nothing && (session_id = pop!(codex_kw, :sessionId, nothing))
+        # Fall back to state.session_id (set by session_middleware) if not
+        # passed explicitly, so prompt_cache_key and session headers work.
+        session_id === nothing && (session_id = state.session_id)
 
         reasoning_effort = pop!(codex_kw, :reasoning_effort, nothing)
         reasoning_effort === nothing && (reasoning_effort = pop!(codex_kw, :reasoningEffort, nothing))
