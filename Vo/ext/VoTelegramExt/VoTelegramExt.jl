@@ -6,13 +6,150 @@ import Vo
 
 export TelegramEventSource
 
+# ─── Markdown → Telegram MarkdownV2 conversion ───
+
+# Characters that must be escaped outside formatting entities
+const _ESCAPE_CHARS = Set("_*[]()~`>#+-=|{}.!")
+
+function _escape_mdv2(text::AbstractString)
+    buf = IOBuffer()
+    for ch in text
+        ch in _ESCAPE_CHARS && write(buf, '\\')
+        write(buf, ch)
+    end
+    return String(take!(buf))
+end
+
+"""
+    markdown_to_telegramv2(md::AbstractString) -> String
+
+Convert standard markdown (as LLMs produce) to Telegram MarkdownV2 format.
+Handles code blocks, inline code, bold, italic, links, headings, and bullet lists.
+"""
+function markdown_to_telegramv2(md::AbstractString)
+    buf = IOBuffer()
+    lines = split(md, '\n')
+    i = 1
+    while i <= length(lines)
+        line = lines[i]
+        # Fenced code block
+        if startswith(lstrip(line), "```")
+            lang = strip(replace(lstrip(line), r"^```" => ""))
+            write(buf, "```", lang, "\n")
+            i += 1
+            while i <= length(lines)
+                if startswith(lstrip(lines[i]), "```")
+                    i += 1
+                    break
+                end
+                # Inside code blocks: escape only ` and \
+                cb_line = replace(lines[i], "\\" => "\\\\", "`" => "\\`")
+                write(buf, cb_line, "\n")
+                i += 1
+            end
+            write(buf, "```")
+            i <= length(lines) && write(buf, "\n")
+            continue
+        end
+        write(buf, _convert_line(line))
+        i <= length(lines) && write(buf, "\n")
+        i += 1
+    end
+    return String(take!(buf))
+end
+
+function _convert_line(line::AbstractString)
+    # Headings → bold (strip inner bold markers since heading is already bold)
+    m = match(r"^(#{1,6})\s+(.*)", line)
+    if m !== nothing
+        content = replace(m[2], r"\*\*(.+?)\*\*" => s"\1")
+        return string("*", _format_inline(content), "*")
+    end
+    # Horizontal rule
+    if match(r"^[-*_]{3,}\s*$", line) !== nothing
+        return "———"
+    end
+    # Bullet lists: - or * at start → •
+    m = match(r"^(\s*)[-*]\s+(.*)", line)
+    if m !== nothing
+        indent = _escape_mdv2(m[1])
+        return string(indent, "• ", _format_inline(m[2]))
+    end
+    # Numbered lists: keep number, escape the dot
+    m = match(r"^(\s*)(\d+)\.\s+(.*)", line)
+    if m !== nothing
+        indent = _escape_mdv2(m[1])
+        return string(indent, m[2], "\\. ", _format_inline(m[3]))
+    end
+    return _format_inline(line)
+end
+
+# Walk through text identifying markdown inline elements; escape everything else.
+function _format_inline(text::AbstractString)
+    buf = IOBuffer()
+    i = firstindex(text)
+    while i <= lastindex(text)
+        remaining = SubString(text, i)
+        # Inline code: `...`
+        m = match(r"^`([^`]+)`", remaining)
+        if m !== nothing
+            code = replace(m[1], "\\" => "\\\\", "`" => "\\`")
+            write(buf, '`', code, '`')
+            i += ncodeunits(m.match)
+            continue
+        end
+        # Link: [text](url)
+        m = match(r"^\[([^\]]+)\]\(([^)]+)\)", remaining)
+        if m !== nothing
+            url = replace(m[2], "\\" => "\\\\", ")" => "\\)")
+            write(buf, '[', _escape_mdv2(m[1]), "](", url, ')')
+            i += ncodeunits(m.match)
+            continue
+        end
+        # Strikethrough: ~~text~~ → ~text~
+        m = match(r"^~~(.+?)~~", remaining)
+        if m !== nothing
+            write(buf, '~', _escape_mdv2(m[1]), '~')
+            i += ncodeunits(m.match)
+            continue
+        end
+        # Bold: **text** → *text*
+        m = match(r"^\*\*(.+?)\*\*", remaining)
+        if m !== nothing
+            write(buf, '*', _escape_mdv2(m[1]), '*')
+            i += ncodeunits(m.match)
+            continue
+        end
+        # Italic: *text* → _text_ (single asterisk = italic in std markdown, bold in Telegram)
+        m = match(r"^\*([^*]+)\*", remaining)
+        if m !== nothing
+            write(buf, '_', _escape_mdv2(m[1]), '_')
+            i += ncodeunits(m.match)
+            continue
+        end
+        # Italic: _text_
+        m = match(r"^_([^_]+)_", remaining)
+        if m !== nothing
+            write(buf, '_', _escape_mdv2(m[1]), '_')
+            i += ncodeunits(m.match)
+            continue
+        end
+        # Plain character — escape if needed
+        ch = text[i]
+        ch in _ESCAPE_CHARS && write(buf, '\\')
+        write(buf, ch)
+        i = nextind(text, i)
+    end
+    return String(take!(buf))
+end
+
 # ─── Channel ───
 
 mutable struct TelegramChannel <: Agentif.AbstractChannel
     chat_id::Any
     message_id::Union{Nothing, Int64}
     client::Telegram.Client
-    sm::Union{Nothing, Telegram.StreamingMessage}
+    buffer::IOBuffer
     user_id::String
     user_name::String
     # "private" = DM, "group" = basic group, "supergroup" = large/public group, "channel" = broadcast
@@ -22,30 +159,40 @@ end
 Agentif.start_streaming(::TelegramChannel) = nothing
 
 function Agentif.append_to_stream(ch::TelegramChannel, delta::AbstractString)
+    write(ch.buffer, delta)
+end
+
+function Agentif.finish_streaming(ch::TelegramChannel)
+    text = String(take!(ch.buffer))
+    isempty(text) && return
+    _send_mdv2(ch, text)
+end
+
+Agentif.close_channel(::TelegramChannel) = nothing
+
+function _send_mdv2(ch::TelegramChannel, text::AbstractString)
+    mdv2 = markdown_to_telegramv2(text)
+    parts = Telegram.split_message_text(mdv2)
     Telegram.with_client(ch.client) do
-        if ch.sm === nothing
-            ch.sm = Telegram.send_streaming_message(ch.chat_id, delta)
-        else
-            Telegram.append!(ch.sm, delta)
+        for part in parts
+            try
+                Telegram.send_message(ch.chat_id, part; parse_mode="MarkdownV2")
+            catch e
+                # MarkdownV2 parse error — fall back to plain text
+                if e isa Telegram.TelegramError
+                    @warn "VoTelegramExt: MarkdownV2 send failed, falling back to plain text" exception=e
+                    Telegram.send_message(ch.chat_id, text)
+                else
+                    rethrow()
+                end
+                break
+            end
         end
     end
 end
 
-Agentif.finish_streaming(::TelegramChannel) = nothing
-
-function Agentif.close_channel(ch::TelegramChannel)
-    sm = ch.sm
-    sm === nothing && return
-    Telegram.with_client(ch.client) do
-        Telegram.finish!(sm)
-    end
-    ch.sm = nothing
-end
-
 function Agentif.send_message(ch::TelegramChannel, msg)
-    Telegram.with_client(ch.client) do
-        Telegram.send_message(ch.chat_id, string(msg))
-    end
+    _send_mdv2(ch, string(msg))
 end
 
 Agentif.channel_id(ch::TelegramChannel) = "telegram:$(ch.chat_id)"
@@ -179,7 +326,7 @@ function _handle_message(update, bot_user_id, bot_username, assistant)
 
     @info "VoTelegramExt: message" chat_id message_id direct_ping
 
-    ch = TelegramChannel(chat_id, message_id, Telegram._get_client(), nothing, user_id, user_name, chat_type)
+    ch = TelegramChannel(chat_id, message_id, Telegram._get_client(), IOBuffer(), user_id, user_name, chat_type)
     put!(assistant.event_queue, TelegramMessageEvent(ch, text, direct_ping))
 end
 
@@ -217,7 +364,7 @@ function _handle_reaction(update, bot_user_id, assistant)
 
     @info "VoTelegramExt: reaction" emoji chat_id message_id user_id
 
-    ch = TelegramChannel(chat_id, message_id, Telegram._get_client(), nothing, user_id, user_name, chat_type)
+    ch = TelegramChannel(chat_id, message_id, Telegram._get_client(), IOBuffer(), user_id, user_name, chat_type)
     put!(assistant.event_queue, TelegramReactionEvent(ch, emoji, user_name, message_id))
 end
 
