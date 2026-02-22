@@ -411,6 +411,9 @@ function Vo.start!(source::SlackEventSource, assistant::Vo.AgentAssistant)
     errormonitor(Threads.@spawn begin
         web_client = Slack.WebClient(; token=bot_token)
         source.web_client = web_client
+        # Register channels now that web_client is available
+        # (get_channels returns [] during register_event_source! since web_client is still nothing)
+        Vo.register_channels!(assistant, Vo.get_channels(source))
         channel_type_cache = Dict{String, String}()
         bot_user_id = string(strip(source.bot_user_id))
         bot_username = lowercase(strip(source.bot_username))
