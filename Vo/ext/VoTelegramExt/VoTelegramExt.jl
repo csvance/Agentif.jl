@@ -268,24 +268,15 @@ Keep your response concise."""
 
 # ─── EventSource ───
 
-struct TelegramEventSource <: Vo.EventSource
-    use_polling::Bool
-    timeout::Int
-    host::String
-    port::Int
-    path::String
-    secret_token::Union{String, Nothing}
-end
-
-function TelegramEventSource(;
-        use_polling::Bool=true,
-        timeout::Int=30,
-        host::String="0.0.0.0",
-        port::Int=8080,
-        path::String="/webhook",
-        secret_token::Union{String, Nothing}=nothing,
-    )
-    TelegramEventSource(use_polling, timeout, host, port, path, secret_token)
+Base.@kwdef mutable struct TelegramEventSource <: Vo.EventSource
+    use_polling::Bool = true
+    timeout::Int = 30
+    host::String = "0.0.0.0"
+    port::Int = 8080
+    path::String = "/webhook"
+    secret_token::Union{String, Nothing} = nothing
+    # Runtime state (set during start!)
+    client::Union{Nothing, Telegram.Client} = nothing
 end
 
 Vo.get_event_types(::TelegramEventSource) = Vo.EventType[MESSAGE_EVENT_TYPE, REACTION_EVENT_TYPE]
@@ -382,6 +373,25 @@ function Vo.start!(source::TelegramEventSource, assistant::Vo.AgentAssistant)
             bot_user_id = string(me.id)
             bot_username = me.username !== nothing ? lowercase(string(me.username)) : ""
             @info "VoTelegramExt: Bot user: @$(bot_username) ($(bot_user_id))"
+
+            # Store client for on-demand channel construction
+            source.client = Telegram._get_client()
+
+            # Seed channels from persisted handler/job channel_ids so that
+            # non-ChannelEvents (e.g. JMAP email) can route to Telegram
+            # immediately, before any Telegram message arrives.
+            seed_channels = Agentif.AbstractChannel[]
+            for row in Vo.SQLite.DBInterface.execute(assistant.db,
+                "SELECT DISTINCT channel_id FROM vo_event_handlers WHERE channel_id LIKE 'telegram:%'")
+                cid = row.channel_id === missing ? "" : String(row.channel_id)
+                m = match(r"^telegram:(\d+)$", cid)
+                m !== nothing && push!(seed_channels, TelegramChannel(
+                    parse(Int64, m.captures[1]), nothing, source.client, IOBuffer(), "", "", "private"))
+            end
+            if !isempty(seed_channels)
+                Vo.register_channels!(assistant, seed_channels)
+                @info "VoTelegramExt: seeded channels from DB" count=length(seed_channels)
+            end
 
             if source.use_polling
                 @info "VoTelegramExt: Starting polling mode (timeout=$(source.timeout)s)"
