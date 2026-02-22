@@ -1,6 +1,26 @@
 const AgentHandler = Function
 const AgentMiddleware = Function
 
+const DEFAULT_MAX_TOOL_RESULT_BYTES = 1_048_576  # 1MB
+const MAX_TOOL_RESULT_BYTES = Ref(DEFAULT_MAX_TOOL_RESULT_BYTES)
+
+function _format_byte_size(bytes::Int)
+    if bytes < 1024
+        return "$(bytes)B"
+    elseif bytes < 1_048_576
+        return "$(round(bytes / 1024; digits=1))KB"
+    end
+    return "$(round(bytes / 1_048_576; digits=1))MB"
+end
+
+function _truncate_tool_result(output::String, max_bytes::Int)
+    sizeof(output) <= max_bytes && return output
+    original_size = sizeof(output)
+    idx = prevind(output, max_bytes + 1)
+    truncated = output[1:idx]
+    return truncated * "\n\n[Tool result truncated: showing first ~$(_format_byte_size(max_bytes)) of $(_format_byte_size(original_size)) total]"
+end
+
 @kwarg struct Agent
     id::Union{Nothing, String} = nothing
     prompt::String
@@ -122,6 +142,11 @@ function call_function_tool!(f, tool::AgentTool, tc::PendingToolCall)
                 is_error = true
                 output = sprint(showerror, e)
             end
+        end
+        max_bytes = MAX_TOOL_RESULT_BYTES[]
+        if max_bytes > 0 && sizeof(output) > max_bytes
+            @warn "Tool result exceeds size limit, truncating" tool=tc.name original_size=sizeof(output) limit=max_bytes
+            output = _truncate_tool_result(output, max_bytes)
         end
         trm = ToolResultMessage(tc.call_id, tc.name, output; is_error)
         duration_ms = Int64(div(time_ns() - start_ns, 1_000_000))

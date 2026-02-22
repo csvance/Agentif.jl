@@ -198,6 +198,54 @@ end
     @test isempty(result_state.pending_tool_calls)
 end
 
+@testset "tool result truncation" begin
+    # Save and override the limit for testing
+    original_limit = Agentif.MAX_TOOL_RESULT_BYTES[]
+    Agentif.MAX_TOOL_RESULT_BYTES[] = 100  # 100 bytes for easy testing
+    try
+        big_output = "x" ^ 500  # 500 bytes, well over the 100 byte limit
+        big_tool = @tool "Return a huge string." huge_tool() = big_output
+        base_handler = make_base_handler(; with_tool_call = true)
+        # Patch the base handler to call our big tool instead of echo
+        patched_handler = function (f, agent::Agent, state::AgentState, current_input::Agentif.AgentTurnInput, abort::Agentif.Abort; kw...)
+            if current_input isa String
+                msg = AssistantMessage(; provider = "test", api = "test", model = "test")
+                call = AgentToolCall(; call_id = "call-1", name = "huge_tool", arguments = "{}")
+                push!(msg.tool_calls, call)
+                Agentif.append_state!(state, current_input, msg, Usage())
+                state.pending_tool_calls = [Agentif.PendingToolCall(; call_id = "call-1", name = "huge_tool", arguments = "{}")]
+                state.most_recent_stop_reason = :tool_calls
+            else
+                msg = AssistantMessage(; provider = "test", api = "test", model = "test")
+                Agentif.append_state!(state, current_input, msg, Usage())
+                state.pending_tool_calls = Agentif.PendingToolCall[]
+                state.most_recent_stop_reason = :stop
+            end
+            return state
+        end
+        handler = tool_call_middleware(patched_handler)
+        agent = make_agent(; tools = [big_tool])
+        state = AgentState()
+        result_state = handler(identity, agent, state, "test", Abort())
+        # Find the tool result in the messages
+        tool_result_msgs = filter(m -> m isa ToolResultMessage, result_state.messages)
+        @test length(tool_result_msgs) >= 1
+        result_text = message_text(tool_result_msgs[end])
+        @test sizeof(result_text) < 500  # Should be truncated from original 500 bytes
+        @test occursin("[Tool result truncated:", result_text)
+        @test occursin("500B", result_text)  # Original size shown in notice
+    finally
+        Agentif.MAX_TOOL_RESULT_BYTES[] = original_limit
+    end
+
+    # Test that results under the limit are NOT truncated
+    small_tool = @tool "Return a small string." small_tool() = "small"
+    tc = Agentif.PendingToolCall(; call_id = "call-2", name = "small_tool", arguments = "{}")
+    trm = wait(Agentif.call_function_tool!(identity, small_tool, tc))
+    @test message_text(trm) == "small"
+    @test !occursin("[Tool result truncated:", message_text(trm))
+end
+
 @testset "queue_middleware" begin
     message_queue = Channel{Agentif.AgentTurnInput}(2)
     put!(message_queue, "followup")
