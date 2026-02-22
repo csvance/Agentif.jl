@@ -96,43 +96,57 @@ end
 # ============================================================================
 # Phase 2: LLMTools gating
 # ============================================================================
-@testset "Phase 2: LLMTools tool gating" begin
-    cfg_none = Vo.AgentConfig(
+@testset "Phase 2: LLMTools event source tools" begin
+    # Base config — no coding/web flags → only the 12 Vo wrapper tools
+    cfg_base = Vo.AgentConfig(
         provider="openai-completions", model_id="gpt-4o-mini", apikey="test-key",
     )
-    tools_none = Vo._build_llmtools(cfg_none)
-    @test length(tools_none) == 0
-    println("  No flags: $(length(tools_none)) tools")
+    es_base = Vo.LLMToolsEventSource(cfg_base)
+    tools_base = Vo.get_tools(es_base)
+    names_base = Set(t.name for t in tools_base)
+    @test length(tools_base) == 12
+    # Sub-agent tools
+    @test "start_subagent" in names_base
+    @test "message_subagent" in names_base
+    @test "list_subagents" in names_base
+    @test "kill_subagent" in names_base
+    # PTY tools
+    @test "start_pty" in names_base
+    @test "write_pty" in names_base
+    @test "list_ptys" in names_base
+    @test "kill_pty" in names_base
+    # Worker tools
+    @test "start_worker" in names_base
+    @test "eval_worker" in names_base
+    @test "list_workers" in names_base
+    @test "kill_worker" in names_base
+    println("  Base: $(length(tools_base)) tools — $names_base")
 
+    # With coding enabled → 12 wrappers + 7 coding tools
     cfg_coding = Vo.AgentConfig(
         provider="openai-completions", model_id="gpt-4o-mini", apikey="test-key",
         enable_coding=true,
     )
-    tools_coding = Vo._build_llmtools(cfg_coding)
-    @test length(tools_coding) == 7
+    es_coding = Vo.LLMToolsEventSource(cfg_coding)
+    tools_coding = Vo.get_tools(es_coding)
     names_coding = Set(t.name for t in tools_coding)
     @test "read" in names_coding
     @test "exec_command" in names_coding
+    @test "start_subagent" in names_coding
     println("  enable_coding: $(length(tools_coding)) tools — $names_coding")
 
-    cfg_term = Vo.AgentConfig(
+    # With web enabled → 12 wrappers + 2 web tools
+    cfg_web = Vo.AgentConfig(
         provider="openai-completions", model_id="gpt-4o-mini", apikey="test-key",
-        enable_terminal=true,
+        enable_web=true,
     )
-    tools_term = Vo._build_llmtools(cfg_term)
-    @test length(tools_term) == 4
-    println("  enable_terminal: $(length(tools_term)) tools")
-
-    cfg_ww = Vo.AgentConfig(
-        provider="openai-completions", model_id="gpt-4o-mini", apikey="test-key",
-        enable_web=true, enable_workers=true,
-    )
-    tools_ww = Vo._build_llmtools(cfg_ww)
-    @test length(tools_ww) == 6
-    names_ww = Set(t.name for t in tools_ww)
-    @test "web_fetch" in names_ww
-    @test "web_search" in names_ww
-    println("  enable_web+workers: $(length(tools_ww)) tools — $names_ww")
+    es_web = Vo.LLMToolsEventSource(cfg_web)
+    tools_web = Vo.get_tools(es_web)
+    names_web = Set(t.name for t in tools_web)
+    @test "web_fetch" in names_web
+    @test "web_search" in names_web
+    @test "start_subagent" in names_web
+    println("  enable_web: $(length(tools_web)) tools — $names_web")
 
     println("  ✓ Phase 2 passed")
 end
@@ -406,15 +420,22 @@ end
     @test "remove_job" in tool_names
     println("  All 8 management+tempus tools: $tool_names")
 
-    # With coding enabled
+    # With coding enabled via LLMToolsEventSource
     a2 = AgentAssistant(":memory:";
         provider="openai-completions", model_id="gpt-4o-mini", apikey="test-key",
         enable_coding=true,
     )
-    @test length(a2.tools) == 7
+    llm_es = Vo.LLMToolsEventSource(a2.config)
+    Vo.register_event_source!(a2, llm_es)
+    # 12 wrapper tools + 7 coding tools = 19
+    @test length(a2.tools) == 19
+    tool_names2 = Set(t.name for t in a2.tools)
+    @test "start_subagent" in tool_names2
+    @test "read" in tool_names2
+    @test "exec_command" in tool_names2
     append!(a2.tools, Vo.MANAGEMENT_TOOLS)
     append!(a2.tools, Vo.TEMPUS_TOOLS)
-    @test length(a2.tools) == 7 + 5 + 3
+    @test length(a2.tools) == 19 + 5 + 3
     println("  With coding: $(length(a2.tools)) tools total")
 
     println("  ✓ Constructor & tool registration passed")

@@ -76,8 +76,6 @@ Base.@kwdef struct AgentConfig
     apikey::String
     timezone::String = _detect_timezone()
     base_dir::String = pwd()
-    enable_terminal::Bool = false
-    enable_workers::Bool = false
     enable_web::Bool = false
     enable_coding::Bool = false
 end
@@ -719,19 +717,9 @@ end
 
 const DB_TOOLS = Agentif.AgentTool[DB_STORE_TOOL, DB_SEARCH_TOOL, DB_LIST_KEYS_TOOL, DB_LIST_TAGS_TOOL, DB_REMOVE_TOOL]
 
-# ─── LLMTools builder ───
+# ─── LLMTools event source ───
 
-function _build_llmtools(config::AgentConfig)
-    tools = Agentif.AgentTool[]
-    if config.enable_coding
-        append!(tools, LLMTools.coding_tools(config.base_dir))
-    elseif config.enable_terminal
-        append!(tools, LLMTools.create_terminal_tools(config.base_dir))
-    end
-    config.enable_workers && append!(tools, LLMTools.create_worker_tools())
-    config.enable_web && append!(tools, LLMTools.web_tools())
-    return tools
-end
+include("llmtools.jl")
 
 # ─── Evaluate ───
 
@@ -899,8 +887,6 @@ function AgentAssistant(db_path::String="";
     apikey::String=get(ENV, "VO_AGENT_API_KEY", ""),
     timezone::String=_detect_timezone(),
     base_dir::String=pwd(),
-    enable_terminal::Bool=false,
-    enable_workers::Bool=false,
     enable_web::Bool=false,
     enable_coding::Bool=false,
 )
@@ -911,13 +897,12 @@ function AgentAssistant(db_path::String="";
     session_store = Agentif.SQLiteSessionStore(db, search_store)
     tempus_store = Tempus.SQLiteStore(db)
     scheduler = Tempus.Scheduler(tempus_store)
-    config = AgentConfig(; name, provider, model_id, apikey, timezone, base_dir, enable_terminal, enable_workers, enable_web, enable_coding)
-    tools = _build_llmtools(config)
+    config = AgentConfig(; name, provider, model_id, apikey, timezone, base_dir, enable_web, enable_coding)
     return AgentAssistant(
         config, db,
         Dict{String, Agentif.AbstractChannel}(),
         Base.Channel{Event}(Inf),
-        session_store, tools, scheduler,
+        session_store, Agentif.AgentTool[], scheduler,
     )
 end
 
@@ -929,6 +914,11 @@ function init!(db_path::String=""; event_sources=nothing, kwargs...)
     CURRENT_ASSISTANT[] = assistant
     # Purge ephemeral tables (re-populated from EventSources)
     SQLite.DBInterface.execute(assistant.db, "DELETE FROM vo_event_types")
+    # Auto-register LLMToolsEventSource if not already provided
+    if !any(es -> es isa LLMToolsEventSource, sources)
+        llm_es = LLMToolsEventSource(assistant.config)
+        register_event_source!(assistant, llm_es)
+    end
     for es in sources
         register_event_source!(assistant, es)
     end
