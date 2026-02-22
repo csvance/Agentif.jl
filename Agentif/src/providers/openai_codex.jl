@@ -610,6 +610,7 @@ function openai_codex_event_callback(
                 else
                     "Codex response $(event_type)"
                 end
+                @warn "Codex response error" event_type error_msg
                 if started[] && !ended[]
                     ended[] = true
                     f(MessageEndEvent(:assistant, assistant_message))
@@ -620,6 +621,7 @@ function openai_codex_event_callback(
             code = String(get(() -> "", raw, "code"))
             msg = String(get(() -> "", raw, "message"))
             error_text = format_codex_error_event(raw, code, msg)
+            @warn "Codex SSE error event" code msg
             if started[] && !ended[]
                 ended[] = true
                 f(MessageEndEvent(:assistant, assistant_message))

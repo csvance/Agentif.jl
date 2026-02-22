@@ -126,9 +126,14 @@ function _create_search_session_tool(store::SessionStore)
             results = search_sessions(store, query; limit=n, current_channel_id=ch_id)
             isempty(results) && return "No matching session history found for: $query"
             lines = String[]
+            max_chars = 4000
             for (i, r) in enumerate(results)
                 push!(lines, "--- Result $i [session: $(r.session_id), score: $(round(r.score; digits=2))] ---")
-                push!(lines, r.entry_text)
+                text = r.entry_text
+                if length(text) > max_chars
+                    text = first(text, max_chars) * "\n... [truncated, $(length(r.entry_text)) chars total]"
+                end
+                push!(lines, text)
             end
             return join(lines, "\n\n")
         end,

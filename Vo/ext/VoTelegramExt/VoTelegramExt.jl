@@ -292,10 +292,16 @@ end
 
 function _handle_message(update, bot_user_id, bot_username, assistant)
     msg = update.message
-    msg === nothing && return
+    if msg === nothing
+        @debug "VoTelegramExt: update has no message field"
+        return
+    end
 
     text = msg.text
-    (text === nothing || isempty(text)) && return
+    if text === nothing || isempty(text)
+        @debug "VoTelegramExt: message has no text" chat_id=msg.chat.id
+        return
+    end
 
     chat_id = msg.chat.id
     chat_type = msg.chat.type !== nothing ? string(msg.chat.type) : "private"
@@ -360,6 +366,7 @@ function _handle_reaction(update, bot_user_id, assistant)
 end
 
 function _handle_update(update, bot_user_id::String, bot_username::String, assistant::Vo.AgentAssistant)
+    @info "VoTelegramExt: update received" update_id=update.update_id has_message=(update.message !== nothing) has_reaction=(hasproperty(update, :message_reaction) && update.message_reaction !== nothing)
     _handle_message(update, bot_user_id, bot_username, assistant)
     _handle_reaction(update, bot_user_id, assistant)
 end
