@@ -166,9 +166,15 @@ end
     @test "vo_event_handlers" in tables
     @test "vo_handler_event_types" in tables
     @test "vo_sessions" in tables
+    @test "vo_agent_metadata" in tables
     @test "session_entries" in tables  # from AgentifSQLiteExt
     @test "tempus_jobs" in tables  # from TempusSQLiteExt
     println("  Tables: $tables")
+
+    metadata_row = iterate(SQLite.DBInterface.execute(a.db,
+        "SELECT value FROM vo_agent_metadata WHERE key = ?", ("agent_system_prompt",)))
+    @test metadata_row !== nothing
+    @test metadata_row[1].value == Vo.SOUL_TEMPLATE
 
     # Verify session store is SQLite-backed
     @test nameof(typeof(a.session_store)) === :SQLiteSessionStore
@@ -229,6 +235,15 @@ end
     @test occursin("Respond helpfully", result_eh)
     println("  list_event_handlers:\n$result_eh")
 
+    # Test get/set system prompt tools
+    result_prompt = Vo.get_system_prompt()
+    @test result_prompt == Vo.SOUL_TEMPLATE
+    custom_prompt = "You are Vo. Prioritize concise, direct responses."
+    result_set_prompt = Vo.set_system_prompt(custom_prompt)
+    @test occursin("updated", result_set_prompt)
+    @test Vo.get_system_prompt() == custom_prompt
+    println("  set_system_prompt: $result_set_prompt")
+
     # Test add_event_handler
     result_add = Vo.add_event_handler("new_handler", "message", "Do something", "dm-alice")
     @test occursin("registered", result_add)
@@ -239,7 +254,7 @@ end
     println("  add_event_handler: $result_add")
 
     # Test add_event_handler with unknown event type
-    result_bad_et = Vo.add_event_handler("bad", "nonexistent", "x", nothing)
+    result_bad_et = Vo.add_event_handler("bad", "nonexistent", "x", "dm-alice")
     @test occursin("Unknown event type", result_bad_et)
 
     # Test add_event_handler with unknown channel
@@ -413,12 +428,14 @@ end
     @test "list_channels" in tool_names
     @test "list_event_types" in tool_names
     @test "list_event_handlers" in tool_names
+    @test "get_system_prompt" in tool_names
+    @test "set_system_prompt" in tool_names
     @test "add_event_handler" in tool_names
     @test "remove_event_handler" in tool_names
     @test "list_jobs" in tool_names
     @test "add_job" in tool_names
     @test "remove_job" in tool_names
-    println("  All 8 management+tempus tools: $tool_names")
+    println("  All 10 management+tempus tools: $tool_names")
 
     # With coding enabled via LLMToolsEventSource
     a2 = AgentAssistant(":memory:";
@@ -435,7 +452,7 @@ end
     @test "exec_command" in tool_names2
     append!(a2.tools, Vo.MANAGEMENT_TOOLS)
     append!(a2.tools, Vo.TEMPUS_TOOLS)
-    @test length(a2.tools) == 19 + 5 + 3
+    @test length(a2.tools) == 19 + 7 + 3
     println("  With coding: $(length(a2.tools)) tools total")
 
     println("  ✓ Constructor & tool registration passed")

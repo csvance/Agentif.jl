@@ -27,6 +27,7 @@ abstract type ChannelEvent <: Event end
 # ─── Soul template ───
 
 const SOUL_TEMPLATE = read(joinpath(@__DIR__, "soul_template.md"), String)
+const AGENT_SYSTEM_PROMPT_KEY = "agent_system_prompt"
 
 function _detect_timezone()
     tz = get(ENV, "TZ", "")
@@ -53,6 +54,33 @@ end
 
 function _zdt_to_unix(zdt::ZonedDateTime)
     return datetime2unix(DateTime(astimezone(zdt, tz"UTC")))
+end
+
+function _get_agent_metadata(db::SQLite.DB, key::String)
+    row = iterate(SQLite.DBInterface.execute(db,
+        "SELECT value FROM vo_agent_metadata WHERE key = ?", (key,)))
+    row === nothing && return nothing
+    return String(row[1].value)
+end
+
+function _set_agent_metadata!(db::SQLite.DB, key::String, value::String)
+    SQLite.DBInterface.execute(db,
+        "INSERT OR REPLACE INTO vo_agent_metadata (key, value, updated_at) VALUES (?, ?, ?)",
+        (key, value, time()))
+    return
+end
+
+function _ensure_agent_metadata_defaults!(db::SQLite.DB)
+    SQLite.DBInterface.execute(db,
+        "INSERT OR IGNORE INTO vo_agent_metadata (key, value, updated_at) VALUES (?, ?, ?)",
+        (AGENT_SYSTEM_PROMPT_KEY, SOUL_TEMPLATE, time()))
+    return
+end
+
+function _agent_system_prompt(db::SQLite.DB)
+    prompt = _get_agent_metadata(db, AGENT_SYSTEM_PROMPT_KEY)
+    prompt === nothing && return SOUL_TEMPLATE
+    return prompt
 end
 
 # ─── Core types ───
@@ -153,6 +181,15 @@ function _init_vo_schema!(db::SQLite.DB)
         )
     """)
     SQLite.DBInterface.execute(db, "CREATE INDEX IF NOT EXISTS idx_vo_agent_data_tags_tag ON vo_agent_data_tags(tag)")
+
+    SQLite.DBInterface.execute(db, """
+        CREATE TABLE IF NOT EXISTS vo_agent_metadata (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL,
+            updated_at REAL NOT NULL
+        )
+    """)
+    _ensure_agent_metadata_defaults!(db)
 end
 
 # ─── EventSource interface ───
@@ -292,8 +329,8 @@ This is a **public** channel. Be mindful that responses are visible to everyone.
 Do not reference or reveal information from private conversations or DMs.
 """
 
-function build_system_prompt(config::AgentConfig; channel::Union{Nothing, Agentif.AbstractChannel}=nothing)
-    prompt = SOUL_TEMPLATE
+function build_system_prompt(config::AgentConfig; channel::Union{Nothing, Agentif.AbstractChannel}=nothing, base_prompt::Union{Nothing, String}=nothing)
+    prompt = base_prompt === nothing ? SOUL_TEMPLATE : base_prompt
     if channel !== nothing && Agentif.is_group(channel)
         prompt = string(prompt, GROUP_CHAT_PROMPT)
         if Agentif.is_private(channel)
@@ -303,6 +340,13 @@ function build_system_prompt(config::AgentConfig; channel::Union{Nothing, Agenti
         end
     end
     return prompt
+end
+
+function build_system_prompt(assistant::AgentAssistant; channel::Union{Nothing, Agentif.AbstractChannel}=nothing)
+    prompt = _with_busy_retry() do
+        _agent_system_prompt(assistant.db)
+    end
+    return build_system_prompt(assistant.config; channel=channel, base_prompt=prompt)
 end
 
 function build_context_prefix(config::AgentConfig)
@@ -396,6 +440,27 @@ const LIST_EVENT_HANDLERS_TOOL = @tool "List all registered event handlers with 
     isempty(lines) ? "No event handlers registered" : join(lines, "\n")
 end
 
+const GET_SYSTEM_PROMPT_TOOL = @tool "Retrieve the current agent system prompt text." function get_system_prompt()
+    a = get_current_assistant()
+    a === nothing && return "No assistant initialized"
+    return _with_busy_retry() do
+        _agent_system_prompt(a.db)
+    end
+end
+
+const SET_SYSTEM_PROMPT_TOOL = @tool "Update the agent system prompt text used for future evaluations." function set_system_prompt(prompt::String)
+    a = get_current_assistant()
+    a === nothing && return "No assistant initialized"
+    isempty(strip(prompt)) && return "System prompt cannot be empty"
+    lock(AGENT_DATA_WRITE_LOCK) do
+        _with_busy_retry() do
+            _set_agent_metadata!(a.db, AGENT_SYSTEM_PROMPT_KEY, prompt)
+            return nothing
+        end
+    end
+    return "System prompt updated ($(length(prompt)) chars)"
+end
+
 const ADD_EVENT_HANDLER_TOOL = @tool "Register a new event handler. event_type_names is comma-separated. channel_id is required — use list_channels first to find available channel IDs." function add_event_handler(id::String, event_type_names::String, prompt::String, channel_id::String)
     a = get_current_assistant()
     a === nothing && return "No assistant initialized"
@@ -422,6 +487,7 @@ end
 
 const MANAGEMENT_TOOLS = Agentif.AgentTool[
     LIST_CHANNELS_TOOL, LIST_EVENT_TYPES_TOOL, LIST_EVENT_HANDLERS_TOOL,
+    GET_SYSTEM_PROMPT_TOOL, SET_SYSTEM_PROMPT_TOOL,
     ADD_EVENT_HANDLER_TOOL, REMOVE_EVENT_HANDLER_TOOL,
 ]
 
@@ -728,7 +794,7 @@ function evaluate(assistant::AgentAssistant, input; session_id::String, channel:
     model = Agentif.getModel(cfg.provider, cfg.model_id)
     model === nothing && error("Unknown model: provider=$(cfg.provider) model_id=$(cfg.model_id)")
     agent = Agentif.Agent(
-        prompt = build_system_prompt(cfg; channel),
+        prompt = build_system_prompt(assistant; channel),
         model = model,
         apikey = cfg.apikey,
         tools = assistant.tools,
