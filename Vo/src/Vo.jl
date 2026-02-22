@@ -97,10 +97,12 @@ end
 function _init_vo_schema!(db::SQLite.DB)
     SQLite.DBInterface.execute(db, "PRAGMA journal_mode=WAL")
     SQLite.DBInterface.execute(db, "PRAGMA synchronous=NORMAL")
-    SQLite.DBInterface.execute(db, "PRAGMA foreign_keys=ON")
     SQLite.DBInterface.execute(db, "PRAGMA busy_timeout=5000")
 
+    # Drop legacy table before enabling foreign keys to avoid lock errors
     SQLite.DBInterface.execute(db, "DROP TABLE IF EXISTS vo_channels")
+
+    SQLite.DBInterface.execute(db, "PRAGMA foreign_keys=ON")
 
     SQLite.DBInterface.execute(db, """
         CREATE TABLE IF NOT EXISTS vo_event_types (
