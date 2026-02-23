@@ -2,14 +2,27 @@ module ExtensionTests
 
 using Test
 using Agentif
-using GitHub
-using JMAP
 using Mattermost
 using MSTeams
 using Signal
 using Slack
 using Vo
 
+const HAS_GITHUB = try
+    @eval using GitHub
+    true
+catch
+    false
+end
+
+const HAS_JMAP = try
+    @eval using JMAP
+    true
+catch
+    false
+end
+
+if HAS_GITHUB
 @testset "VoGitHubExt event mapping" begin
     ext = Base.get_extension(Vo, :VoGitHubExt)
     @test ext !== nothing
@@ -108,7 +121,11 @@ using Vo
     @test occursin("star", content_star)
     @test occursin("fan", content_star)
 end
+else
+    @info "Skipping VoGitHubExt tests: GitHub package unavailable in test environment"
+end
 
+if HAS_JMAP
 @testset "VoJMAPExt new email events" begin
     ext = Base.get_extension(Vo, :VoJMAPExt)
     @test ext !== nothing
@@ -241,6 +258,9 @@ end
     end
 
     close(assistant.db)
+end
+else
+    @info "Skipping VoJMAPExt tests: JMAP package unavailable in test environment"
 end
 
 @testset "VoSlackExt event mapping" begin

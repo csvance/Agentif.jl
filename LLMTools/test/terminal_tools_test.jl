@@ -37,10 +37,12 @@ end
         write_stdin = funcs["write_stdin"]
         kill_session = funcs["kill_session"]
         list_sessions = funcs["list_sessions"]
+        test_shell = Sys.iswindows() ? nothing : "/bin/bash"
 
         @testset "Structured exec response" begin
             LLMTools.reset_sessions_for_tests!(LLMTools.PTY_REGISTRY)
-            parsed = exec_parsed_with_retry(exec_command, "echo hello"; yield_time_ms=250, max_output_lines=1000, max_output_tokens=10000)
+            parsed = exec_parsed_with_retry(exec_command, "echo hello";
+                shell=test_shell, yield_time_ms=250, max_output_lines=1000, max_output_tokens=10000)
             @test parsed["schema_version"] == 1
             @test parsed["tool"] == "exec_command"
             @test parsed["ok"] == true
@@ -58,7 +60,7 @@ end
             if Sys.iswindows()
                 @test_skip "Interactive PTY test currently unix-only"
             else
-                started = parse_tool_json(exec_command("cat", nothing, nothing, 150, 1000, 10000))
+                started = parse_tool_json(exec_command("cat", nothing, test_shell, 150, 1000, 10000))
                 @test started["status"] == LLMTools.SESSION_STATUS_RUNNING
                 session_id = started["session_id"]
                 @test session_id isa Integer
@@ -81,7 +83,7 @@ end
             if Sys.iswindows()
                 @test_skip "Interactive PTY test currently unix-only"
             else
-                started = parse_tool_json(exec_command("cat", nothing, nothing, 100, 1000, 10000))
+                started = parse_tool_json(exec_command("cat", nothing, test_shell, 100, 1000, 10000))
                 @test started["status"] == LLMTools.SESSION_STATUS_RUNNING
                 session_id = started["session_id"]
                 _ = parse_tool_json(kill_session(session_id))
@@ -96,7 +98,7 @@ end
         @testset "Deterministic cleanup sweeper" begin
             LLMTools.reset_sessions_for_tests!(LLMTools.PTY_REGISTRY)
             cmd = Sys.iswindows() ? "Start-Sleep -Seconds 1" : "sleep 1"
-            started = parse_tool_json(exec_command(cmd, nothing, nothing, 100, 1000, 10000))
+            started = parse_tool_json(exec_command(cmd, nothing, test_shell, 100, 1000, 10000))
             @test started["status"] == LLMTools.SESSION_STATUS_RUNNING
             session_id = started["session_id"]
 
@@ -111,7 +113,7 @@ end
             else
                 "for i in {1..200}; do echo 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'; done"
             end
-            parsed = parse_tool_json(exec_command(cmd, nothing, nothing, 300, 40, 80))
+            parsed = parse_tool_json(exec_command(cmd, nothing, test_shell, 300, 40, 80))
             @test parsed["ok"] == true
             @test parsed["truncated"] == true
             @test parsed["token_truncated"] == true
@@ -124,7 +126,7 @@ end
             if Sys.iswindows()
                 _ = parse_tool_json(exec_command("Start-Sleep -Seconds 2", nothing, nothing, 100, 1000, 10000))
             else
-                _ = parse_tool_json(exec_command("sleep 2", nothing, nothing, 100, 1000, 10000))
+                _ = parse_tool_json(exec_command("sleep 2", nothing, test_shell, 100, 1000, 10000))
             end
 
             listed = parse_tool_json(list_sessions())
