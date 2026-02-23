@@ -405,8 +405,13 @@ end
     sid3 = Vo._get_or_create_session(a.db, "handler-2")
     @test sid3 != sid1
 
+    # Follow-up channel key can be bound to existing session.
+    Vo._bind_session_key!(a.db, "slack:C123:1700000000.123", sid1)
+    sid4 = Vo._get_or_create_session(a.db, "slack:C123:1700000000.123")
+    @test sid4 == sid1
+
     # Verify in SQLite
-    @test count_rows(a.db, "vo_sessions") == 2
+    @test count_rows(a.db, "vo_sessions") == 3
 
     println("  ✓ Session helper passed")
 end

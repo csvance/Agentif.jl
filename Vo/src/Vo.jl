@@ -211,6 +211,7 @@ get_channel(ev::ChannelEvent) = error("get_channel not implemented for $(typeof(
 event_content(ev::Event) = error("event_content not implemented for $(typeof(ev))")
 get_session_key(::Event) = nothing
 get_session_key(ev::ChannelEvent) = Agentif.channel_id(get_channel(ev))
+get_followup_session_key(::Agentif.AbstractChannel) = nothing
 
 # ─── Global state ───
 
@@ -387,6 +388,14 @@ function _get_or_create_session(db::SQLite.DB, session_key::String)
         "INSERT INTO vo_sessions (session_key, session_id) VALUES (?, ?)",
         (session_key, sid))
     return sid
+end
+
+function _bind_session_key!(db::SQLite.DB, session_key::String, session_id::String)
+    isempty(session_key) && return nothing
+    SQLite.DBInterface.execute(db,
+        "INSERT OR REPLACE INTO vo_sessions (session_key, session_id) VALUES (?, ?)",
+        (session_key, session_id))
+    return nothing
 end
 
 # ─── Management tools ───
@@ -907,6 +916,15 @@ function _run_event_handler!(assistant::AgentAssistant, ev::Event, handler)
         _get_or_create_session(assistant.db, session_key)
     end
     evaluate(assistant, input; session_id=sid, channel=ch)
+    followup_session_key = get_followup_session_key(ch)
+    if followup_session_key !== nothing
+        followup_key = String(followup_session_key)
+        if !isempty(followup_key) && followup_key != session_key
+            _with_busy_retry() do
+                _bind_session_key!(assistant.db, followup_key, sid)
+            end
+        end
+    end
     return nothing
 end
 

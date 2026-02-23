@@ -9,6 +9,10 @@ export SlackEventSource
 
 # ─── Channel ───
 
+const CHAT_POST_MESSAGE_FN = Ref{Function}(Slack.chat_post_message)
+const API_CALL_FN = Ref{Function}(Slack.api_call)
+const MARKDOWN_BLOCK_MAX_CHARS = 12_000
+
 mutable struct SlackChannel <: Agentif.AbstractChannel
     channel::String
     thread_ts::String
@@ -29,7 +33,10 @@ const STREAM_BUFFER_SIZE = 32
 
 function Agentif.start_streaming(ch::SlackChannel)
     if ch.sm === nothing && ch.io === nothing
-        if !isempty(ch.thread_ts) && ch.recipient_team_id !== nothing && ch.recipient_user_id !== nothing
+        requires_recipients = ch.channel_type != "im"
+        has_recipients = ch.recipient_team_id !== nothing && ch.recipient_user_id !== nothing
+        can_stream = !isempty(ch.thread_ts) && (!requires_recipients || has_recipients)
+        if can_stream
             ch.sm = Slack.ChatStream(ch.web_client;
                 channel=ch.channel,
                 thread_ts=ch.thread_ts,
@@ -82,16 +89,78 @@ function Agentif.close_channel(ch::SlackChannel)
 end
 
 function Agentif.send_message(ch::SlackChannel, msg)
-    if isempty(ch.thread_ts)
-        Slack.chat_post_message(ch.web_client; channel=ch.channel, text=string(msg))
-    else
-        Slack.chat_post_message(ch.web_client; channel=ch.channel, text=string(msg), thread_ts=ch.thread_ts)
+    text = string(msg)
+    isempty(text) && return nothing
+
+    # Prefer Slack's markdown block to preserve LLM markdown output as-is.
+    if ncodeunits(text) <= MARKDOWN_BLOCK_MAX_CHARS
+        payload = Dict{String, Any}(
+            "channel" => ch.channel,
+            "text" => text, # accessibility fallback text
+            "blocks" => [Dict{String, Any}(
+                "type" => "markdown",
+                "text" => text,
+            )],
+        )
+        !isempty(ch.thread_ts) && (payload["thread_ts"] = ch.thread_ts)
+
+        try
+            response = API_CALL_FN[](ch.web_client, "chat.postMessage"; json=payload)
+            _record_post_ts!(ch, response)
+            return response
+        catch e
+            if e isa Slack.SlackApiError
+                response = e.response
+                code = if response isa Slack.SlackResponse && response.data isa AbstractDict
+                    get(() -> "", response.data, "error")
+                else
+                    ""
+                end
+                if code == "invalid_blocks" || code == "invalid_arguments" || code == "invalid_json"
+                    @warn "VoSlackExt: markdown blocks rejected by Slack; falling back to mrkdwn text" error=code
+                else
+                    rethrow()
+                end
+            else
+                rethrow()
+            end
+        end
     end
+
+    if isempty(ch.thread_ts)
+        response = CHAT_POST_MESSAGE_FN[](
+            ch.web_client;
+            channel=ch.channel,
+            text=text,
+            mrkdwn=true,
+            parse="none",
+        )
+        _record_post_ts!(ch, response)
+        return response
+    end
+    response = CHAT_POST_MESSAGE_FN[](
+        ch.web_client;
+        channel=ch.channel,
+        text=text,
+        thread_ts=ch.thread_ts,
+        mrkdwn=true,
+        parse="none",
+    )
+    _record_post_ts!(ch, response)
+    return response
 end
 
 function Agentif.channel_id(ch::SlackChannel)
     base = "slack:$(ch.channel)"
     return isempty(ch.thread_ts) ? base : "$(base):$(ch.thread_ts)"
+end
+
+function _record_post_ts!(ch::SlackChannel, response)
+    response isa AbstractDict || return nothing
+    ts = _string_or_empty(get(() -> "", response, "ts"))
+    isempty(ts) && return nothing
+    ch.post_ts = ts
+    return nothing
 end
 
 Agentif.channel_name(ch::SlackChannel) = ch.display_name
@@ -104,6 +173,16 @@ function Agentif.get_current_user(ch::SlackChannel)
 end
 
 Agentif.source_message_id(ch::SlackChannel) = isempty(ch.post_ts) ? nothing : ch.post_ts
+
+function Vo.get_followup_session_key(ch::SlackChannel)
+    if !isempty(ch.thread_ts)
+        return Agentif.channel_id(ch)
+    end
+    if !isempty(ch.post_ts)
+        return "slack:$(ch.channel):$(ch.post_ts)"
+    end
+    return nothing
+end
 
 # ─── Channel Events ───
 
@@ -382,6 +461,10 @@ function _handle_request(request::Slack.SocketModeRequest, web_client::Slack.Web
     event = _payload_event(payload)
     event === nothing && return
     event_type = _event_type(event)
+    if event_type == "app_mention"
+        @info "VoSlackExt: skipping app_mention event; relying on message events"
+        return
+    end
 
     message_event = _extract_message_event(event, web_client, bot_user_id, bot_username, recipient_team_id, recipient_user_id, channel_type_cache)
     if message_event !== nothing

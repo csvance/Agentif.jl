@@ -346,6 +346,79 @@ end
     @test ext._channel_type_from_info(Dict("is_group" => true)) == "group"
     @test ext._channel_type_from_info(nothing) === nothing
 
+    # Streaming should be allowed for IM without recipient IDs, but not for channel/group.
+    stream_im = ext.SlackChannel("D111", "1700000000.500", "", web_client, nothing, nothing, "", "", "im", nothing, nothing, "")
+    Agentif.start_streaming(stream_im)
+    @test stream_im.sm !== nothing
+    @test stream_im.io === nothing
+
+    stream_channel_missing_recipients = ext.SlackChannel("C111", "1700000000.600", "", web_client, nothing, nothing, "", "", "channel", nothing, nothing, "")
+    Agentif.start_streaming(stream_channel_missing_recipients)
+    @test stream_channel_missing_recipients.sm === nothing
+    @test stream_channel_missing_recipients.io !== nothing
+
+    # Outgoing message path should prefer markdown blocks and preserve markdown text.
+    original_api_call_fn = ext.API_CALL_FN[]
+    original_chat_post_message_fn = ext.CHAT_POST_MESSAGE_FN[]
+    try
+        api_calls = NamedTuple[]
+        fallback_calls = NamedTuple[]
+        ext.API_CALL_FN[] = function (_client, api_method; json=nothing, kwargs...)
+            push!(api_calls, (api_method=String(api_method), json=json))
+            return Dict{String, Any}("ok" => true, "channel" => json["channel"], "ts" => "1700000009.111")
+        end
+        ext.CHAT_POST_MESSAGE_FN[] = function (_client; channel, text=nothing, thread_ts=nothing, mrkdwn=nothing, parse=nothing, kwargs...)
+            push!(fallback_calls, (
+                channel=String(channel),
+                text=text === nothing ? nothing : String(text),
+                thread_ts=thread_ts === nothing ? nothing : String(thread_ts),
+                mrkdwn=mrkdwn,
+                parse=parse === nothing ? nothing : String(parse),
+            ))
+            return Dict{String, Any}("ok" => true, "channel" => String(channel), "ts" => "1700000010.222")
+        end
+
+        markdown = "# Heading\n- item\n```julia\nx = 1\n```"
+        out_ch = ext.SlackChannel("C123", "", "", web_client, nothing, nothing, "", "", "channel", nothing, nothing, "")
+        Agentif.send_message(out_ch, markdown)
+        @test length(api_calls) == 1
+        @test isempty(fallback_calls)
+        @test api_calls[1].api_method == "chat.postMessage"
+        @test api_calls[1].json["channel"] == "C123"
+        @test api_calls[1].json["text"] == markdown
+        @test api_calls[1].json["blocks"][1]["type"] == "markdown"
+        @test api_calls[1].json["blocks"][1]["text"] == markdown
+        @test out_ch.post_ts == "1700000009.111"
+        @test Vo.get_followup_session_key(out_ch) == "slack:C123:1700000009.111"
+
+        # If markdown blocks are rejected, fallback to classic mrkdwn text.
+        ext.API_CALL_FN[] = function (client, _api_method; json=nothing, kwargs...)
+            resp = Slack.SlackResponse(
+                client,
+                "POST",
+                "https://slack.com/api/chat.postMessage",
+                Dict{String,Any}(),
+                Slack.JSON.Object("ok" => false, "error" => "invalid_blocks"),
+                Dict{String,String}(),
+                200,
+            )
+            throw(Slack.SlackApiError("invalid blocks", resp))
+        end
+        threaded_ch = ext.SlackChannel("C123", "1700000000.999", "", web_client, nothing, nothing, "", "", "channel", nothing, nothing, "")
+        Agentif.send_message(threaded_ch, markdown)
+        @test length(fallback_calls) == 1
+        @test fallback_calls[1].channel == "C123"
+        @test fallback_calls[1].thread_ts == "1700000000.999"
+        @test fallback_calls[1].text == markdown
+        @test fallback_calls[1].mrkdwn == true
+        @test fallback_calls[1].parse == "none"
+        @test threaded_ch.post_ts == "1700000010.222"
+        @test Vo.get_followup_session_key(threaded_ch) == Agentif.channel_id(threaded_ch)
+    finally
+        ext.API_CALL_FN[] = original_api_call_fn
+        ext.CHAT_POST_MESSAGE_FN[] = original_chat_post_message_fn
+    end
+
     assistant = Vo.AgentAssistant(":memory:";
         provider="openai-completions",
         model_id="gpt-4o-mini",
@@ -375,7 +448,7 @@ end
     @test ev_group isa ext.SlackMessageEvent
     @test !ev_group.direct_ping
 
-    # Mention in channel should also enqueue.
+    # app_mention callbacks are ignored to avoid duplicate processing.
     mention_request = Slack.SocketModeRequest(
         type="events_api",
         envelope_id="env-2",
@@ -392,13 +465,33 @@ end
         ),
     )
     ext._handle_request(mention_request, web_client, "UBOT", "", nothing, nothing, assistant, channel_type_cache)
+    @test !isready(assistant.event_queue)
+
+    # Mention text in a message event still triggers direct_ping.
+    mention_message_request = Slack.SocketModeRequest(
+        type="events_api",
+        envelope_id="env-3",
+        payload=Slack.SlackEventsApiPayload(
+            type="event_callback",
+            event_id="evt-message-mention-1",
+            event=Slack.SlackMessageEvent(
+                type="message",
+                channel="C123",
+                channel_type="channel",
+                user="U123",
+                text="<@UBOT> hi",
+                ts="1700000005.333",
+            ),
+        ),
+    )
+    ext._handle_request(mention_message_request, web_client, "UBOT", "", nothing, nothing, assistant, channel_type_cache)
     @test isready(assistant.event_queue)
     ev = take!(assistant.event_queue)
     @test ev isa ext.SlackMessageEvent
     @test ev.direct_ping
 
-    # Re-delivery of same mention is still a processable event.
-    ext._handle_request(mention_request, web_client, "UBOT", "", nothing, nothing, assistant, channel_type_cache)
+    # Re-delivery is processable without event-id dedupe cache.
+    ext._handle_request(mention_message_request, web_client, "UBOT", "", nothing, nothing, assistant, channel_type_cache)
     @test isready(assistant.event_queue)
     ev2 = take!(assistant.event_queue)
     @test ev2 isa ext.SlackMessageEvent
