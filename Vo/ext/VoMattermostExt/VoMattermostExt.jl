@@ -9,11 +9,20 @@ export MattermostEventSource
 
 # ─── Channel ───
 
+const CREATE_POST_FN = Ref{Function}(Mattermost.create_post)
+const GET_POST_FN = Ref{Function}(Mattermost.get_post)
+const SEND_STREAMING_MESSAGE_FN = Ref{Function}(Mattermost.send_streaming_message)
+const STREAM_APPEND_FN = Ref{Function}((sm, delta) -> Mattermost.append!(sm, delta))
+const STREAM_FLUSH_FN = Ref{Function}(Mattermost.flush!)
+const STREAM_FINISH_FN = Ref{Function}(Mattermost.finish!)
+const STREAM_MIN_INTERVAL_S = 1.0
+
 mutable struct MattermostChannel <: Agentif.AbstractChannel
     channel_id::String
     root_id::String
     post_id::String
     client::Mattermost.Client
+    sm::Union{Nothing, Mattermost.StreamingMessage}
     io::Union{Nothing, IOBuffer}
     user_id::String
     user_name::String
@@ -22,19 +31,83 @@ mutable struct MattermostChannel <: Agentif.AbstractChannel
 end
 
 function Agentif.start_streaming(ch::MattermostChannel)
-    ch.io === nothing && (ch.io = IOBuffer())
+    if ch.sm === nothing && ch.io === nothing
+        kwargs = isempty(ch.root_id) ? (;) : (; root_id=ch.root_id)
+        try
+            sm = Mattermost.with_client(ch.client) do
+                SEND_STREAMING_MESSAGE_FN[](ch.channel_id, "..."; min_interval=STREAM_MIN_INTERVAL_S, kwargs...)
+            end
+            ch.sm = sm
+            if hasproperty(sm, :post_id)
+                post_id = String(getproperty(sm, :post_id))
+                !isempty(post_id) && (ch.post_id = post_id)
+            end
+        catch e
+            @warn "VoMattermostExt: failed to start streaming message; falling back to buffered send" exception=e
+            ch.io = IOBuffer()
+        end
+    end
     return nothing
 end
 
 function Agentif.append_to_stream(ch::MattermostChannel, delta::AbstractString)
+    sm = ch.sm
+    if sm !== nothing
+        try
+            Mattermost.with_client(ch.client) do
+                STREAM_APPEND_FN[](sm, String(delta))
+            end
+            return
+        catch e
+            @warn "VoMattermostExt: stream append failed; switching to buffered send" exception=e
+            ch.sm = nothing
+            fallback = IOBuffer()
+            if hasproperty(sm, :buffer)
+                prior = String(getproperty(sm, :buffer))
+                !isempty(prior) && write(fallback, prior)
+            end
+            ch.io = fallback
+        end
+    end
     io = ch.io
-    io === nothing && return
+    if io === nothing
+        io = IOBuffer()
+        ch.io = io
+    end
     write(io, String(delta))
 end
 
-Agentif.finish_streaming(::MattermostChannel) = nothing
+function Agentif.finish_streaming(ch::MattermostChannel)
+    sm = ch.sm
+    sm === nothing && return nothing
+    try
+        Mattermost.with_client(ch.client) do
+            STREAM_FLUSH_FN[](sm)
+        end
+    catch e
+        @warn "VoMattermostExt: stream flush failed" exception=e
+    end
+    return nothing
+end
 
 function Agentif.close_channel(ch::MattermostChannel)
+    sm = ch.sm
+    if sm !== nothing
+        try
+            Mattermost.with_client(ch.client) do
+                STREAM_FINISH_FN[](sm)
+            end
+            if hasproperty(sm, :post_id)
+                post_id = String(getproperty(sm, :post_id))
+                !isempty(post_id) && (ch.post_id = post_id)
+            end
+        catch e
+            @warn "VoMattermostExt: stream finish failed" exception=e
+        end
+        ch.sm = nothing
+        return nothing
+    end
+
     io = ch.io
     io === nothing && return
     text = String(take!(io))
@@ -45,14 +118,29 @@ end
 
 function Agentif.send_message(ch::MattermostChannel, msg)
     kwargs = isempty(ch.root_id) ? (;) : (; root_id=ch.root_id)
-    Mattermost.with_client(ch.client) do
-        Mattermost.create_post(ch.channel_id, string(msg); kwargs...)
+    response = Mattermost.with_client(ch.client) do
+        CREATE_POST_FN[](ch.channel_id, string(msg); kwargs...)
     end
+    if hasproperty(response, :id)
+        post_id = String(getproperty(response, :id))
+        !isempty(post_id) && (ch.post_id = post_id)
+    end
+    return response
 end
 
 function Agentif.channel_id(ch::MattermostChannel)
     base = "mattermost:$(ch.channel_id)"
     return isempty(ch.root_id) ? base : "$(base):$(ch.root_id)"
+end
+
+function Vo.get_followup_session_key(ch::MattermostChannel)
+    if !isempty(ch.root_id)
+        return Agentif.channel_id(ch)
+    end
+    if !isempty(ch.post_id)
+        return "mattermost:$(ch.channel_id):$(ch.post_id)"
+    end
+    return nothing
 end
 
 Agentif.channel_name(ch::MattermostChannel) = ch.display_name
@@ -158,46 +246,51 @@ end
 # ─── WebSocket event handling ───
 
 function _handle_posted(event, bot_user_id, bot_username, assistant)
-    post_json = get(event.data, "post", nothing)
+    post_json = get(() -> nothing, event.data, "post")
     post_json === nothing && return
     post_data = JSON.parse(post_json)
 
-    user_id = get(post_data, "user_id", "")
+    user_id = get(() -> "", post_data, "user_id")
     user_id == bot_user_id && return
 
-    message = get(post_data, "message", "")
+    post_type = get(() -> "", post_data, "type")
+    !isempty(post_type) && return
+
+    message = get(() -> "", post_data, "message")
     (message === nothing || isempty(message)) && return
 
-    channel_id = get(post_data, "channel_id", "")
-    post_root_id = get(post_data, "root_id", "")
-    post_id = get(post_data, "id", "")
-    root_id = post_root_id  # empty for top-level messages → shared session per channel
+    channel_id = get(() -> "", post_data, "channel_id")
+    post_root_id = get(() -> "", post_data, "root_id")
+    post_id = get(() -> "", post_data, "id")
+    isempty(channel_id) && return
+    isempty(post_id) && return
+    root_id = isempty(post_root_id) ? post_id : post_root_id
 
-    user_name = get(event.data, "sender_name", "")
+    user_name = get(() -> "", event.data, "sender_name")
     startswith(user_name, "@") && (user_name = user_name[2:end])
 
-    channel_type = get(event.data, "channel_type", "O")
+    channel_type = get(() -> "O", event.data, "channel_type")
     direct_ping = channel_type == "D" || (!isempty(bot_username) && occursin("@" * bot_username, lowercase(message)))
 
     @info "VoMattermostExt: message" channel_id post_id direct_ping
 
-    ch = MattermostChannel(channel_id, root_id, post_id, Mattermost._get_client(), nothing, user_id, user_name, channel_type, "")
+    ch = MattermostChannel(channel_id, root_id, post_id, Mattermost._get_client(), nothing, nothing, user_id, user_name, channel_type, "")
     put!(assistant.event_queue, MattermostMessageEvent(ch, message, direct_ping))
 end
 
 function _handle_reaction(event, bot_user_id, assistant)
-    reaction_json = get(event.data, "reaction", nothing)
+    reaction_json = get(() -> nothing, event.data, "reaction")
     reaction_json === nothing && return
     reaction_data = JSON.parse(reaction_json)
 
-    user_id = get(reaction_data, "user_id", "")
+    user_id = get(() -> "", reaction_data, "user_id")
     user_id == bot_user_id && return
 
-    emoji_name = get(reaction_data, "emoji_name", "")
-    post_id = get(reaction_data, "post_id", "")
+    emoji_name = get(() -> "", reaction_data, "emoji_name")
+    post_id = get(() -> "", reaction_data, "post_id")
     isempty(post_id) && return
 
-    channel_id = event.broadcast !== nothing ? get(event.broadcast, "channel_id", "") : ""
+    channel_id = event.broadcast !== nothing ? get(() -> "", event.broadcast, "channel_id") : ""
     isempty(channel_id) && return
 
     # Fetch the reacted-to post for thread root_id and message content
@@ -205,7 +298,7 @@ function _handle_reaction(event, bot_user_id, assistant)
     reacted_to = ""
     user_name = user_id
     try
-        post = Mattermost.get_post(post_id)
+        post = GET_POST_FN[](post_id)
         if hasproperty(post, :root_id) && post.root_id !== nothing && !isempty(string(post.root_id))
             root_id = string(post.root_id)
         end
@@ -218,15 +311,15 @@ function _handle_reaction(event, bot_user_id, assistant)
 
     @info "VoMattermostExt: reaction" emoji=emoji_name post_id channel_id user_id
 
-    ch = MattermostChannel(channel_id, root_id, post_id, Mattermost._get_client(), nothing, user_id, user_name, "", "")
+    ch = MattermostChannel(channel_id, root_id, post_id, Mattermost._get_client(), nothing, nothing, user_id, user_name, "", "")
     put!(assistant.event_queue, MattermostReactionEvent(ch, emoji_name, user_name, reacted_to))
 end
 
 function _handle_post_deleted(event, assistant)
-    post_json = get(event.data, "post", nothing)
+    post_json = get(() -> nothing, event.data, "post")
     post_json === nothing && return
     post_data = JSON.parse(post_json)
-    post_id = get(post_data, "id", "")
+    post_id = get(() -> "", post_data, "id")
     isempty(post_id) && return
     @info "VoMattermostExt: post deleted" post_id
     try
@@ -255,7 +348,7 @@ function _fetch_channels(client::Mattermost.Client, bot_user_id::String)
     teams = Mattermost.get_teams()
     for team in teams
         for mm_ch in Mattermost.get_channels_for_user(bot_user_id, team.id)
-            push!(channels, MattermostChannel(mm_ch.id, "", "", client, nothing, "", "", mm_ch.type, mm_ch.display_name))
+            push!(channels, MattermostChannel(mm_ch.id, "", "", client, nothing, nothing, "", "", mm_ch.type, mm_ch.display_name))
         end
     end
     return channels
@@ -269,6 +362,7 @@ function Vo.start!(source::MattermostEventSource, assistant::Vo.AgentAssistant)
             bot_username = me.username !== nothing ? lowercase(string(me.username)) : ""
             source.client = Mattermost._get_client()
             source.bot_user_id = bot_user_id
+            Vo.register_channels!(assistant, _fetch_channels(source.client, bot_user_id))
             @info "VoMattermostExt: Bot user: $(me.username) ($(bot_user_id))"
 
             Mattermost.run_websocket() do event

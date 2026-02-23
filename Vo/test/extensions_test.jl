@@ -519,7 +519,7 @@ end
     close(assistant.db)
 end
 
-@testset "VoMattermostExt channel buffering" begin
+@testset "VoMattermostExt channel + event mapping" begin
     ext = Base.get_extension(Vo, :VoMattermostExt)
     @test ext !== nothing
 
@@ -532,7 +532,7 @@ end
     @test any(h -> h.id == "mattermost_reaction_default", handlers)
 
     client = Mattermost.Client("test-token", "https://example.invalid/api/v4/")
-    ch = ext.MattermostChannel("chan-1", "root-1", "post-1", client, nothing, "user-1", "alice", "D", "Test Channel")
+    ch = ext.MattermostChannel("chan-1", "root-1", "post-1", client, nothing, nothing, "user-1", "alice", "D", "Test Channel")
 
     @test Agentif.channel_id(ch) == "mattermost:chan-1:root-1"
     @test Agentif.source_message_id(ch) == "post-1"
@@ -543,17 +543,204 @@ end
     @test user.id == "user-1"
     @test user.name == "alice"
 
-    Agentif.start_streaming(ch)
-    @test ch.io !== nothing
-    Agentif.append_to_stream(ch, "Hello")
-    Agentif.append_to_stream(ch, " world")
-    Agentif.finish_streaming(ch)
-    @test String(take!(ch.io)) == "Hello world"
+    assistant = Vo.AgentAssistant(":memory:";
+        provider="openai-completions",
+        model_id="gpt-4o-mini",
+        apikey="test-key",
+    )
+    function drain_events!()
+        while isready(assistant.event_queue)
+            take!(assistant.event_queue)
+        end
+    end
 
-    # Empty buffer on close should do nothing and clear channel state.
-    ch.io = IOBuffer()
-    Agentif.close_channel(ch)
-    @test ch.io === nothing
+    original_create_post_fn = ext.CREATE_POST_FN[]
+    original_get_post_fn = ext.GET_POST_FN[]
+    original_send_streaming_message_fn = ext.SEND_STREAMING_MESSAGE_FN[]
+    original_stream_append_fn = ext.STREAM_APPEND_FN[]
+    original_stream_flush_fn = ext.STREAM_FLUSH_FN[]
+    original_stream_finish_fn = ext.STREAM_FINISH_FN[]
+    try
+        create_post_calls = NamedTuple[]
+        stream_starts = NamedTuple[]
+        ext.CREATE_POST_FN[] = function (channel_id::String, message::String; root_id=nothing, kwargs...)
+            push!(create_post_calls, (
+                channel_id=String(channel_id),
+                message=String(message),
+                root_id=root_id === nothing ? nothing : String(root_id),
+            ))
+            return (id="post-$(length(create_post_calls))", root_id=root_id, message=message)
+        end
+        ext.GET_POST_FN[] = function (_post_id::String)
+            return (root_id="root-from-post", message="Original post")
+        end
+        ext.SEND_STREAMING_MESSAGE_FN[] = function (channel_id::String, initial_text::String="..."; min_interval::Float64=1.0, root_id=nothing, kwargs...)
+            push!(stream_starts, (
+                channel_id=String(channel_id),
+                initial_text=String(initial_text),
+                root_id=root_id === nothing ? nothing : String(root_id),
+                min_interval=min_interval,
+            ))
+            return Mattermost.StreamingMessage(
+                String(channel_id),
+                "stream-post-1",
+                String(initial_text),
+                String(initial_text),
+                time(),
+                min_interval,
+                false,
+            )
+        end
+        ext.STREAM_APPEND_FN[] = function (sm, delta)
+            sm.buffer *= String(delta)
+            sm.pending = true
+            return sm
+        end
+        ext.STREAM_FLUSH_FN[] = function (sm)
+            sm.last_sent = sm.buffer
+            sm.pending = false
+            return sm
+        end
+        ext.STREAM_FINISH_FN[] = function (sm)
+            sm.last_sent = sm.buffer
+            sm.pending = false
+            return sm
+        end
+
+        # Streaming uses Mattermost's streaming API, not plain IO buffering.
+        stream_ch = ext.MattermostChannel("chan-stream", "root-stream", "", client, nothing, nothing, "", "", "D", "")
+        Mattermost.with_client(client) do
+            Agentif.start_streaming(stream_ch)
+            Agentif.append_to_stream(stream_ch, "Hello")
+            Agentif.append_to_stream(stream_ch, " world")
+            Agentif.finish_streaming(stream_ch)
+            Agentif.close_channel(stream_ch)
+        end
+        @test length(stream_starts) == 1
+        @test stream_starts[1].channel_id == "chan-stream"
+        @test stream_starts[1].root_id == "root-stream"
+        @test stream_ch.sm === nothing
+        @test stream_ch.io === nothing
+        @test stream_ch.post_id == "stream-post-1"
+        @test Vo.get_followup_session_key(stream_ch) == Agentif.channel_id(stream_ch)
+
+        # Outgoing send should preserve markdown text and record post_id.
+        markdown = "# Heading\n- item\n```julia\nx = 1\n```"
+        out_ch = ext.MattermostChannel("chan-out", "", "", client, nothing, nothing, "", "", "O", "")
+        Mattermost.with_client(client) do
+            Agentif.send_message(out_ch, markdown)
+        end
+        @test create_post_calls[end].channel_id == "chan-out"
+        @test create_post_calls[end].message == markdown
+        @test create_post_calls[end].root_id === nothing
+        @test out_ch.post_id == "post-1"
+        @test Vo.get_followup_session_key(out_ch) == "mattermost:chan-out:post-1"
+
+        threaded_out = ext.MattermostChannel("chan-out", "root-123", "", client, nothing, nothing, "", "", "O", "")
+        Mattermost.with_client(client) do
+            Agentif.send_message(threaded_out, markdown)
+        end
+        @test create_post_calls[end].root_id == "root-123"
+        @test Vo.get_followup_session_key(threaded_out) == Agentif.channel_id(threaded_out)
+
+        function posted_event(; user_id="U1", message="hello", channel_id="chan-top", root_id="", post_id="post-top", post_type="", sender_name="alice", channel_type="O")
+            post_payload = Mattermost.JSON.Object(
+                "user_id" => user_id,
+                "message" => message,
+                "channel_id" => channel_id,
+                "root_id" => root_id,
+                "id" => post_id,
+                "type" => post_type,
+            )
+            return Mattermost.WebSocketEvent(
+                "posted",
+                Mattermost.JSON.Object(
+                    "post" => Mattermost.JSON.json(post_payload),
+                    "sender_name" => sender_name,
+                    "channel_type" => channel_type,
+                ),
+                Mattermost.JSON.Object(),
+                1,
+            )
+        end
+
+        # Top-level post should map to per-thread session key via post_id root.
+        Mattermost.with_client(client) do
+            ext._handle_posted(posted_event(), "UBOT", "vo", assistant)
+        end
+        @test isready(assistant.event_queue)
+        ev_post = take!(assistant.event_queue)
+        @test ev_post isa ext.MattermostMessageEvent
+        @test !ev_post.direct_ping
+        @test Agentif.channel_id(Vo.get_channel(ev_post)) == "mattermost:chan-top:post-top"
+
+        # Mention in a group channel should direct-ping.
+        Mattermost.with_client(client) do
+            ext._handle_posted(posted_event(; message="hey @Vo please check", post_id="post-mention", sender_name="@bob"), "UBOT", "vo", assistant)
+        end
+        @test isready(assistant.event_queue)
+        ev_mention = take!(assistant.event_queue)
+        @test ev_mention isa ext.MattermostMessageEvent
+        @test ev_mention.direct_ping
+        @test Vo.event_content(ev_mention) == "[bob]: hey @Vo please check"
+
+        # DMs always count as direct_ping.
+        Mattermost.with_client(client) do
+            ext._handle_posted(posted_event(; channel_type="D", post_id="post-dm"), "UBOT", "vo", assistant)
+        end
+        @test isready(assistant.event_queue)
+        ev_dm = take!(assistant.event_queue)
+        @test ev_dm isa ext.MattermostMessageEvent
+        @test ev_dm.direct_ping
+
+        # System posts and bot-self posts should be ignored.
+        drain_events!()
+        Mattermost.with_client(client) do
+            ext._handle_posted(posted_event(; post_type="system_join_channel", post_id="post-system"), "UBOT", "vo", assistant)
+            ext._handle_posted(posted_event(; user_id="UBOT", post_id="post-self"), "UBOT", "vo", assistant)
+        end
+        @test !isready(assistant.event_queue)
+
+        # Single posted event should emit exactly one message event.
+        Mattermost.with_client(client) do
+            ext._handle_event(posted_event(; message="@vo hi", post_id="post-once"), "UBOT", "vo", assistant)
+        end
+        count = 0
+        while isready(assistant.event_queue)
+            take!(assistant.event_queue)
+            count += 1
+        end
+        @test count == 1
+
+        reaction_payload = Mattermost.JSON.Object(
+            "user_id" => "U2",
+            "emoji_name" => "thumbsup",
+            "post_id" => "post-target",
+        )
+        reaction_event = Mattermost.WebSocketEvent(
+            "reaction_added",
+            Mattermost.JSON.Object("reaction" => Mattermost.JSON.json(reaction_payload)),
+            Mattermost.JSON.Object("channel_id" => "chan-react"),
+            2,
+        )
+        Mattermost.with_client(client) do
+            ext._handle_reaction(reaction_event, "UBOT", assistant)
+        end
+        @test isready(assistant.event_queue)
+        ev_reaction = take!(assistant.event_queue)
+        @test ev_reaction isa ext.MattermostReactionEvent
+        @test Agentif.channel_id(Vo.get_channel(ev_reaction)) == "mattermost:chan-react:root-from-post"
+        @test occursin("thumbsup", Vo.event_content(ev_reaction))
+    finally
+        ext.CREATE_POST_FN[] = original_create_post_fn
+        ext.GET_POST_FN[] = original_get_post_fn
+        ext.SEND_STREAMING_MESSAGE_FN[] = original_send_streaming_message_fn
+        ext.STREAM_APPEND_FN[] = original_stream_append_fn
+        ext.STREAM_FLUSH_FN[] = original_stream_flush_fn
+        ext.STREAM_FINISH_FN[] = original_stream_finish_fn
+    end
+
+    close(assistant.db)
 end
 
 @testset "VoSignalExt event mapping" begin
