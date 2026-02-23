@@ -59,6 +59,7 @@ julia = "1.10"
 
 [extras]
 GitHub = "bc5e4493-9b4d-5f90-b8aa-2b2bcaad7a26"
+HTTP = "cd3eb016-35fb-5094-929b-558a96fad6f3"
 JMAP = "40da3204-f0f7-47a6-9ee8-6f8207b67b8d"
 MSTeams = "730ab40b-c28c-4fcb-83ce-ff189233d76d"
 Mattermost = "c9a394b0-b131-4b99-aeb4-b011b7b7f934"
