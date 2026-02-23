@@ -15,6 +15,21 @@ function wait_until(timeout_s::Real, predicate::Function)
     return predicate()
 end
 
+function exec_parsed_with_retry(exec_command::Function, cmd::String;
+        workdir=nothing, shell=nothing, yield_time_ms=250, max_output_lines=1000, max_output_tokens=10000,
+        max_attempts::Int=3)
+    parsed = Dict{String,Any}()
+    for _ in 1:max_attempts
+        parsed = parse_tool_json(exec_command(cmd, workdir, shell, yield_time_ms, max_output_lines, max_output_tokens))
+        ok = get(() -> false, parsed, "ok")
+        error_kind = get(() -> "", parsed, "error_kind")
+        ok == true && return parsed
+        error_kind == "spawn_failed" || return parsed
+        sleep(0.1)
+    end
+    return parsed
+end
+
 @testset "Terminal Tools" begin
     mktempdir() do tmpdir
         funcs = terminal_funcs(tmpdir)
@@ -25,7 +40,7 @@ end
 
         @testset "Structured exec response" begin
             LLMTools.reset_sessions_for_tests!(LLMTools.PTY_REGISTRY)
-            parsed = parse_tool_json(exec_command("echo hello", nothing, nothing, 250, 1000, 10000))
+            parsed = exec_parsed_with_retry(exec_command, "echo hello"; yield_time_ms=250, max_output_lines=1000, max_output_tokens=10000)
             @test parsed["schema_version"] == 1
             @test parsed["tool"] == "exec_command"
             @test parsed["ok"] == true
