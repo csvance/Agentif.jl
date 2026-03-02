@@ -95,7 +95,25 @@ function create_worker_tools()
     ensure_cleanup_task_running!(WORKER_REGISTRY)
 
     exec_code = @tool(
-        "Execute Julia code in a new persistent Worker process. Returns structured JSON with the result. The worker stays alive for follow-up eval_code calls using the returned worker_id.",
+        """Launch a NEW Julia worker process and evaluate code in it.
+Use this to start a fresh execution environment. The worker process persists after this call — use the returned `worker_id` with `eval_code` for follow-up evaluations in the same process.
+Do NOT call this for follow-up work on an existing worker; use `eval_code` instead.
+
+Arguments:
+- `code::String` — Julia code to evaluate. All expressions are executed; stdout and the return value of the last expression are captured.
+- `timeout_s::Union{Nothing, Int}` (default: nothing) — Optional timeout in seconds. `nothing` means no timeout.
+
+Behavior:
+- Spawns a new Julia process (~1-2s startup latency). The worker inherits the parent's active Julia project/environment.
+- All state (variables, loaded packages, module definitions) persists in the worker for subsequent `eval_code` calls.
+- Output combines captured stdout with the string representation of the last expression's return value.
+- Max 10 concurrent workers. Old exited workers are auto-cleaned, but prefer `kill_worker` to free resources explicitly.
+
+Examples:
+- `exec_code("x = 42; println(x)")` → creates worker, prints "42", returns worker_id for reuse.
+- `exec_code("using Statistics; mean([1,2,3])")` → loads Statistics (persists), returns 2.0.
+
+Returns structured JSON with `ok`, `status`, `session_id` (the worker_id), `output`, and `result`.""",
         exec_code(
             code::String,
             timeout_s::Union{Nothing, Int} = nothing,
@@ -175,7 +193,24 @@ function create_worker_tools()
     )
 
     eval_code = @tool(
-        "Evaluate Julia code in an existing Worker process by worker_id. State from previous eval/exec calls persists (variables, loaded packages). Returns structured JSON with the result.",
+        """Evaluate Julia code in an EXISTING worker process.
+Use this for follow-up evaluations on a worker previously created by `exec_code`. All state from prior calls (variables, loaded packages, module definitions) persists.
+Do NOT use this to start a new worker — use `exec_code` instead.
+
+Arguments:
+- `worker_id::Int` — ID of an existing worker, as returned by `exec_code` in the `session_id` field.
+- `code::String` — Julia code to evaluate. All expressions are executed; stdout and the return value of the last expression are captured.
+- `timeout_s::Union{Nothing, Int}` (default: nothing) — Optional timeout in seconds. `nothing` means no timeout.
+
+Gotchas:
+- Returns an error if the worker_id does not exist or the worker has exited. Use `list_workers` to check.
+- If the worker exits during evaluation (e.g. `exit()`), it is removed from the registry automatically.
+
+Examples:
+- After `exec_code("x = 10")` returns worker_id=1: `eval_code(1, "x + 5")` → returns 15.
+- `eval_code(1, "push!(results, new_data); length(results)")` → mutates and queries persistent state.
+
+Returns structured JSON with `ok`, `status`, `session_id`, `output`, and `result`.""",
         eval_code(
             worker_id::Int,
             code::String,
@@ -253,7 +288,18 @@ function create_worker_tools()
     )
 
     kill_worker = @tool(
-        "Terminate a Worker process by worker_id and return structured JSON status.",
+        """Terminate a worker process and free its resources.
+Use this to explicitly shut down a worker you no longer need. Prefer this over letting workers idle, especially when approaching the 10-worker limit.
+
+Arguments:
+- `worker_id::Int` — ID of the worker to terminate, as returned by `exec_code`.
+
+Behavior:
+- Immediately kills the worker process. All in-process state is lost.
+- Returns an error if the worker_id is not found (it may have already exited).
+- Idempotent in effect: calling on an already-exited worker simply returns a not-found error.
+
+Returns structured JSON with `ok`, `status`, and confirmation message.""",
         kill_worker(worker_id::Int) = begin
             start_time = time()
             meta = remove_session!(WORKER_REGISTRY, worker_id; mark_status = SESSION_STATUS_KILLED, close_session = true)
@@ -287,7 +333,17 @@ function create_worker_tools()
     )
 
     list_workers = @tool(
-        "List all active Worker processes with their IDs, status, and metadata.",
+        """List all active worker processes and their current state.
+Use this to discover available worker_ids, check worker status, or diagnose capacity issues before creating new workers.
+
+Arguments: none.
+
+Returns structured JSON with:
+- `active_workers` — count of live workers.
+- `max_workers` — the 10-worker concurrency limit.
+- `workers` — array of objects, each with `worker_id`, `status` ("running"/"exited"/"killed"), `description` (truncated initial code), `age_s`, and `idle_s`.
+
+Automatically cleans up exited workers before reporting.""",
         list_workers() = begin
             cleanup_exited_sessions!(WORKER_REGISTRY)
             sessions_snapshot = lock(WORKER_REGISTRY.lock) do

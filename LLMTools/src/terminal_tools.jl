@@ -69,7 +69,23 @@ function create_terminal_tools(base_dir::AbstractString = pwd())
     end
 
     exec_command = @tool(
-        "Execute a shell command in a PTY session. Returns a structured JSON response with status, output, truncation metadata, and output events.",
+        """Execute a shell command in a new PTY (pseudo-terminal) session.
+
+Use this to run any shell command. If the command finishes within `yield_time_ms`, the session auto-closes and no `session_id` is returned. If the command is still running after `yield_time_ms`, a `session_id` IS returned — use `write_stdin` to send further input or read more output, and `kill_session` to stop it.
+
+Arguments:
+- `cmd` (String, required): The shell command to execute.
+- `workdir` (String, optional): Working directory. Defaults to the agent's base directory.
+- `shell` (String, optional): Shell to use. Defaults to "bash" (or "powershell" on Windows).
+- `yield_time_ms` (Int, optional): How long (in ms) to wait for initial output before returning. Default: 10000 (10s). Minimum: 100.
+- `max_output_lines` (Int, optional): Truncate output beyond this many lines.
+- `max_output_tokens` (Int, optional): Truncate output beyond this many tokens.
+
+Examples:
+- Quick command: `exec_command(cmd="ls -la")` — finishes fast, no session_id returned.
+- Long-running: `exec_command(cmd="tail -f /var/log/syslog")` — returns a session_id for follow-up via `write_stdin`.
+
+Limits: Maximum 20 concurrent sessions. Old exited sessions are auto-cleaned. Output is truncated by both line count and token count.""",
         exec_command(
             cmd::String,
             workdir::Union{Nothing, String} = nothing,
@@ -199,7 +215,22 @@ function create_terminal_tools(base_dir::AbstractString = pwd())
     )
 
     write_stdin = @tool(
-        "Write to an existing PTY session. Returns structured JSON response with status, output deltas, and truncation metadata.",
+        """Send input to a running PTY session and read new output.
+
+Use this to interact with a long-running process started by `exec_command`. Only works when `exec_command` returned a `session_id` (meaning the process is still running). Do NOT use this to start new commands — use `exec_command` instead.
+
+Arguments:
+- `session_id` (Int, required): The session ID returned by `exec_command`.
+- `chars` (String, optional): Characters to send to the process. Include "\\n" to submit a command. Default: "" (empty — just reads pending output without sending anything).
+- `yield_time_ms` (Int, optional): How long (in ms) to wait for output after writing. Default: 250. Minimum: 50.
+- `max_output_lines` (Int, optional): Truncate output beyond this many lines.
+- `max_output_tokens` (Int, optional): Truncate output beyond this many tokens.
+
+Examples:
+- Send a command: `write_stdin(session_id=1, chars="yes\\n")`
+- Just read output: `write_stdin(session_id=1)` — sends nothing, returns any pending output.
+
+Gotchas: If the session has exited, returns an error. The `chars` value is sent raw — you almost always want to append "\\n" to execute a line.""",
         write_stdin(
             session_id::Int,
             chars::String = "",
@@ -308,7 +339,14 @@ function create_terminal_tools(base_dir::AbstractString = pwd())
     )
 
     kill_session = @tool(
-        "Terminate a PTY session by session_id and return structured JSON status.",
+        """Terminate a running PTY session.
+
+Use this to stop a long-running process that was started by `exec_command`. Safe to call on sessions that have already exited (returns a not-found status).
+
+Arguments:
+- `session_id` (Int, required): The session ID to terminate.
+
+Example: `kill_session(session_id=1)`""",
         kill_session(session_id::Int) = begin
             start_time = time()
             meta = remove_session!(PTY_REGISTRY, session_id; mark_status = SESSION_STATUS_KILLED, close_session = true)
@@ -349,7 +387,13 @@ function create_terminal_tools(base_dir::AbstractString = pwd())
     )
 
     list_sessions = @tool(
-        "List all active PTY sessions in structured JSON with status and metadata.",
+        """List all active PTY sessions with their status and metadata.
+
+Use this to check which sessions are still running, find session IDs for `write_stdin` or `kill_session`, or diagnose session limits. Takes no arguments.
+
+Returns for each session: session_id, status (running/exited/killed), command, workdir, age (seconds since creation), and idle time (seconds since last interaction).
+
+Example: `list_sessions()`""",
         list_sessions() = begin
             cleanup_exited_sessions!(PTY_REGISTRY)
             sessions_snapshot = lock(PTY_REGISTRY.lock) do

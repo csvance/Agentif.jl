@@ -204,7 +204,22 @@ end
 function _create_subagent_tools(es::LLMToolsEventSource)
 
     start_tool = @tool(
-        """Start a new sub-agent with its own system prompt and initial message. By default runs asynchronously — returns immediately and you'll be notified when the sub-agent completes. Set run_sync=true to block and get the result directly (use when confident the task will complete quickly). The 'prompt' parameter describes what you'll receive back when notified (only used in async mode).""",
+        """Spawn an independent child agent with its own system prompt, tools, and context to perform a delegated task.
+
+Use this to delegate complex, self-contained tasks (research, code generation, analysis) that benefit from a separate instruction set and tool access. The child agent gets coding tools, worker tools, and web tools. Prefer start_worker for pure Julia computation or start_pty for shell commands.
+
+Runs ASYNC by default: returns immediately, you receive a notification event when the sub-agent finishes. Set run_sync=true to block and return the result directly (only for tasks you expect to complete quickly).
+
+Arguments:
+- name (String, required): Unique session identifier. MUST be kebab-case matching ^[a-z0-9]+(-[a-z0-9]+)*\$ — e.g. "code-review", "data-fetch", "analyze3". No uppercase, spaces, or underscores.
+- system_prompt (String, required): The child agent's system instructions. This defines the sub-agent's role and behavior.
+- input_message (String, required): The task or question to send to the child agent.
+- prompt (String, optional): Notification context prepended to the async completion event. Use it to remind yourself what you delegated — e.g. "Summary of error logs from service X". Ignored when run_sync=true.
+- run_sync (Bool, optional): If true, blocks until the sub-agent finishes and returns its output directly. Default: false (async).
+
+Examples:
+- start_subagent("refactor-auth", "You are a senior Julia developer...", "Refactor the auth module to use token-based sessions")
+- start_subagent("quick-check", "You are a code reviewer.", "Is this function type-stable?", run_sync=true)""",
         start_subagent(
             name::String,
             system_prompt::String,
@@ -277,7 +292,19 @@ function _create_subagent_tools(es::LLMToolsEventSource)
     )
 
     message_tool = @tool(
-        """Send a follow-up message to an existing sub-agent. By default runs asynchronously — returns immediately and you'll be notified when the sub-agent responds. Set run_sync=true to block and get the result directly.""",
+        """Send a follow-up message to a previously started sub-agent, continuing its conversation with full prior context.
+
+Use this to ask follow-up questions, request refinements, or give the sub-agent additional instructions after its initial task completes. The sub-agent retains all state from prior interactions.
+
+The sub-agent must be in "completed" status — it cannot receive messages while still running. Use list_subagents to check status. Runs ASYNC by default; set run_sync=true to block and get the response directly.
+
+Arguments:
+- name (String, required): The name of an existing sub-agent session (as given to start_subagent).
+- input_message (String, required): The follow-up message or question to send.
+- run_sync (Bool, optional): If true, blocks until the sub-agent responds. Default: false (async).
+
+Example:
+- message_subagent("refactor-auth", "Now add unit tests for the new token validation function")""",
         message_subagent(
             name::String,
             input_message::String,
@@ -348,7 +375,9 @@ function _create_subagent_tools(es::LLMToolsEventSource)
     )
 
     list_tool = @tool(
-        "List all active sub-agent sessions with their status and age.",
+        """List all active sub-agent sessions with their current status and timing info.
+
+Returns each sub-agent's name, status (running/completed/error/killed), age since creation, and idle time since last activity. Returns "No active sub-agents" if none exist. Use this to check if a sub-agent has finished before calling message_subagent, or to find sessions to kill.""",
         list_subagents() = begin
             lines = String[]
             lock(es.lock) do
@@ -364,7 +393,12 @@ function _create_subagent_tools(es::LLMToolsEventSource)
     )
 
     kill_tool = @tool(
-        "Kill and remove a sub-agent session by name.",
+        """Terminate and remove a sub-agent session, freeing its name for reuse.
+
+Interrupts the sub-agent if still running and unregisters its event handler. Use this to clean up finished sub-agents you no longer need, or to force-stop a stuck/runaway sub-agent.
+
+Arguments:
+- name (String, required): The name of the sub-agent session to kill.""",
         kill_subagent(name::String) = begin
             session = _cleanup_session!(es, name)
             session === nothing && return "No sub-agent named '$name'"
@@ -383,7 +417,22 @@ end
 function _create_pty_tools(es::LLMToolsEventSource)
 
     start_tool = @tool(
-        """Start a new PTY (terminal) session with a shell command. By default runs asynchronously — returns immediately and you'll be notified when output is available. Set run_sync=true to block and get the initial output directly (use for quick commands).""",
+        """Start a persistent terminal (PTY) session and run a shell command in it.
+
+Use this for shell commands, especially long-running ones like servers, builds, test suites, or interactive processes. For quick one-shot commands, set run_sync=true. For pure Julia computation, prefer start_worker. For tasks needing LLM reasoning, prefer start_subagent.
+
+Runs ASYNC by default: returns immediately, you receive notification events as terminal output becomes available (polled every 0.5s). When the process exits, you get a final notification with the exit code. Set run_sync=true to block ~0.5s and return the initial output directly.
+
+Arguments:
+- name (String, required): Unique session identifier. MUST be kebab-case matching ^[a-z0-9]+(-[a-z0-9]+)*\$ — e.g. "test-run", "dev-server", "build1". No uppercase, spaces, or underscores.
+- cmd (String, required): The shell command to execute (run via bash -l -c on Unix, powershell on Windows).
+- prompt (String, optional): Notification context prepended to async output events. Use to label what this terminal is doing — e.g. "Test suite output". Ignored when run_sync=true.
+- workdir (String, optional): Working directory for the command. Defaults to the agent's configured base_dir.
+- run_sync (Bool, optional): If true, blocks ~0.5s and returns initial output. Default: false (async).
+
+Examples:
+- start_pty("test-run", "julia --project -e 'using Pkg; Pkg.test()'", "Test results")
+- start_pty("quick-ls", "ls -la /tmp", run_sync=true)""",
         start_pty(
             name::String,
             cmd::String,
@@ -480,7 +529,21 @@ function _create_pty_tools(es::LLMToolsEventSource)
     )
 
     write_tool = @tool(
-        """Write input to an existing PTY session. By default runs asynchronously — the polling task will notify you when output is available. Set run_sync=true to block briefly and return any immediate output.""",
+        """Send raw input to an existing PTY terminal session.
+
+Use this to type commands, answer interactive prompts, send Ctrl-C (via "\\x03"), or provide stdin data to a running process. The PTY must be in "running" status — use list_ptys to check.
+
+IMPORTANT: Input is sent raw to the terminal. You MUST include "\\n" at the end to execute a command (e.g. "ls -la\\n"). Without "\\n", the text is typed but not submitted.
+
+Runs ASYNC by default: the background polling task will send you a notification when output appears. Set run_sync=true to block ~0.5s and return any immediate output.
+
+Arguments:
+- name (String, required): The name of an existing PTY session (as given to start_pty).
+- input (String, required): Raw text to send to the terminal. Include "\\n" to execute. Use "\\x03" for Ctrl-C.
+- run_sync (Bool, optional): If true, blocks ~0.5s and returns immediate output. Default: false (async).
+
+Example:
+- write_pty("dev-server", "curl localhost:8080/health\\n", run_sync=true)""",
         write_pty(
             name::String,
             input::String,
@@ -504,7 +567,9 @@ function _create_pty_tools(es::LLMToolsEventSource)
     )
 
     list_tool = @tool(
-        "List all active PTY sessions with their status, command, and age.",
+        """List all active PTY terminal sessions with their current status and timing info.
+
+Returns each PTY's name, status (running/exited/error/killed), age since creation, and idle time since last activity. Returns "No active PTY sessions" if none exist. Use this to check if a PTY is still running before calling write_pty, or to find sessions to kill.""",
         list_ptys() = begin
             lines = String[]
             lock(es.lock) do
@@ -520,7 +585,12 @@ function _create_pty_tools(es::LLMToolsEventSource)
     )
 
     kill_tool = @tool(
-        "Kill and remove a PTY session by name.",
+        """Terminate and remove a PTY terminal session, freeing its name for reuse.
+
+Kills the underlying process, stops output polling, and unregisters the event handler. Use this to clean up finished sessions or force-stop a running process.
+
+Arguments:
+- name (String, required): The name of the PTY session to kill.""",
         kill_pty(name::String) = begin
             session = _cleanup_session!(es, name)
             session === nothing && return "No PTY session named '$name'"
@@ -543,7 +613,21 @@ end
 function _create_worker_tools(es::LLMToolsEventSource)
 
     start_tool = @tool(
-        """Start a new Julia worker process and execute initial code. By default runs asynchronously — returns immediately and you'll be notified when execution completes. Set run_sync=true to block and get the result directly (use for quick computations).""",
+        """Spawn a persistent Julia worker process and execute initial Julia code on it.
+
+Use this for Julia computations, data processing, package operations, or any task that benefits from a persistent Julia environment. Variables, loaded packages, and defined functions persist across subsequent eval_worker calls. For shell commands, prefer start_pty. For tasks needing LLM reasoning, prefer start_subagent.
+
+Runs ASYNC by default: returns immediately, you receive a notification event when the code finishes executing. Set run_sync=true to block and return the result directly (for quick computations).
+
+Arguments:
+- name (String, required): Unique session identifier. MUST be kebab-case matching ^[a-z0-9]+(-[a-z0-9]+)*\$ — e.g. "data-proc", "analysis1", "pkg-test". No uppercase, spaces, or underscores.
+- code (String, required): Julia code to evaluate. Runs in a fresh worker process. Output includes both the return value and any stdout/stderr.
+- prompt (String, optional): Notification context prepended to the async completion event. Use to label what this worker is computing — e.g. "CSV parsing results". Ignored when run_sync=true.
+- run_sync (Bool, optional): If true, blocks until execution completes and returns the output. Default: false (async).
+
+Examples:
+- start_worker("data-proc", "using CSV, DataFrames; df = CSV.read(\\"data.csv\\", DataFrame); describe(df)", "Data summary")
+- start_worker("quick-calc", "sum(1:1_000_000)", run_sync=true)""",
         start_worker(
             name::String,
             code::String,
@@ -620,7 +704,19 @@ function _create_worker_tools(es::LLMToolsEventSource)
     )
 
     eval_tool = @tool(
-        """Evaluate Julia code on an existing worker process. State from previous calls persists. By default runs asynchronously — returns immediately and you'll be notified when execution completes. Set run_sync=true to block and get the result directly.""",
+        """Evaluate Julia code on an existing worker process, with all prior state (variables, packages, functions) preserved.
+
+Use this to run follow-up computations on a worker created by start_worker. All state from previous start_worker and eval_worker calls persists — you can reference variables and functions defined earlier. The worker must not be in "running" status; use list_workers to check.
+
+Runs ASYNC by default: returns immediately, you receive a notification when execution completes. Set run_sync=true to block and return the result directly.
+
+Arguments:
+- name (String, required): The name of an existing worker session (as given to start_worker).
+- code (String, required): Julia code to evaluate. Can reference variables/functions from prior calls.
+- run_sync (Bool, optional): If true, blocks until execution completes. Default: false (async).
+
+Example:
+- eval_worker("data-proc", "filter(row -> row.age > 30, df) |> nrow", run_sync=true)""",
         eval_worker(
             name::String,
             code::String,
@@ -682,7 +778,9 @@ function _create_worker_tools(es::LLMToolsEventSource)
     )
 
     list_tool = @tool(
-        "List all active worker sessions with their status and age.",
+        """List all active Julia worker sessions with their current status and timing info.
+
+Returns each worker's name, status (running/completed/error/killed), age since creation, and idle time since last activity. Returns "No active worker sessions" if none exist. Use this to check if a worker has finished before calling eval_worker, or to find sessions to kill.""",
         list_workers() = begin
             lines = String[]
             lock(es.lock) do
@@ -698,7 +796,12 @@ function _create_worker_tools(es::LLMToolsEventSource)
     )
 
     kill_tool = @tool(
-        "Kill and remove a worker session by name.",
+        """Terminate and remove a Julia worker session, freeing its name for reuse.
+
+Kills the underlying worker process and unregisters the event handler. Use this to clean up finished workers you no longer need, or to force-stop a stuck computation.
+
+Arguments:
+- name (String, required): The name of the worker session to kill.""",
         kill_worker(name::String) = begin
             session = _cleanup_session!(es, name)
             session === nothing && return "No worker session named '$name'"

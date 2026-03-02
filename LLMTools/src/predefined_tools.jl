@@ -241,7 +241,22 @@ end
 function create_read_tool(base_dir::AbstractString)
     base = ensure_base_dir(base_dir)
     return @tool(
-        "Read the contents of a file. Output is truncated to 2000 lines or 50KB (whichever is hit first). Use offset and limit for large files.",
+        """Read the contents of a file and return its text.
+
+Use `read` when you know the file path and want to see its contents. For searching across many files, use `grep` instead. For listing directory contents, use `ls`.
+
+Arguments:
+- path (String, required): File path relative to the working directory.
+- offset (Int, optional): 1-based line number to start reading from. Errors if beyond end of file.
+- limit (Int, optional): Maximum number of lines to return starting from offset.
+
+Output is truncated to 2000 lines or 50KB, whichever is hit first. If a single line exceeds 50KB, it is skipped with a hint to use sed. When output is truncated, a notice shows how to continue with the next offset.
+
+Examples:
+- `read("src/main.jl")` — read entire file
+- `read("src/main.jl", 100, 50)` — read 50 lines starting at line 100
+
+Errors if the file does not exist.""",
         read(path::String, offset::Union{Nothing, Int} = nothing, limit::Union{Nothing, Int} = nothing) = begin
             resolved = resolve_relative_path(base, path)
             isfile(resolved) || throw(ArgumentError("file not found: $path"))
@@ -280,7 +295,17 @@ end
 function create_write_tool(base_dir::AbstractString)
     base = ensure_base_dir(base_dir)
     return @tool(
-        "Write content to a file. Creates the file if it doesn't exist, overwrites if it does. Automatically creates parent directories.",
+        """Write content to a file, creating it if it doesn't exist.
+
+WARNING: This completely overwrites the file. To change specific parts of an existing file, use `edit` instead — it is safer and more precise.
+
+Arguments:
+- path (String, required): File path relative to the working directory. Parent directories are created automatically.
+- content (String, required): The full file content to write.
+
+Examples:
+- `write("config.toml", "[settings]\\nverbose = true")` — create a new config file
+- `write("src/new_module.jl", "module NewModule\\nend")` — create a new source file""",
         write(path::String, content::String) = begin
             resolved = resolve_relative_path(base, path)
             mkpath(dirname(resolved))
@@ -296,7 +321,20 @@ end
 function create_edit_tool(base_dir::AbstractString)
     base = ensure_base_dir(base_dir)
     return @tool(
-        "Edit a file by replacing exact text. The oldText must match exactly (including whitespace). Use this for precise, surgical edits.",
+        """Edit a file by replacing an exact text match with new text. Preferred over `write` for modifying existing files.
+
+The match is whitespace-sensitive and must be unique — if `oldText` appears more than once in the file, the call fails. Include enough surrounding context (nearby lines) to make the match unique.
+
+Arguments:
+- path (String, required): File path relative to the working directory.
+- oldText (String, required): The exact text to find. Must match exactly one location in the file, including whitespace and indentation.
+- newText (String, required): The replacement text. Must differ from oldText.
+
+Examples:
+- `edit("src/app.jl", "timeout = 30", "timeout = 60")` — change a single value
+- `edit("src/app.jl", "function foo()\\n    return 1\\nend", "function foo()\\n    return 2\\nend")` — replace a multi-line block
+
+Errors if: file not found, oldText not found, oldText matches more than once, or newText equals oldText.""",
         edit(path::String, oldText::String, newText::String) = begin
             resolved = resolve_relative_path(base, path)
             isfile(resolved) || throw(ArgumentError("file not found: $path"))
@@ -320,7 +358,19 @@ end
 function create_ls_tool(base_dir::AbstractString)
     base = ensure_base_dir(base_dir)
     return @tool(
-        "List directory contents. Returns entries sorted alphabetically, with '/' suffix for directories. Includes dotfiles. Output is truncated to 500 entries or 50KB (whichever is hit first).",
+        """List the contents of a single directory (non-recursive).
+
+Use `ls` to see what's in a directory. For recursive file search by name pattern, use `find`. For searching file contents, use `grep`.
+
+Arguments:
+- path (String or nothing, required): Directory path relative to the working directory, or nothing to list the working directory itself.
+- limit (Int, optional): Maximum number of entries to return. Defaults to 500.
+
+Entries are sorted alphabetically (case-insensitive). Directories have a trailing `/` suffix. Dotfiles are included. Output is truncated to 500 entries or 50KB, whichever is hit first.
+
+Examples:
+- `ls(nothing)` — list the working directory
+- `ls("src", 20)` — list first 20 entries in src/""",
         ls(path::Union{Nothing, String}, limit::Union{Nothing, Int} = nothing) = begin
             dir_path = resolve_search_path(base, path)
             isdir(dir_path) || throw(ArgumentError("not a directory: $(path === nothing ? "." : path)"))
@@ -380,7 +430,26 @@ function create_codex_tool()
     end
 
     return @tool(
-        "Run Codex CLI in exec mode on a directory. Prepends worktree requirements (default-branch checkout, create `/worktrees/<branch>`, work there, push, remove worktree). Research the package, evaluate the prompt, use the GitHub CLI tool to make code changes, commit to a branch, and push the branch (without opening a PR). Returns session_id, summary of work done, and branch name if created.",
+        """Delegate a coding task to an autonomous Codex CLI agent with full shell and git access.
+
+Use this tool to hand off substantial, self-contained code changes (bug fixes, new features, refactors) to a separate agent that works independently in a git worktree. Do NOT use this for quick lookups, questions, or tasks that need conversational back-and-forth — use `subagent` instead.
+
+The Codex agent automatically:
+1. Detects the repo's default branch (main/master).
+2. Creates a git worktree on a new branch under `/worktrees/<branch>`.
+3. Makes code changes, commits, and pushes the branch.
+4. Cleans up the worktree. It does NOT open a PR.
+
+Arguments:
+- `prompt` (String, required): The task description. Be specific — include file paths, expected behavior, and acceptance criteria. The agent has no prior context.
+- `directory` (String, required): Absolute path to the git repository to work in. Must exist and be a directory.
+- `timeout` (Int or nothing, default: nothing): Max seconds to wait. Use for potentially long-running tasks. `nothing` means no timeout.
+
+Returns a Dict with keys: "session_id", "directory", "summary" (work done), "branch" (branch name or nothing), "success" (Bool), and optionally "errors".
+
+Examples:
+- `codex("Fix the off-by-one error in src/parser.jl line 42. Add a test.", "/path/to/repo")`
+- `codex("Add a CLI flag --verbose that enables debug logging throughout the app.", "/path/to/repo", 300)`""",
         codex(prompt::String, directory::String, timeout::Union{Nothing, Int} = nothing) = begin
             isempty(prompt) && throw(ArgumentError("prompt is required"))
             isempty(directory) && throw(ArgumentError("directory is required"))
@@ -496,7 +565,25 @@ end
 
 function create_subagent_tool(parent_provider::Function)
     return @tool(
-        "Create and run a subagent with an independent prompt and input. Returns the subagent's response text. Useful for well-defined, isolatable tasks where the subagent can be specialized for the task and the parent agent can avoid unnecessary context pollution.",
+        """Spawn a child agent to perform an isolated sub-task and return its text response synchronously.
+
+Use this tool when you need to delegate a well-defined task (research, analysis, summarization, focused reasoning) to a separate context window, keeping the parent conversation clean. The subagent inherits the parent's model, API key, and tools (except `subagent` itself by default). Do NOT use this for code changes that need git/shell access — use `codex` instead.
+
+This call BLOCKS until the subagent finishes. The subagent's conversation history is discarded after it returns — only the final response text comes back to you.
+
+Arguments:
+- `system_prompt` (String, required): Defines the subagent's role, expertise, and constraints. Be precise — this is the only system-level guidance the subagent receives.
+- `input_message` (String, required): The task or question for the subagent. Include all necessary context since the subagent has no access to the parent's conversation history.
+
+Returns the subagent's final response as a String (truncated if very long).
+
+Examples:
+- `subagent("You are an expert Julia developer.", "Explain the difference between abstract and concrete types, with examples.")`
+- `subagent("You are a code reviewer. Be concise and focus on correctness.", "Review this function for bugs:\\n\\nfunction foo(x)\\n  return x[end+1]\\nend")`
+
+Gotchas:
+- Nesting depth is controlled by AGENTIF_SUBAGENT_ALLOW_NESTED env var ("0" to disable). Default allows nesting.
+- Tool inheritance is controlled by AGENTIF_SUBAGENT_ALLOW_TOOLS env var ("0" to disable). Default inherits parent tools.""",
         subagent(system_prompt::String, input_message::String) = begin
             parent_agent = parent_provider()
             parent_agent === nothing && throw(ArgumentError("parent agent not initialized for subagent"))
@@ -535,7 +622,20 @@ end
 function create_find_tool(base_dir::AbstractString)
     base = ensure_base_dir(base_dir)
     return @tool(
-        "Search for files by glob pattern. Returns matching file paths relative to the search directory. Output is truncated to 1000 results or 50KB (whichever is hit first).",
+        """Recursively search for files and directories by glob pattern. Returns matching paths relative to the search directory.
+
+Use `find` to locate files by name or path pattern. For searching file contents, use `grep`. For listing a single directory, use `ls`.
+
+Arguments:
+- pattern (String, required): Glob pattern to match against relative paths. Supports `*` (any chars except `/`), `**` (any path segments), and `?` (single char). Examples: `"*.jl"`, `"src/**/*.jl"`, `"test_*.jl"`.
+- path (String or nothing, optional): Directory to search within, relative to the working directory. Defaults to the working directory.
+- limit (Int, optional): Maximum number of results. Defaults to 1000.
+
+Matched directories have a trailing `/` suffix. Output is also capped at 50KB.
+
+Examples:
+- `find("*.jl")` — find all Julia files recursively
+- `find("**/*test*.jl", "test")` — find test files under test/""",
         find(pattern::String, path::Union{Nothing, String} = nothing, limit::Union{Nothing, Int} = nothing) = begin
             isempty(pattern) && throw(ArgumentError("pattern is required"))
             search_dir = resolve_search_path(base, path)
@@ -589,7 +689,25 @@ end
 function create_grep_tool(base_dir::AbstractString)
     base = ensure_base_dir(base_dir)
     return @tool(
-        "Search file contents for a pattern. Returns matching lines with file paths and line numbers. Output is truncated to 100 matches or 50KB (whichever is hit first). Long lines are truncated to 500 chars.",
+        """Search file contents for a text pattern. Returns matching lines with file paths and line numbers.
+
+Use `grep` to find specific text or patterns inside files. For finding files by name, use `find`. For reading a known file, use `read`.
+
+Arguments:
+- pattern (String, required): Regex pattern by default. Set `literal=true` for exact string matching.
+- path (String or nothing, optional): File or directory to search in, relative to the working directory. Defaults to the working directory (recursive).
+- glob (String or nothing, optional): Glob pattern to filter which files are searched (e.g., `"*.jl"`). This filters files, not content.
+- ignoreCase (Bool or nothing, optional): Case-insensitive matching when true.
+- literal (Bool or nothing, optional): Treat pattern as a literal string, not regex.
+- context (Int or nothing, optional): Number of lines to show before and after each match (like `grep -C`).
+- limit (Int, optional): Maximum number of matches. Defaults to 100.
+
+Lines longer than 500 characters are truncated. Output is capped at 50KB.
+
+Examples:
+- `grep("function main")` — search all files for a regex pattern
+- `grep("TODO", nothing, "*.jl", true)` — case-insensitive search in Julia files only
+- `grep("error", "src/app.jl", nothing, nothing, true, 2)` — literal search in one file with 2 lines of context""",
         grep(
             pattern::String,
             path::Union{Nothing, String} = nothing,
@@ -1002,19 +1120,38 @@ end
 
 function create_web_fetch_tool()
     return @tool(
-        """Fetch content from a URL. Streams response to a temp file and returns truncated preview.
+        """Fetch content from a URL and return a truncated preview. The full response is saved to a temp file for pagination.
+
+        Use web_fetch to retrieve web pages, API responses, files, or any HTTP resource.
+        Use web_search first if you need to find URLs; use web_fetch to read content at a known URL.
 
         Parameters:
-        - url: The URL to fetch (required). Supports http:// and https://.
-        - method: HTTP method (default: GET). Supports GET, POST, PUT, DELETE, HEAD, OPTIONS.
-        - headers: JSON object of request headers (optional). Example: {"Authorization": "Bearer token"}
-        - body: Request body for POST/PUT (optional).
-        - extract_text: If true, strips HTML tags and returns readable text (default: false).
-        - timeout: Request timeout in seconds (default: 30).
-        - file_id: If provided, reads from a previously fetched file instead of making a new request.
-        - offset: Line offset for reading (default: 1). Use with file_id to continue reading.
+        - url (String, required): The URL to fetch. Supports http:// and https:// (bare domains auto-prepend https://).
+        - method (String, default "GET"): HTTP method. Supports GET, POST, PUT, DELETE, HEAD, OPTIONS, PATCH.
+        - headers (String or nothing, optional): Request headers as a JSON object string. Example: `{"Authorization": "Bearer token", "Content-Type": "application/json"}`
+        - body (String or nothing, optional): Request body for POST/PUT/PATCH requests. Ignored for other methods.
+        - extract_text (Bool, default false): When true, strips HTML tags and returns readable plain text. Only applies to HTML/XHTML content types. Set this to true when fetching web pages for reading.
+        - timeout (Int, default 30): Request timeout in seconds.
+        - file_id (String or nothing, optional): Read from a previously fetched temp file instead of making a new HTTP request. Returned by the first call in the `Saved to: file_id="..."` line.
+        - offset (Int or nothing, optional): Line number to start reading from (1-indexed). Use with file_id to paginate through large responses.
 
-        Returns: Status code, content type, file location, and truncated content preview.""",
+        Returns: Status code, content type, file size, file_id, and a truncated content preview.
+
+        Pagination pattern for large responses:
+          1. First call: `web_fetch(url, extract_text=true)` -> returns preview + file_id
+          2. Next page: `web_fetch(url, file_id="abc123", offset=150)` -> continues from line 150
+          The response tells you the exact offset to use next.
+
+        Limits and edge cases:
+        - Max response size is 10 MB; larger responses are truncated (noted in output).
+        - Binary content (images, PDFs, etc.) is detected automatically and cannot be previewed as text.
+        - Redirects are followed automatically (up to 5 hops); the final URL is shown in output.
+        - 4xx/5xx responses are returned (not thrown), so you can inspect error bodies.
+
+        Examples:
+          web_fetch("https://api.example.com/data")
+          web_fetch("https://example.com/page", extract_text=true)
+          web_fetch("https://api.example.com/items", method="POST", headers="{\\\"Content-Type\\\": \\\"application/json\\\"}", body="{\\\"name\\\": \\\"test\\\"}")""",
         web_fetch(
             url::String,
             method::String = "GET",
@@ -1450,14 +1587,27 @@ end
 
 function create_web_search_tool()
     return @tool(
-        """Search the web using DuckDuckGo. Returns a list of search results with titles, URLs, and snippets.
+        """Search the web using DuckDuckGo and return a list of results with titles, URLs, and snippets. No API key required.
+
+        Use web_search to find URLs, look up documentation, research current events, or discover resources.
+        After finding relevant results, use web_fetch(url) to read the full content of any result.
+        Do NOT use web_search if you already have the URL you need -- use web_fetch directly.
 
         Parameters:
-        - query: The search query (required).
-        - num_results: Maximum number of results to return (default: 10, max: 20).
-        - timeout: Request timeout in seconds (default: 30).
+        - query (String, required): The search query. Use specific keywords for best results; DuckDuckGo works best with concise, targeted queries.
+        - num_results (Int, default 10): Maximum number of results to return. Range: 1-20. May return fewer if DuckDuckGo has insufficient matches.
+        - timeout (Int, default 30): Request timeout in seconds.
 
-        Returns: List of search results with title, URL, and description snippet.""",
+        Returns: Numbered list of results, each with title, URL, and description snippet.
+
+        Tips:
+        - Include specific terms: "python requests library timeout" not "how to set timeout".
+        - Add "site:domain.com" to restrict results to a specific site.
+        - Results may be less comprehensive than Google; try rephrasing if initial results are poor.
+
+        Examples:
+          web_search("Julia language HTTP.jl documentation")
+          web_search("site:github.com openai api client", num_results=5)""",
         web_search(
             query::String,
             num_results::Int = 10,

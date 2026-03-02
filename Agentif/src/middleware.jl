@@ -129,7 +129,21 @@ end
 
 function _create_search_session_tool(store::SessionStore)
     return @tool(
-        "Search past session history (previous conversations) for relevant context. Returns matching snippets from past interactions.",
+        """Search past session history for relevant context from previous conversations.
+
+Use this tool to recall past decisions, find previous instructions, or look up what was discussed in earlier sessions. Only searches PAST sessions — not the current conversation.
+
+Arguments:
+- `query::String` (required): Natural-language search query. Uses hybrid semantic search (BM25 + vector similarity), so phrase your query descriptively rather than as exact keywords.
+- `limit::Union{Nothing, Int}` (default: 10): Maximum number of results to return.
+
+Returns matching snippets with entry IDs and relevance scores. Each result is truncated to 4000 characters.
+
+Results are scoped by channel — conversations from private channels are never leaked to other channels.
+
+Examples:
+- `search_session_history("what deployment strategy did we decide on")` — find a past decision
+- `search_session_history("error handling guidelines", 5)` — find up to 5 results about a topic""",
         search_session_history(query::String, limit::Union{Nothing, Int}=nothing) = begin
             n = limit === nothing ? 10 : limit
             ch = CURRENT_CHANNEL[]

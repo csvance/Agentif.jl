@@ -368,7 +368,19 @@ end
 
 # ─── Management tools ───
 
-const LIST_CHANNELS_TOOL = @tool "List all registered messaging channels with their IDs, type, and group/private status. Use the channel ID when calling add_job or add_event_handler." function list_channels()
+const LIST_CHANNELS_TOOL = @tool """List all registered messaging channels with their IDs, type (group/direct), and visibility (public/private).
+
+Channels represent messaging destinations — Mattermost channels, Telegram chats, the REPL, etc. Each channel has a unique ID string.
+
+When to use: Before calling add_job or add_event_handler, since both require a channel_id. Also useful for discovering what integrations are active.
+
+Arguments: none.
+
+Returns one line per channel: "- name (id) — group/direct, public/private".
+
+Example output:
+  - general (mm-abc123) — group, public
+  - repl — direct, private""" function list_channels()
     a = get_current_assistant()
     a === nothing && return "No assistant initialized"
     # Refresh channels from all event sources
@@ -390,7 +402,15 @@ const LIST_CHANNELS_TOOL = @tool "List all registered messaging channels with th
     isempty(lines) ? "No channels registered" : join(lines, "\n")
 end
 
-const LIST_EVENT_TYPES_TOOL = @tool "List all registered event types." function list_event_types()
+const LIST_EVENT_TYPES_TOOL = @tool """List all registered event types with their names and descriptions.
+
+Event types define the kinds of events the system can produce (e.g., "repl_input", "jmap_new_email", "tempus_job:daily-report"). Each event type can have event handlers attached to it via add_event_handler.
+
+When to use: Before calling add_event_handler, to see what event types are available to listen for.
+
+Arguments: none.
+
+Returns one line per event type: "- name: description".""" function list_event_types()
     a = get_current_assistant()
     a === nothing && return "No assistant initialized"
     lines = String[]
@@ -400,7 +420,15 @@ const LIST_EVENT_TYPES_TOOL = @tool "List all registered event types." function 
     isempty(lines) ? "No event types registered" : join(lines, "\n")
 end
 
-const LIST_EVENT_HANDLERS_TOOL = @tool "List all registered event handlers with their event types, channel, and prompt." function list_event_handlers()
+const LIST_EVENT_HANDLERS_TOOL = @tool """List all registered event handlers showing their IDs, subscribed event types, target channel, and prompt text.
+
+Event handlers define how the agent responds to events. When an event fires, matching handlers trigger an agent evaluation with the handler's prompt prepended to the event content, and the response is sent to the handler's target channel.
+
+When to use: To audit what automations are active, debug why events aren't being handled, or find handler IDs before calling remove_event_handler.
+
+Arguments: none.
+
+Returns one entry per handler with: ID, subscribed event types, channel, and a preview of the prompt text.""" function list_event_handlers()
     a = get_current_assistant()
     a === nothing && return "No assistant initialized"
     lines = String[]
@@ -417,7 +445,13 @@ const LIST_EVENT_HANDLERS_TOOL = @tool "List all registered event handlers with 
     isempty(lines) ? "No event handlers registered" : join(lines, "\n")
 end
 
-const GET_SYSTEM_PROMPT_TOOL = @tool "Retrieve the current agent system prompt text." function get_system_prompt()
+const GET_SYSTEM_PROMPT_TOOL = @tool """Retrieve the current agent system prompt text (your own instructions).
+
+When to use: To review your current instructions before modifying them with set_system_prompt, or to audit what behavioral guidelines are active.
+
+Arguments: none.
+
+Returns the full system prompt string.""" function get_system_prompt()
     a = get_current_assistant()
     a === nothing && return "No assistant initialized"
     return _with_busy_retry() do
@@ -425,7 +459,17 @@ const GET_SYSTEM_PROMPT_TOOL = @tool "Retrieve the current agent system prompt t
     end
 end
 
-const SET_SYSTEM_PROMPT_TOOL = @tool "Update the agent system prompt text used for future evaluations." function set_system_prompt(prompt::String)
+const SET_SYSTEM_PROMPT_TOOL = @tool """Update the agent system prompt — your own instructions for ALL future evaluations.
+
+WARNING: This change persists across restarts (stored in SQLite) and affects every future conversation. Use get_system_prompt first to review the current prompt before overwriting.
+
+Arguments:
+- prompt (String, required): The new system prompt text. Cannot be empty or whitespace-only.
+
+Gotchas:
+- Replaces the ENTIRE system prompt, not a partial update. Include everything you want to keep.
+- Takes effect on the NEXT evaluation, not the current one.
+- Use with care — a bad system prompt can break the agent's behavior.""" function set_system_prompt(prompt::String)
     a = get_current_assistant()
     a === nothing && return "No assistant initialized"
     isempty(strip(prompt)) && return "System prompt cannot be empty"
@@ -438,7 +482,22 @@ const SET_SYSTEM_PROMPT_TOOL = @tool "Update the agent system prompt text used f
     return "System prompt updated ($(length(prompt)) chars)"
 end
 
-const ADD_EVENT_HANDLER_TOOL = @tool "Register a new event handler. event_type_names is comma-separated. channel_id is required — use list_channels first to find available channel IDs." function add_event_handler(id::String, event_type_names::String, prompt::String, channel_id::String)
+const ADD_EVENT_HANDLER_TOOL = @tool """Register a new event handler that triggers an agent evaluation when specified events fire.
+
+When an event matches, the handler's prompt is prepended to the event content, and the combined text is evaluated as agent input. The response is sent to the handler's target channel.
+
+Arguments:
+- id (String, required): Unique identifier for this handler. Use a descriptive name like "email-summary" or "daily-standup".
+- event_type_names (String, required): Comma-separated event type names to listen for. Use list_event_types to see available types. Example: "jmap_new_email" or "repl_input,tempus_job:reminder".
+- prompt (String, required): Text prepended to the event content before evaluation. This is your instruction for how to handle the event. Example: "Summarize this email and flag if urgent."
+- channel_id (String, required): Where to send the response. Use list_channels first to find valid IDs.
+
+Example: add_event_handler("email-triage", "jmap_new_email", "Triage this email: if spam or marketing, archive it. If important, summarize it.", "mm-general")
+
+Gotchas:
+- Fails if event_type_names contains unknown event types (use list_event_types first).
+- Fails if channel_id is not a registered channel (use list_channels first).
+- If an id already exists, it will be replaced (upsert behavior).""" function add_event_handler(id::String, event_type_names::String, prompt::String, channel_id::String)
     a = get_current_assistant()
     a === nothing && return "No assistant initialized"
     cid = strip(channel_id)
@@ -455,7 +514,12 @@ const ADD_EVENT_HANDLER_TOOL = @tool "Register a new event handler. event_type_n
     "Event handler '$id' registered for channel '$cid'"
 end
 
-const REMOVE_EVENT_HANDLER_TOOL = @tool "Remove an event handler by its ID." function remove_event_handler(id::String)
+const REMOVE_EVENT_HANDLER_TOOL = @tool """Remove an event handler by its ID, stopping it from triggering on future events.
+
+Arguments:
+- id (String, required): The handler ID to remove. Use list_event_handlers to find IDs.
+
+Silently succeeds even if the ID doesn't exist.""" function remove_event_handler(id::String)
     a = get_current_assistant()
     a === nothing && return "No assistant initialized"
     unregister_event_handler!(a, id)
@@ -470,7 +534,13 @@ const MANAGEMENT_TOOLS = Agentif.AgentTool[
 
 # ─── Tempus tools ───
 
-const LIST_JOBS_TOOL = @tool "List all scheduled jobs with their cron schedule, status, and timezone." function list_jobs()
+const LIST_JOBS_TOOL = @tool """List all scheduled recurring jobs with their cron expression, enabled/disabled status, and timezone.
+
+When to use: To see what recurring automations are active, verify a job was created correctly, or find job names before calling remove_job.
+
+Arguments: none.
+
+Returns one line per job: "- name [cron_schedule] [enabled/disabled] [tz: timezone]".""" function list_jobs()
     a = get_current_assistant()
     a === nothing && return "No assistant initialized"
     jobs = Tempus.getJobs(a.scheduler.store)
@@ -484,7 +554,22 @@ const LIST_JOBS_TOOL = @tool "List all scheduled jobs with their cron schedule, 
     isempty(lines) ? "No scheduled jobs" : join(lines, "\n")
 end
 
-const ADD_JOB_TOOL = @tool "Schedule a recurring job with a cron expression (e.g. '0 9 * * *' for daily at 9am). The job fires the given prompt on the specified channel. Use list_channels to find channel IDs." function add_job(name::String, schedule::String, prompt::String, channel_id::String, timezone::Union{Nothing, String} = nothing)
+const ADD_JOB_TOOL = @tool """Schedule a recurring job that evaluates a prompt on a channel at a cron schedule.
+
+When the cron fires, the prompt text is sent as agent input on the specified channel — the agent evaluates it like any other message.
+
+Arguments:
+- name (String, required): Unique job name. Used as identifier for remove_job.
+- schedule (String, required): Cron expression with 5 fields: minute hour day-of-month month day-of-week.
+  Examples: "0 9 * * *" (daily 9am), "0 9 * * 1" (Mondays 9am), "*/30 * * * *" (every 30min), "0 0 1 * *" (1st of month midnight).
+- prompt (String, required): The text evaluated as agent input when the job fires. Example: "Give me a summary of unread emails from today."
+- channel_id (String, required): Target channel for the response. Use list_channels to find valid IDs.
+- timezone (String, optional): IANA timezone for the schedule (e.g., "America/New_York"). Defaults to the agent's configured timezone.
+
+Gotchas:
+- Fails if channel_id is not a registered channel.
+- Job names must be unique — reusing a name overwrites the previous job.
+- Jobs persist across restarts (stored in SQLite).""" function add_job(name::String, schedule::String, prompt::String, channel_id::String, timezone::Union{Nothing, String} = nothing)
     a = get_current_assistant()
     a === nothing && return "No assistant initialized"
     haskey(a._channels, channel_id) || return "Unknown channel: $channel_id"
@@ -503,7 +588,14 @@ const ADD_JOB_TOOL = @tool "Schedule a recurring job with a cron expression (e.g
     "Job '$name' scheduled: $schedule (timezone: $tz) -> channel: $channel_id"
 end
 
-const REMOVE_JOB_TOOL = @tool "Remove a scheduled job and its event handler by name." function remove_job(name::String)
+const REMOVE_JOB_TOOL = @tool """Remove a scheduled job by name, stopping all future executions.
+
+Also cleans up the associated event type and event handler.
+
+Arguments:
+- name (String, required): The job name as specified when created with add_job. Use list_jobs to find names.
+
+Silently succeeds even if the job doesn't exist.""" function remove_job(name::String)
     a = get_current_assistant()
     a === nothing && return "No assistant initialized"
     Tempus.purgeJob!(a.scheduler.store, name)
@@ -587,7 +679,23 @@ function _agent_data_visibility_tags(channel_id, channel_flags)
     return tags
 end
 
-const DB_STORE_TOOL = @tool "Store a key-value entry in your persistent scratch space. Use tags to categorize entries for later retrieval. Value can be plain text or JSON." function db_store(key::String, value::String, tags::Union{Nothing, String} = nothing)
+const DB_STORE_TOOL = @tool """Store a key-value entry in your persistent scratch space (survives restarts).
+
+Use this to remember facts, save intermediate results, or build up structured knowledge over time. Entries are searchable via db_search (semantic/keyword hybrid search).
+
+Arguments:
+- key (String, required): Unique identifier for the entry. If the key already exists, the value and tags are REPLACED (upsert). The original created_at timestamp is preserved on update.
+- value (String, required): The content to store. Can be plain text, JSON, or any string data.
+- tags (String, optional): Comma-separated tags for categorization and filtering. Tags are lowercased and deduplicated. Example: "meeting-notes,project-x,2024".
+
+Examples:
+- db_store("user-prefs", "Prefers concise responses, uses dark mode", "preferences")
+- db_store("api-key-location", "Stored in ~/.config/app/secrets.json", "config,secrets")
+
+Gotchas:
+- Keys are unique — storing with an existing key overwrites the value and tags.
+- Entries are scoped by channel visibility: data stored from a private channel is only searchable from that channel.
+- Value is indexed for semantic search, so descriptive text is more findable than raw IDs.""" function db_store(key::String, value::String, tags::Union{Nothing, String} = nothing)
     a = get_current_assistant()
     a === nothing && return "No assistant initialized"
     parsed_tags = _parse_tags(tags)
@@ -620,7 +728,22 @@ const DB_STORE_TOOL = @tool "Store a key-value entry in your persistent scratch 
     "Stored '$key'$tag_str"
 end
 
-const DB_SEARCH_TOOL = @tool "Search your stored data by text query. Optionally filter by tags (comma-separated, AND logic) and time range (after/before: relative like '7d','24h','30m' or absolute 'yyyy-mm-dd')." function db_search(query::String, tags::Union{Nothing, String} = nothing, after::Union{Nothing, String} = nothing, before::Union{Nothing, String} = nothing, limit::Union{Nothing, Int} = nothing)
+const DB_SEARCH_TOOL = @tool """Search your stored scratch space entries by semantic/keyword query.
+
+Uses hybrid search (BM25 keyword + vector similarity), so natural language queries work well. Use db_list_keys for browsing by tags/time without a search query.
+
+Arguments:
+- query (String, required): Search text. Natural language works best (e.g., "user preferences for notifications") but keywords also work.
+- tags (String, optional): Comma-separated tags to filter by (AND logic — all tags must match). Example: "project-x,meeting-notes".
+- after (String, optional): Only return entries created after this time. Relative: "7d", "24h", "30m". Absolute: "2024-01-15" or "2024-01-15T09:00:00".
+- before (String, optional): Only return entries created before this time. Same format as after.
+- limit (Int, optional): Max results to return. Default: 10.
+
+Returns matching entries with keys and relevance scores, sorted by relevance.
+
+Gotchas:
+- Results are channel-scoped: entries from private channels are only visible in that channel. Public entries are always visible.
+- Time filters apply to the entry's created_at timestamp, not updated_at.""" function db_search(query::String, tags::Union{Nothing, String} = nothing, after::Union{Nothing, String} = nothing, before::Union{Nothing, String} = nothing, limit::Union{Nothing, Int} = nothing)
     a = get_current_assistant()
     a === nothing && return "No assistant initialized"
     n = limit === nothing ? 10 : limit
@@ -671,7 +794,21 @@ const DB_SEARCH_TOOL = @tool "Search your stored data by text query. Optionally 
     return join(lines, "\n")
 end
 
-const DB_LIST_KEYS_TOOL = @tool "List keys stored in your scratch space. Optionally filter by tags (comma-separated, AND logic) and time range." function db_list_keys(tags::Union{Nothing, String} = nothing, after::Union{Nothing, String} = nothing, before::Union{Nothing, String} = nothing, limit::Union{Nothing, Int} = nothing)
+const DB_LIST_KEYS_TOOL = @tool """List keys in your scratch space, sorted by most recently updated. Use this to browse stored entries without a search query.
+
+For finding specific content by meaning, use db_search instead.
+
+Arguments:
+- tags (String, optional): Comma-separated tags to filter by (AND logic — all tags must match). Example: "project-x,config".
+- after (String, optional): Only entries created after this time. Relative: "7d", "24h", "30m". Absolute: "2024-01-15".
+- before (String, optional): Only entries created before this time. Same format as after.
+- limit (Int, optional): Max entries to return. Default: 50.
+
+Returns entries with key, tags, created and updated timestamps.
+
+Gotchas:
+- Results are channel-scoped (same rules as db_search).
+- Shows keys and metadata only, not values. Use db_search to see content.""" function db_list_keys(tags::Union{Nothing, String} = nothing, after::Union{Nothing, String} = nothing, before::Union{Nothing, String} = nothing, limit::Union{Nothing, Int} = nothing)
     a = get_current_assistant()
     a === nothing && return "No assistant initialized"
     n = limit === nothing ? 50 : limit
@@ -731,7 +868,13 @@ const DB_LIST_KEYS_TOOL = @tool "List keys stored in your scratch space. Optiona
     isempty(lines) ? "No stored entries" : join(lines, "\n")
 end
 
-const DB_LIST_TAGS_TOOL = @tool "List all tags you have used in your scratch space." function db_list_tags()
+const DB_LIST_TAGS_TOOL = @tool """List all distinct tags used across your scratch space entries.
+
+Useful for discovering what categories exist before filtering with db_search or db_list_keys.
+
+Arguments: none.
+
+Returns a comma-separated list of all tags, sorted alphabetically.""" function db_list_tags()
     a = get_current_assistant()
     a === nothing && return "No assistant initialized"
     tags = String[]
@@ -742,7 +885,14 @@ const DB_LIST_TAGS_TOOL = @tool "List all tags you have used in your scratch spa
     isempty(tags) ? "No tags stored" : join(tags, ", ")
 end
 
-const DB_REMOVE_TOOL = @tool "Remove an entry from your scratch space by key." function db_remove(key::String)
+const DB_REMOVE_TOOL = @tool """Permanently remove an entry from your scratch space by key.
+
+This deletes the entry, its tags, and its search index entry. This action is irreversible.
+
+Arguments:
+- key (String, required): The exact key to delete. Use db_list_keys to find keys.
+
+Returns confirmation or "Key not found" if the key doesn't exist.""" function db_remove(key::String)
     a = get_current_assistant()
     a === nothing && return "No assistant initialized"
     removed = lock(AGENT_DATA_WRITE_LOCK) do

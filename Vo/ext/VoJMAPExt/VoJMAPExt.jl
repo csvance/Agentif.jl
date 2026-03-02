@@ -326,7 +326,23 @@ end
 
 # ─── email_search ───
 
-const EMAIL_SEARCH_TOOL = Agentif.@tool "Search emails by text query, sender, subject, date range, mailbox, or keywords. Returns matching email summaries sorted by date." function email_search(
+const EMAIL_SEARCH_TOOL = Agentif.@tool """Search emails and return summaries sorted by date (newest first).
+
+All filter parameters are optional, but provide at least one to get meaningful results. Use this tool to find emails before calling email_read for full content.
+
+Arguments:
+- query: Free-text search across all email fields.
+- from: Filter by sender email address or name.
+- to: Filter by recipient email address or name.
+- subject: Filter by subject line text.
+- in_mailbox: Mailbox ID to search within. Get IDs from jmap_list_mailboxes.
+- after: Only emails received on or after this ISO 8601 date (e.g. "2025-01-15").
+- before: Only emails received before this ISO 8601 date.
+- has_keyword: Only emails with this JMAP keyword (e.g. "\$flagged", "\$seen").
+- not_keyword: Exclude emails with this JMAP keyword (e.g. "\$seen" for unread only).
+- limit: Max results to return (default: 20, max: 50).
+
+Returns: One summary per email with ID, thread ID, flags, sender, subject, date, and preview text.""" function email_search(
         query::Union{Nothing, String} = nothing,
         from::Union{Nothing, String} = nothing,
         to::Union{Nothing, String} = nothing,
@@ -382,7 +398,14 @@ end
 
 # ─── email_read ───
 
-const EMAIL_READ_TOOL = Agentif.@tool "Read the full content of an email by its ID. Returns headers, body text, and attachment info." function email_read(email_id::String)
+const EMAIL_READ_TOOL = Agentif.@tool """Read the full content of a single email by its ID.
+
+Use this after email_search to get complete email body, headers, and attachment details. email_search returns only previews; this returns the full text.
+
+Arguments:
+- email_id: The email ID string (from email_search or email_thread results).
+
+Returns: Full headers (from, to, cc, subject, date), flags, complete text body (truncated at 256KB), and attachment list with names/sizes/types.""" function email_read(email_id::String)
     session = _get_session()
     emails = JMAP.fetch_emails(session, [email_id];
         properties=["id", "threadId", "mailboxIds", "keywords", "from", "to", "cc", "bcc",
@@ -439,7 +462,18 @@ end
 
 # ─── email_send ───
 
-const EMAIL_SEND_TOOL = Agentif.@tool "Compose and send a new email. Provide to address(es) comma-separated, subject, and body text." function email_send(
+const EMAIL_SEND_TOOL = Agentif.@tool """Compose and SEND a new email immediately. There is no draft or review step.
+
+Use this for new conversations only. To continue an existing thread, use email_reply or email_forward instead.
+
+Arguments:
+- to: Recipient email address(es), comma-separated (e.g. "alice@example.com, bob@example.com").
+- subject: Email subject line.
+- body: Plain text email body.
+- cc: CC recipients, comma-separated. Optional.
+- bcc: BCC recipients, comma-separated. Optional.
+
+Sends from the first configured sending identity. The email is sent immediately upon calling this tool.""" function email_send(
         to::String,
         subject::String,
         body::String,
@@ -501,7 +535,16 @@ end
 
 # ─── email_reply ───
 
-const EMAIL_REPLY_TOOL = Agentif.@tool "Reply to an email by its ID. Automatically threads the reply and sets In-Reply-To headers. Set reply_all to 'true' to reply to all recipients." function email_reply(
+const EMAIL_REPLY_TOOL = Agentif.@tool """Reply to an email and SEND immediately. Automatically threads the reply with correct In-Reply-To and References headers.
+
+Use this to respond to an existing email. For new conversations, use email_send instead.
+
+Arguments:
+- email_id: The ID of the email to reply to (from email_search or email_read results).
+- body: Plain text reply body.
+- reply_all: Set to "true" or "yes" to reply to all original recipients (To + CC). Omit or set to null for reply-to-sender only. NOTE: this is a string, not a boolean.
+
+Automatically prefixes "Re:" to the subject if not already present. Sends from the first configured identity.""" function email_reply(
         email_id::String,
         body::String,
         reply_all::Union{Nothing, String} = nothing
@@ -595,7 +638,14 @@ end
 
 # ─── email_forward ───
 
-const EMAIL_FORWARD_TOOL = Agentif.@tool "Forward an email to new recipients. Optionally add a comment above the forwarded content." function email_forward(
+const EMAIL_FORWARD_TOOL = Agentif.@tool """Forward an email to new recipients and SEND immediately.
+
+Includes the original email's full text body with a "Forwarded message" header. Automatically prefixes "Fwd:" to the subject if not already present.
+
+Arguments:
+- email_id: The ID of the email to forward (from email_search or email_read results).
+- to: Recipient email address(es), comma-separated.
+- comment: Optional text to prepend above the forwarded content (e.g. "FYI, see below").""" function email_forward(
         email_id::String,
         to::String,
         comment::Union{Nothing, String} = nothing
@@ -634,7 +684,13 @@ end
 
 # ─── email_move ───
 
-const EMAIL_MOVE_TOOL = Agentif.@tool "Move an email to a different mailbox. Use list_mailboxes to find mailbox IDs." function email_move(email_id::String, target_mailbox_id::String)
+const EMAIL_MOVE_TOOL = Agentif.@tool """Move an email to a specific mailbox (folder), removing it from all current mailboxes.
+
+For common operations, prefer email_archive or email_trash instead. Use this for moves to arbitrary mailboxes.
+
+Arguments:
+- email_id: The email ID to move.
+- target_mailbox_id: The destination mailbox ID. Get IDs from jmap_list_mailboxes.""" function email_move(email_id::String, target_mailbox_id::String)
     session = _get_session()
     JMAP.email_set(session;
         update=Dict{String,Dict{String,Any}}(email_id => Dict{String,Any}("mailboxIds" => Dict{String,Any}(target_mailbox_id => true))))
@@ -643,7 +699,12 @@ end
 
 # ─── email_archive ───
 
-const EMAIL_ARCHIVE_TOOL = Agentif.@tool "Archive an email by moving it to the Archive mailbox." function email_archive(email_id::String)
+const EMAIL_ARCHIVE_TOOL = Agentif.@tool """Archive an email by moving it out of the inbox into the Archive mailbox.
+
+Use this to clean up the inbox without deleting. Fails if no mailbox with the "archive" role exists.
+
+Arguments:
+- email_id: The email ID to archive.""" function email_archive(email_id::String)
     session = _get_session()
     mailboxes = JMAP.list_mailboxes(session)
     archive_mb = nothing
@@ -658,7 +719,12 @@ end
 
 # ─── email_trash ───
 
-const EMAIL_TRASH_TOOL = Agentif.@tool "Move an email to the Trash mailbox." function email_trash(email_id::String)
+const EMAIL_TRASH_TOOL = Agentif.@tool """Move an email to the Trash mailbox. This is NOT a permanent delete; the email can be recovered from Trash.
+
+Fails if no mailbox with the "trash" role exists.
+
+Arguments:
+- email_id: The email ID to trash.""" function email_trash(email_id::String)
     session = _get_session()
     mailboxes = JMAP.list_mailboxes(session)
     trash_mb = nothing
@@ -673,7 +739,14 @@ end
 
 # ─── email_flag ───
 
-const EMAIL_FLAG_TOOL = Agentif.@tool "Set or clear a keyword flag on an email. Common keywords: \$seen (read), \$flagged (starred), \$answered, \$draft. Set action to 'set' or 'clear'." function email_flag(email_id::String, keyword::String, action::String)
+const EMAIL_FLAG_TOOL = Agentif.@tool """Set or clear a JMAP keyword flag on a single email.
+
+For bulk marking as read, use email_mark_read instead. For muting threads, use email_mute_thread.
+
+Arguments:
+- email_id: The email ID to modify.
+- keyword: The JMAP keyword including the \$ prefix. Common values: "\$seen" (read/unread), "\$flagged" (starred), "\$answered", "\$draft".
+- action: Either "set" to add the keyword or "clear" to remove it.""" function email_flag(email_id::String, keyword::String, action::String)
     session = _get_session()
     value = lowercase(action) == "set" ? true : nothing
     JMAP.email_set(session;
@@ -684,7 +757,12 @@ end
 
 # ─── email_mark_read ───
 
-const EMAIL_MARK_READ_TOOL = Agentif.@tool "Mark one or more emails as read. Provide comma-separated email IDs." function email_mark_read(email_ids::String)
+const EMAIL_MARK_READ_TOOL = Agentif.@tool """Mark one or more emails as read (sets the \$seen keyword) in a single batch operation.
+
+Use this instead of email_flag when marking multiple emails as read at once.
+
+Arguments:
+- email_ids: One or more email IDs, comma-separated (e.g. "id1" or "id1,id2,id3").""" function email_mark_read(email_ids::String)
     session = _get_session()
     ids = strip.(split(email_ids, ","))
     updates = Dict{String,Dict{String,Any}}()
@@ -697,7 +775,11 @@ end
 
 # ─── list_mailboxes ───
 
-const LIST_MAILBOXES_TOOL = Agentif.@tool "List all email mailboxes (folders) with their IDs, names, roles, and unread counts." function jmap_list_mailboxes()
+const LIST_MAILBOXES_TOOL = Agentif.@tool """List all email mailboxes (folders) with their IDs, names, roles, and message counts.
+
+Call this to discover mailbox IDs needed by email_search (in_mailbox) and email_move (target_mailbox_id). No arguments required.
+
+Returns: One line per mailbox with name, role (e.g. inbox, archive, drafts, sent, trash, junk), opaque mailbox ID, unread count, and total count. Sorted by server sort order.""" function jmap_list_mailboxes()
     session = _get_session()
     mailboxes = JMAP.list_mailboxes(session)
     lines = String[]
@@ -712,7 +794,12 @@ end
 
 # ─── email_thread ───
 
-const EMAIL_THREAD_TOOL = Agentif.@tool "Get all emails in a thread by thread ID. Returns the full conversation." function email_thread(thread_id::String)
+const EMAIL_THREAD_TOOL = Agentif.@tool """Get all emails in a conversation thread, returned in chronological order.
+
+Returns previews (sender, subject, date, preview text), not full bodies. Use email_read on individual email IDs for complete content.
+
+Arguments:
+- thread_id: The thread ID string (from email_search or email_read results, NOT an email ID).""" function email_thread(thread_id::String)
     session = _get_session()
     thread_resp = JMAP.thread_get(session; ids=[thread_id])
     isempty(thread_resp.list) && return "Thread not found: $thread_id"
@@ -736,7 +823,12 @@ end
 
 # ─── email_mute_thread ───
 
-const EMAIL_MUTE_THREAD_TOOL = Agentif.@tool "Mute an email thread. New replies will be auto-archived and marked as read by Fastmail." function email_mute_thread(thread_id::String)
+const EMAIL_MUTE_THREAD_TOOL = Agentif.@tool """Mute an email thread so future replies are automatically archived and marked as read (Fastmail-specific behavior).
+
+Sets the \$muted keyword on ALL emails in the thread. Use email_unmute_thread to reverse.
+
+Arguments:
+- thread_id: The thread ID to mute (from email_search or email_read results).""" function email_mute_thread(thread_id::String)
     session = _get_session()
     thread_resp = JMAP.thread_get(session; ids=[thread_id])
     isempty(thread_resp.list) && return "Thread not found: $thread_id"
@@ -753,7 +845,12 @@ end
 
 # ─── email_unmute_thread ───
 
-const EMAIL_UNMUTE_THREAD_TOOL = Agentif.@tool "Unmute an email thread. New replies will arrive in inbox normally." function email_unmute_thread(thread_id::String)
+const EMAIL_UNMUTE_THREAD_TOOL = Agentif.@tool """Unmute a previously muted email thread so future replies arrive in the inbox normally.
+
+Clears the \$muted keyword from ALL emails in the thread.
+
+Arguments:
+- thread_id: The thread ID to unmute (from email_search or email_read results).""" function email_unmute_thread(thread_id::String)
     session = _get_session()
     thread_resp = JMAP.thread_get(session; ids=[thread_id])
     isempty(thread_resp.list) && return "Thread not found: $thread_id"

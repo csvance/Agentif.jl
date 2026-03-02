@@ -79,7 +79,18 @@ end
 
 function create_skill_loader_tool(registry::SkillRegistry)
     return @tool(
-        "Load full SKILL.md instructions for a known skill by name.",
+        """Load the full SKILL.md instructions for a skill by name.
+
+Use this tool when you see a relevant skill listed in <available_skills> in the system prompt and need its complete instructions before executing. This is a two-step pattern: (1) identify the skill from the system prompt listing, (2) call this tool to load its full instructions.
+
+Arguments:
+- `name::String` (required): Exact skill name in kebab-case (e.g., "code-review", "my-skill"). Must match a name from <available_skills> exactly — case-sensitive.
+
+Throws `ArgumentError` if the skill name is not found. Output may be truncated for very large skill files; if so, the response includes a hint for loading more content via the read tool with offset/limit.
+
+Examples:
+- `skill_loader("code-review")` — load full instructions for the code-review skill
+- `skill_loader("deploy-staging")` — load instructions before executing a deployment skill""",
         skill_loader(name::String) = begin
             content = load_skill(registry, name)
             meta = get(() -> nothing, registry.skills, name)
