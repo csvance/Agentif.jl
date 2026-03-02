@@ -124,9 +124,9 @@ Agentif.close_channel(ch::StreamTestChannel) = (ch.closed += 1)
 end
 
 let
-    provider = get(ENV, "VO_AGENT_PROVIDER", "")
-    model_id = get(ENV, "VO_AGENT_MODEL", "")
-    apikey = get(ENV, "VO_AGENT_API_KEY", "")
+    provider = get(ENV, "CLAW_AGENT_PROVIDER", "")
+    model_id = get(ENV, "CLAW_AGENT_MODEL", "")
+    apikey = get(ENV, "CLAW_AGENT_API_KEY", "")
 
     if !isempty(provider) && !isempty(model_id) && !isempty(apikey)
         @testset "stream (MiniMax live)" begin
@@ -158,7 +158,7 @@ let
             @test any(e -> e isa ToolCallRequestEvent, events)
         end
     else
-        @info "Skipping live MiniMax tests; VO_AGENT_* env vars are not set."
+        @info "Skipping live MiniMax tests; CLAW_AGENT_* env vars are not set."
     end
 end
 

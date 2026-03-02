@@ -1,0 +1,72 @@
+name = "Claw"
+uuid = "46916a23-5c37-4b23-b62b-45b422578c04"
+version = "0.1.0"
+authors = ["Jacob Quinn <quinn.jacobd@gmail.com>"]
+
+[deps]
+Agentif = "b1e21dde-9d8e-492f-89d0-ee48af23bfc5"
+Dates = "ade2ca70-3891-5945-98fb-dc099432e06a"
+HTTP = "cd3eb016-35fb-5094-929b-558a96fad6f3"
+LLMTools = "d2f4c4b3-4b8a-4e8c-9b4f-7b8e4e6e5b2c"
+LocalSearch = "3edf9609-13f2-4288-b0a3-8bd6d521158e"
+Logging = "56ddb016-857b-54e1-b83d-db4d58db5568"
+LoggingExtras = "e6f89c97-d47a-5376-807f-9c37f3926c36"
+Mattermost = "c9a394b0-b131-4b99-aeb4-b011b7b7f934"
+SQLite = "0aa819cd-b072-5ff4-a722-6bc24af294d9"
+ScopedValues = "7e506255-f358-4e82-b7e4-beb19740aa63"
+Tempus = "e6262be2-5787-4bdc-bc3f-4b5a3442fa30"
+TimeZones = "f269a46b-ccf7-5d73-abea-4c690281aa53"
+
+[weakdeps]
+GitHub = "bc5e4493-9b4d-5f90-b8aa-2b2bcaad7a26"
+JMAP = "40da3204-f0f7-47a6-9ee8-6f8207b67b8d"
+MSTeams = "730ab40b-c28c-4fcb-83ce-ff189233d76d"
+Signal = "0944c9af-6677-4ce2-950b-62b1fa25f333"
+Slack = "4d517630-ce0d-4555-8fa7-416d9f8f5684"
+Telegram = "0f099131-46f3-42ed-8989-d9c7888465f9"
+
+[sources]
+Agentif = {path = "../Agentif"}
+HTTP = {url = "https://github.com/JuliaWeb/HTTP.jl.git", rev = "master"}
+LLMTools = {path = "../LLMTools"}
+LocalSearch = {url = "https://github.com/quinnj/LocalSearch.jl.git"}
+MSTeams = {url = "https://github.com/quinnj/MSTeams.jl.git"}
+Mattermost = {url = "https://github.com/quinnj/Mattermost.jl.git"}
+Signal = {url = "https://github.com/quinnj/Signal.jl.git"}
+Slack = {url = "https://github.com/quinnj/Slack.jl.git"}
+Telegram = {url = "https://github.com/quinnj/Telegram.jl.git"}
+Tempus = {rev = "main", url = "https://github.com/JuliaServices/Tempus.jl.git"}
+
+[extensions]
+ClawGitHubExt = "GitHub"
+ClawJMAPExt = "JMAP"
+ClawMSTeamsExt = "MSTeams"
+ClawMattermostExt = "Mattermost"
+ClawSignalExt = "Signal"
+ClawSlackExt = "Slack"
+ClawTelegramExt = "Telegram"
+
+[compat]
+Agentif = "1"
+GitHub = "5"
+JMAP = "0.1.0"
+MSTeams = "0.1.0"
+Mattermost = "0.1.0"
+Signal = "0.1.0"
+Slack = "0.1.0"
+Telegram = "0.1.0"
+TimeZones = "1"
+Logging = "1"
+LoggingExtras = "1"
+julia = "1.10"
+
+[extras]
+MSTeams = "730ab40b-c28c-4fcb-83ce-ff189233d76d"
+Mattermost = "c9a394b0-b131-4b99-aeb4-b011b7b7f934"
+Signal = "0944c9af-6677-4ce2-950b-62b1fa25f333"
+Slack = "4d517630-ce0d-4555-8fa7-416d9f8f5684"
+Telegram = "0f099131-46f3-42ed-8989-d9c7888465f9"
+Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+
+[targets]
+test = ["Test", "MSTeams", "Mattermost", "Signal", "Slack", "Telegram"]
