@@ -487,34 +487,40 @@ end
 
 const ADD_EVENT_HANDLER_TOOL = @tool """Register a new event handler that triggers an agent evaluation when specified events fire.
 
-When an event matches, the handler's prompt is prepended to the event content, and the combined text is evaluated as agent input. The response is sent to the handler's target channel.
+When an event matches, the handler's prompt is prepended to the event content, and the combined text is evaluated as agent input. If a channel_id is provided, the response is sent there. If omitted, evaluation still runs (results stored in session history) but no response is sent externally.
 
 Arguments:
 - id (String, required): Unique identifier for this handler. Use a descriptive name like "email-summary" or "daily-standup".
 - event_type_names (String, required): Comma-separated event type names to listen for. Use list_event_types to see available types. Example: "jmap_new_email" or "repl_input,tempus_job:reminder".
 - prompt (String, required): Text prepended to the event content before evaluation. This is your instruction for how to handle the event. Example: "Summarize this email and flag if urgent."
-- channel_id (String, required): Where to send the response. Use list_channels first to find valid IDs.
+- channel_id (String or nothing, optional): Where to send the response. Use list_channels to find valid IDs. If omitted, the handler evaluates without sending a response — useful for background processing like building event logs.
 
-Example: add_event_handler("email-triage", "jmap_new_email", "Triage this email: if spam or marketing, archive it. If important, summarize it.", "mm-general")
+Examples:
+  add_event_handler("email-triage", "jmap_new_email", "Triage this email: if spam or marketing, archive it. If important, summarize it.", "mm-general")
+  add_event_handler("github-log", "github_push", "Summarize this push event and store a log entry.")
 
 Gotchas:
 - Fails if event_type_names contains unknown event types (use list_event_types first).
-- Fails if channel_id is not a registered channel (use list_channels first).
-- If an id already exists, it will be replaced (upsert behavior).""" function add_event_handler(id::String, event_type_names::String, prompt::String, channel_id::String)
+- Fails if channel_id is provided but is not a registered channel (use list_channels first).
+- If an id already exists, it will be replaced (upsert behavior).""" function add_event_handler(id::String, event_type_names::String, prompt::String, channel_id::Union{Nothing, String} = nothing)
     a = get_current_assistant()
     a === nothing && return "No assistant initialized"
-    cid = strip(channel_id)
-    isempty(cid) && return "channel_id is required. Use list_channels to see available channels and provide a valid channel ID."
+    cid = channel_id === nothing ? nothing : strip(channel_id)
+    if cid !== nothing && isempty(cid)
+        cid = nothing
+    end
     names = strip.(split(event_type_names, ","))
     for n in names
         result = iterate(SQLite.DBInterface.execute(a.db,
             "SELECT 1 FROM claw_event_types WHERE name = ?", (n,)))
         result === nothing && return "Unknown event type: $n"
     end
-    haskey(a._channels, cid) || return "Unknown channel: $cid. Use list_channels to see available channels."
+    if cid !== nothing
+        haskey(a._channels, cid) || return "Unknown channel: $cid. Use list_channels to see available channels."
+    end
     eh = EventHandler(id, names, prompt, cid)
     register_event_handler!(a, eh)
-    "Event handler '$id' registered for channel '$cid'"
+    cid === nothing ? "Event handler '$id' registered (no channel — evaluate only)" : "Event handler '$id' registered for channel '$cid'"
 end
 
 const REMOVE_EVENT_HANDLER_TOOL = @tool """Remove an event handler by its ID, stopping it from triggering on future events.
@@ -1022,6 +1028,23 @@ function _event_handlers_for(assistant::AgentAssistant, event_name::String)
     end
 end
 
+# ─── SinkChannel ───
+# No-op channel for event handlers without a target channel.
+# Evaluation runs and session tracks results, but nothing is sent externally.
+
+struct SinkChannel <: Agentif.AbstractChannel
+    id::String
+end
+Agentif.channel_id(ch::SinkChannel) = ch.id
+Agentif.channel_name(ch::SinkChannel) = "Internal ($(ch.id))"
+Agentif.start_streaming(::SinkChannel) = nothing
+Agentif.append_to_stream(::SinkChannel, ::AbstractString) = nothing
+Agentif.finish_streaming(::SinkChannel) = nothing
+Agentif.send_message(::SinkChannel, _) = nothing
+Agentif.close_channel(::SinkChannel) = nothing
+Agentif.is_group(::SinkChannel) = false
+Agentif.is_private(::SinkChannel) = true
+
 function _resolve_event_channel(assistant::AgentAssistant, ev::Event, handler_channel_id::Union{Nothing, String})
     if ev isa ChannelEvent
         ch = get_channel(ev)
@@ -1043,8 +1066,7 @@ function _run_event_handler!(
     )
     ch = _resolve_event_channel(assistant, ev, handler.channel_id)
     if ch === nothing
-        @warn "No channel available for handler" handler_id=handler.id channel_id=handler.channel_id
-        return nothing
+        ch = SinkChannel("handler:$(handler.id)")
     end
     input = make_prompt(handler.prompt, ev)
     @debug "Claw handler evaluate start" handler_id = handler.id event_name = get_name(ev) channel_id = Agentif.channel_id(ch)

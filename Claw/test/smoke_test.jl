@@ -279,6 +279,15 @@ end
     result_bad_ch = Claw.add_event_handler("bad2", "message", "x", "fake-channel")
     @test occursin("Unknown channel", result_bad_ch)
 
+    # Test add_event_handler without channel_id (evaluate-only)
+    result_no_ch = Claw.add_event_handler("bg-logger", "message", "Log this event")
+    @test occursin("registered", result_no_ch)
+    @test occursin("evaluate only", result_no_ch)
+    @test count_rows(a.db, "claw_event_handlers") == 3
+    Claw.remove_event_handler("bg-logger")
+    @test count_rows(a.db, "claw_event_handlers") == 2
+    println("  add_event_handler (no channel): $result_no_ch")
+
     # Test remove_event_handler
     result_rm = Claw.remove_event_handler("new_handler")
     @test occursin("removed", result_rm)
