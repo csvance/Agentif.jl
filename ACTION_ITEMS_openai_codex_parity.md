@@ -84,7 +84,7 @@
   - `julia --project=Agentif -e 'using Pkg; Pkg.test()'`
   - Added regression coverage for prompt-cache/session mapping, GPT-5 zero-juice request shaping, cached/reasoning token accounting, and incomplete-status handling for both Responses and Codex.
 
-### [ ] ITEM-004 (P1) Harden Codex OAuth login and refresh behavior
+### [x] ITEM-004 (P1) Harden Codex OAuth login and refresh behavior
 - Description: The current Codex OAuth flow assumes the localhost callback server always binds successfully and does not provide a manual paste fallback. Refresh handling also rebuilds credentials from the refresh response without preserving the previous refresh token if the server omits a new one.
 - Desired outcome: Codex OAuth remains usable when the callback server cannot be used, and refresh logic safely preserves a valid existing refresh token when the refresh response omits one.
 - Affected files: `LLMOAuth/src/oauth.jl`, `LLMOAuth/test/runtests.jl`, `Agentif/ext/AgentifLLMOAuthExt/AgentifLLMOAuthExt.jl`
@@ -105,6 +105,10 @@
   - Codex login has a non-loopback fallback path.
   - Refresh preserves the old token when no replacement is returned.
   - Tests cover the new fallback/preservation behavior.
+- Verification evidence:
+  - `julia --project=Agentif -e 'using Pkg; Pkg.test()'`
+  - `julia -e 'using Pkg; tmp = mktempdir(); Pkg.activate(tmp); Pkg.develop(path="/Users/jacob.quinn/.julia/dev/OAuth"); Pkg.develop(path="/Users/jacob.quinn/.julia/dev/Agentif/LLMOAuth"); Pkg.add("JSON"); Pkg.instantiate(); include("/Users/jacob.quinn/.julia/dev/Agentif/LLMOAuth/test/runtests.jl")'`
+  - Added tests for authorization-input parsing, manual fallback validation, and refresh-token preservation.
 
 ### [ ] ITEM-005 (P2) Update Codex model parity and close remaining test gaps
 - Description: The Codex model registry in this repo lags the local pi-mono reference and current internal expectations, and the existing tests do not lock in the newer Codex model variants or reasoning-effort clamp behavior.

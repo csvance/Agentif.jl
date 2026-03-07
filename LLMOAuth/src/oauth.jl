@@ -208,6 +208,68 @@ function codex_get_account_id(access_token::String)
     return String(account_id)
 end
 
+function parse_codex_authorization_input(input::String)
+    value = strip(input)
+    isempty(value) && return "", ""
+
+    if occursin("://", value)
+        try
+            uri = HTTP.URI(value)
+            query = uri.query === nothing ? "" : String(uri.query)
+            if !isempty(query)
+                params = HTTP.URIs.queryparams(query)
+                code = get(() -> "", params, "code")
+                state = get(() -> "", params, "state")
+                return strip(String(code)), strip(String(state))
+            end
+        catch
+        end
+    end
+
+    if occursin('#', value)
+        code, state = split(value, '#'; limit = 2)
+        return strip(code), strip(state)
+    end
+
+    if occursin("code=", value)
+        params = HTTP.URIs.queryparams(startswith(value, "?") ? value[2:end] : value)
+        code = get(() -> "", params, "code")
+        state = get(() -> "", params, "state")
+        return strip(String(code)), strip(String(state))
+    end
+
+    return value, ""
+end
+
+function codex_manual_authorization_code(url::String, expected_state::String; input_provider::Function = readline)
+    println("If automatic callback handling fails, paste the authorization code or full redirect URL.")
+    print("Authorization code / redirect URL: ")
+    input = input_provider()
+    code, returned_state = parse_codex_authorization_input(input)
+    isempty(code) && throw(ArgumentError("Authorization code is required"))
+    if !isempty(returned_state) && returned_state != expected_state
+        throw(ArgumentError("Authorization state mismatch"))
+    end
+    return code
+end
+
+function codex_refresh_token_value(token::OAuth.TokenResponse, existing_refresh_token::Union{Nothing, String} = nothing)
+    refresh_token = token.refresh_token
+    if refresh_token isa AbstractString && !isempty(refresh_token)
+        return String(refresh_token)
+    elseif existing_refresh_token !== nothing && !isempty(existing_refresh_token)
+        return existing_refresh_token
+    end
+    throw(ErrorException("Codex token response did not include a refresh token"))
+end
+
+function codex_credentials_from_token(token::OAuth.TokenResponse; existing_refresh_token::Union{Nothing, String} = nothing)
+    account_id = codex_get_account_id(token.access_token)
+    expires_at = something(token.expires_at, Dates.now(Dates.UTC) + Dates.Second(3600))
+    refresh_token = codex_refresh_token_value(token, existing_refresh_token)
+    return CodexCredentials(token.access_token, refresh_token, expires_at, account_id)
+end
+
 function codex_exchange_code(code::AbstractString, verifier::OAuth.PKCEVerifier)
     resp = HTTP.post(
         CODEX_TOKEN_URL,
@@ -304,9 +366,7 @@ function codex_login(; open_browser::Bool = true, timeout::Real = 180)
     verifier = OAuth.generate_pkce_verifier()
     challenge = OAuth.pkce_challenge(verifier)
     state = bytes2hex(rand(UInt8, 16))
-
-    # Start the loopback listener to receive the OAuth callback
-    listener = OAuth.start_loopback_listener("127.0.0.1", CODEX_LOOPBACK_PORT, CODEX_LOOPBACK_PATH)
+    listener = nothing
 
     try
         # Build authorization URL with Codex-specific parameters
@@ -327,41 +387,55 @@ function codex_login(; open_browser::Bool = true, timeout::Real = 180)
         println("Opening browser for Codex authentication...")
         println("If the browser doesn't open, visit this URL:\n$(url)")
         open_browser && OAuth.launch_browser(url)
+        callback_error = nothing
+        params = nothing
 
-        # Wait for the callback with the authorization code
-        println("Waiting for authorization callback...")
-        params = OAuth.take_with_timeout(listener.result_channel, timeout)
-
-        # Check for errors in the callback
-        if haskey(params, "error")
-            description = get(params, "error_description", "")
-            message = isempty(description) ? params["error"] : "$(params["error"]): $description"
-            throw(ErrorException("Authorization failed: $message"))
+        try
+            listener = OAuth.start_loopback_listener("127.0.0.1", CODEX_LOOPBACK_PORT, CODEX_LOOPBACK_PATH)
+        catch e
+            callback_error = e
+            println("Unable to start the local callback listener; falling back to manual code entry.")
         end
 
-        # Extract and validate the code and state
-        code = get(params, "code", nothing)
-        code === nothing && throw(ErrorException("Authorization response missing code parameter"))
+        if listener !== nothing
+            println("Waiting for authorization callback...")
+            try
+                params = OAuth.take_with_timeout(listener.result_channel, timeout)
+            catch e
+                callback_error = e
+                println("Authorization callback not received in time; falling back to manual code entry.")
+            end
+        end
 
-        returned_state = get(params, "state", nothing)
-        returned_state === nothing && throw(ErrorException("Authorization response missing state parameter"))
-        returned_state == state || throw(ErrorException("Authorization state mismatch"))
+        code = nothing
+        if params !== nothing
+            if haskey(params, "error")
+                description = get(params, "error_description", "")
+                message = isempty(description) ? params["error"] : "$(params["error"]): $description"
+                throw(ErrorException("Authorization failed: $message"))
+            end
+
+            code = get(params, "code", nothing)
+            code === nothing && throw(ErrorException("Authorization response missing code parameter"))
+
+            returned_state = get(params, "state", nothing)
+            returned_state === nothing && throw(ErrorException("Authorization response missing state parameter"))
+            returned_state == state || throw(ErrorException("Authorization state mismatch"))
+        else
+            callback_error !== nothing && println("Callback details: $(sprint(showerror, callback_error))")
+            code = codex_manual_authorization_code(url, state)
+        end
 
         # Exchange the code for tokens
         token = codex_exchange_code(code, verifier)
-        account_id = codex_get_account_id(token.access_token)
-
-        # Calculate expiration time
-        expires_at = something(token.expires_at, Dates.now(Dates.UTC) + Dates.Second(3600))
-
-        creds = CodexCredentials(token.access_token, token.refresh_token, expires_at, account_id)
+        creds = codex_credentials_from_token(token)
         codex_save_credentials(creds)
 
         println("Successfully authenticated with Codex!")
         return (creds.access_token, creds.account_id)
     finally
         # Always stop the listener
-        OAuth.stop_loopback_listener(listener)
+        listener !== nothing && OAuth.stop_loopback_listener(listener)
     end
 end
 
@@ -390,11 +464,7 @@ function _codex_credentials_unlocked(skew_seconds::Integer)
     if Dates.now(Dates.UTC) + Dates.Second(skew_seconds) >= creds.expires_at
         # Refresh the token
         token = codex_refresh_token(creds.refresh_token)
-        account_id = codex_get_account_id(token.access_token)
-
-        expires_at = something(token.expires_at, Dates.now(Dates.UTC) + Dates.Second(3600))
-
-        creds = CodexCredentials(token.access_token, token.refresh_token, expires_at, account_id)
+        creds = codex_credentials_from_token(token; existing_refresh_token = creds.refresh_token)
         codex_save_credentials(creds)
     end
 

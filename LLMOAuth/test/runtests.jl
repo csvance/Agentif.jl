@@ -1,7 +1,9 @@
 using Test
 using JSON
 using Base64
+using Dates
 using LLMOAuth
+using OAuth
 
 function fake_jwt(payload::AbstractDict)
     encoded = Base64.base64encode(JSON.json(payload))
@@ -20,4 +22,50 @@ end
 
     bad = fake_jwt(Dict("sub" => "user"))
     @test_throws ErrorException LLMOAuth.codex_get_account_id(bad)
+end
+
+@testset "Codex auth input parsing" begin
+    @test LLMOAuth.parse_codex_authorization_input("abc123") == ("abc123", "")
+    @test LLMOAuth.parse_codex_authorization_input("abc123#state-1") == ("abc123", "state-1")
+    @test LLMOAuth.parse_codex_authorization_input("code=abc123&state=state-1") == ("abc123", "state-1")
+    @test LLMOAuth.parse_codex_authorization_input(
+        "http://localhost:1455/auth/callback?code=abc123&state=state-1",
+    ) == ("abc123", "state-1")
+end
+
+@testset "Codex manual auth fallback helpers" begin
+    @test LLMOAuth.codex_manual_authorization_code(
+        "http://localhost:1455/auth/callback?code=abc123&state=state-1",
+        "state-1";
+        input_provider = () -> "http://localhost:1455/auth/callback?code=abc123&state=state-1",
+    ) == "abc123"
+
+    @test_throws ArgumentError LLMOAuth.codex_manual_authorization_code(
+        "http://localhost:1455/auth/callback?code=abc123&state=state-1",
+        "state-1";
+        input_provider = () -> "abc123#wrong-state",
+    )
+end
+
+@testset "Codex refresh token preservation" begin
+    access = fake_jwt(Dict("https://api.openai.com/auth" => Dict("chatgpt_account_id" => "acct-xyz")))
+    issued_at = Dates.now(Dates.UTC)
+    token = OAuth.TokenResponse(
+        access_token = access,
+        token_type = "Bearer",
+        expires_at = issued_at + Dates.Second(3600),
+        refresh_token = nothing,
+        scope = nothing,
+        id_token = nothing,
+        dpop_jkt = nothing,
+        dpop_nonce = nothing,
+        authorization_details = nothing,
+        resource = String[],
+        issued_token_type = nothing,
+        extra = Dict{String, Any}(),
+        raw = JSON.parse("{}"),
+    )
+    creds = LLMOAuth.codex_credentials_from_token(token; existing_refresh_token = "refresh-old")
+    @test creds.refresh_token == "refresh-old"
+    @test creds.account_id == "acct-xyz"
 end
