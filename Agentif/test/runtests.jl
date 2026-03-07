@@ -907,10 +907,16 @@ end
     @test headers["Accept"] == "text/event-stream"
     ws_headers = Agentif.create_codex_websocket_headers(headers)
     @test ws_headers["OpenAI-Beta"] == "responses_websockets=2026-02-06"
+    @test Agentif.codex_websocket_pool_key("wss://example.test/codex", headers) == (
+        "wss://example.test/codex",
+        "acct-123",
+        "sess-1",
+    )
 
     no_session_headers = Agentif.create_codex_headers(nothing, "acct-123", "tok", nothing)
     @test !haskey(no_session_headers, "session_id")
     @test !haskey(no_session_headers, "conversation_id")
+    @test Agentif.codex_websocket_pool_key("wss://example.test/codex", no_session_headers) === nothing
     @test Agentif.normalize_codex_transport(nothing) == :sse
     @test Agentif.normalize_codex_transport("sse") == :sse
     @test Agentif.normalize_codex_transport("websocket") == :websocket
@@ -1105,6 +1111,7 @@ end
 end
 
 @testset "openai_codex websocket transport" begin
+    Agentif.close_codex_websocket_pool!()
     request_headers = Ref(Dict{String, String}())
     request_body = Ref(Dict{String, Any}())
 
@@ -1160,6 +1167,98 @@ end
         @test request_headers[]["openai-beta"] == "responses_websockets=2026-02-06"
         @test request_headers[]["chatgpt-account-id"] == "acct-jwt-3"
     finally
+        Agentif.close_codex_websocket_pool!()
+        close(ws_server)
+    end
+end
+
+@testset "openai_codex websocket pooling isolates sessions" begin
+    Agentif.close_codex_websocket_pool!()
+    connection_count = Ref(0)
+    request_count = Ref(0)
+    seen_session_headers = String[]
+
+    ws_server = HTTP.WebSockets.listen!("127.0.0.1", 0) do ws
+        connection_count[] += 1
+        headers = Dict{String, String}(lowercase(String(k)) => String(v) for (k, v) in ws.request.headers)
+        push!(seen_session_headers, get(() -> "", headers, "session_id"))
+        try
+            while true
+                msg = HTTP.WebSockets.receive(ws)
+                data = msg isa AbstractString ? String(msg) : String(msg)
+                body = JSON.parse(data)
+                request_count[] += 1
+                text = "Hello ws $(request_count[])"
+                events = Any[
+                    Dict("type" => "response.output_item.added", "item" => Dict("type" => "message", "id" => "msg_$(request_count[])", "role" => "assistant", "content" => Any[])),
+                    Dict("type" => "response.output_text.delta", "delta" => text),
+                    Dict("type" => "response.output_item.done", "item" => Dict("type" => "message", "id" => "msg_$(request_count[])", "role" => "assistant", "content" => Any[Dict("type" => "output_text", "text" => text)])),
+                    Dict(
+                        "type" => "response.completed",
+                        "response" => Dict(
+                            "status" => "completed",
+                            "usage" => Dict("input_tokens" => 1, "output_tokens" => 2, "total_tokens" => 3),
+                            "id" => get(() -> "resp_$(request_count[])", body, "prompt_cache_key"),
+                        ),
+                    ),
+                ]
+                for event in events
+                    HTTP.WebSockets.send(ws, JSON.json(event))
+                end
+            end
+        catch err
+            if !(err isa HTTP.WebSockets.WebSocketError && HTTP.WebSockets.isok(err))
+                rethrow()
+            end
+        finally
+            try
+                close(ws)
+            catch
+            end
+        end
+    end
+
+    try
+        sock = HTTP.Sockets.getsockname(ws_server.listener.server)
+        port = sock[2]
+        model = Model(
+            id = "gpt-5.3-codex",
+            name = "gpt-5.3-codex",
+            api = "openai-codex-responses",
+            provider = "openai-codex",
+            baseUrl = "http://127.0.0.1:$port",
+            reasoning = true,
+            input = ["text"],
+            cost = Dict("input" => 0.0, "output" => 0.0, "cacheRead" => 0.0, "cacheWrite" => 0.0),
+            contextWindow = 128000,
+            maxTokens = 32000,
+        )
+        payload = Dict("https://api.openai.com/auth" => Dict("chatgpt_account_id" => "acct-jwt-pooled"))
+        token = fake_jwt(payload)
+        agent = Agent(
+            id = "codex-ws-pool-test",
+            prompt = "You are helpful.",
+            model = model,
+            apikey = token,
+            tools = AgentTool[],
+        )
+
+        same_a = stream(identity, agent, AgentState(), "Say hello", Abort(); transport = "websocket", session_id = "pool-1")
+        same_b = stream(identity, agent, AgentState(), "Say hello again", Abort(); transport = "websocket", session_id = "pool-1")
+        diff = stream(identity, agent, AgentState(), "Different session", Abort(); transport = "websocket", session_id = "pool-2")
+        no_session_a = stream(identity, agent, AgentState(), "No session A", Abort(); transport = "websocket")
+        no_session_b = stream(identity, agent, AgentState(), "No session B", Abort(); transport = "websocket")
+
+        @test Agentif.message_text(same_a.messages[end]) == "Hello ws 1"
+        @test Agentif.message_text(same_b.messages[end]) == "Hello ws 2"
+        @test Agentif.message_text(diff.messages[end]) == "Hello ws 3"
+        @test Agentif.message_text(no_session_a.messages[end]) == "Hello ws 4"
+        @test Agentif.message_text(no_session_b.messages[end]) == "Hello ws 5"
+
+        @test connection_count[] == 4
+        @test seen_session_headers == ["pool-1", "pool-2", "", ""]
+    finally
+        Agentif.close_codex_websocket_pool!()
         close(ws_server)
     end
 end

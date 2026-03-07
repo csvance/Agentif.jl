@@ -969,7 +969,7 @@ mutable struct PooledWebSocket
     created_at::Float64
 end
 
-const _CODEX_WS_POOL = Pool{String, PooledWebSocket}(16)
+const _CODEX_WS_POOL = Pool{Tuple{String, String, String}, PooledWebSocket}(16)
 const _CODEX_WS_TTL = 300.0  # 5 minutes
 
 function _open_pooled_websocket(ws_url::String, ws_headers, ws_open_kw)
@@ -1007,6 +1007,28 @@ function _pooled_ws_isvalid(pws::PooledWebSocket)
     return valid
 end
 
+function close_codex_websocket_pool!()
+    Base.@lock _CODEX_WS_POOL.lock begin
+        for pooled in values(_CODEX_WS_POOL.keyedvalues)
+            for pws in pooled
+                _close_pooled_websocket(pws)
+            end
+            empty!(pooled)
+        end
+    end
+    return nothing
+end
+
+function codex_websocket_pool_key(ws_url::String, headers::Dict{String, String})
+    session_id = get(() -> nothing, headers, OPENAI_HEADERS.session_id)
+    if !(session_id isa AbstractString) || isempty(strip(session_id))
+        return nothing
+    end
+    account_id = get(() -> "", headers, OPENAI_HEADERS.account_id)
+    account = account_id isa AbstractString ? String(account_id) : ""
+    return (ws_url, account, String(session_id))
+end
+
 function codex_stream_websocket!(
         callback::Function,
         ws_url::String,
@@ -1021,9 +1043,15 @@ function codex_stream_websocket!(
     start_request = copy(request_body)
     start_request["type"] = "response.create"
     saw_terminal = false
+    pool_key = codex_websocket_pool_key(ws_url, headers)
+    pooled = pool_key !== nothing
 
-    pws = acquire(_CODEX_WS_POOL, ws_url; isvalid = _pooled_ws_isvalid) do
+    pws = if pool_key === nothing
         _open_pooled_websocket(ws_url, ws_headers, ws_open_kw)
+    else
+        acquire(_CODEX_WS_POOL, pool_key; isvalid = _pooled_ws_isvalid) do
+            _open_pooled_websocket(ws_url, ws_headers, ws_open_kw)
+        end
     end
 
     try
@@ -1049,13 +1077,15 @@ function codex_stream_websocket!(
             end
         end
     finally
-        if saw_terminal
+        if pooled && saw_terminal
             # Connection completed normally; return to pool for reuse
-            release(_CODEX_WS_POOL, ws_url, pws)
-        else
+            release(_CODEX_WS_POOL, pool_key, pws)
+        elseif pooled
             # Error or incomplete; close connection and return permit only
             _close_pooled_websocket(pws)
-            release(_CODEX_WS_POOL, ws_url, nothing)
+            release(_CODEX_WS_POOL, pool_key, nothing)
+        else
+            _close_pooled_websocket(pws)
         end
     end
 
