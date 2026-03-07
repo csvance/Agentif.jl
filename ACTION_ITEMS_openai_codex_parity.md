@@ -110,7 +110,7 @@
   - `julia -e 'using Pkg; tmp = mktempdir(); Pkg.activate(tmp); Pkg.develop(path="/Users/jacob.quinn/.julia/dev/OAuth"); Pkg.develop(path="/Users/jacob.quinn/.julia/dev/Agentif/LLMOAuth"); Pkg.add("JSON"); Pkg.instantiate(); include("/Users/jacob.quinn/.julia/dev/Agentif/LLMOAuth/test/runtests.jl")'`
   - Added tests for authorization-input parsing, manual fallback validation, and refresh-token preservation.
 
-### [ ] ITEM-005 (P2) Update Codex model parity and close remaining test gaps
+### [x] ITEM-005 (P2) Update Codex model parity and close remaining test gaps
 - Description: The Codex model registry in this repo lags the local pi-mono reference and current internal expectations, and the existing tests do not lock in the newer Codex model variants or reasoning-effort clamp behavior.
 - Desired outcome: The `openai-codex` registry includes the missing newer model IDs needed for parity, the reasoning-effort clamp covers the newer Codex family, and tests prevent regressions.
 - Affected files: `LLMProviders/src/models_custom.jl`, `LLMProviders/test/runtests.jl`, `Agentif/test/runtests.jl`
@@ -128,6 +128,10 @@
 - Completion criteria:
   - Missing Codex model entries are present.
   - Clamp behavior is tested for the newer models.
+- Verification evidence:
+  - `julia --project=LLMProviders -e 'using Pkg; Pkg.test()'`
+  - `julia --project=Agentif -e 'using Pkg; Pkg.test()'`
+  - Added `gpt-5.4` registry coverage in `LLMProviders` and clamp coverage in `Agentif`.
 
 ## Compaction Continuity Block
 

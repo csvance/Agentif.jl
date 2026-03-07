@@ -253,4 +253,8 @@ end
     v51 = LLMProviders.getModel("openai-codex", "gpt-5.1-codex")
     @test v51 !== nothing
     @test v51.id == "gpt-5.1-codex"
+
+    v54 = LLMProviders.getModel("openai-codex", "gpt-5.4")
+    @test v54 !== nothing
+    @test v54.id == "gpt-5.4"
 end

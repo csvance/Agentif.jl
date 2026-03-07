@@ -123,7 +123,7 @@ end
 
 function clamp_reasoning_effort(model::String, effort::String)
     model_id = occursin("/", model) ? split(model, "/")[end] : model
-    if (startswith(model_id, "gpt-5.2") || startswith(model_id, "gpt-5.3")) && effort == "minimal"
+    if (startswith(model_id, "gpt-5.2") || startswith(model_id, "gpt-5.3") || startswith(model_id, "gpt-5.4")) && effort == "minimal"
         return "low"
     end
     if model_id == "gpt-5.1" && effort == "xhigh"

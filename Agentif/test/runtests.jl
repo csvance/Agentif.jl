@@ -889,6 +889,7 @@ end
     @test Agentif.clamp_reasoning_effort("gpt-5.3-codex-spark", "minimal") == "low"
     @test Agentif.clamp_reasoning_effort("gpt-5.3-codex-spark", "xhigh") == "xhigh"
     @test Agentif.clamp_reasoning_effort("gpt-5.2-codex", "minimal") == "low"
+    @test Agentif.clamp_reasoning_effort("gpt-5.4", "minimal") == "low"
     @test Agentif.clamp_reasoning_effort("gpt-5.1", "xhigh") == "high"
     @test Agentif.clamp_reasoning_effort("gpt-5.1-codex-mini", "low") == "medium"
     @test Agentif.clamp_reasoning_effort("gpt-5.1-codex-mini", "xhigh") == "high"

@@ -106,6 +106,7 @@ function _init_custom_models!()
             context_window = 128000,
             max_tokens = 32000,
         ),
+        "gpt-5.4" => codex_model("gpt-5.4", "GPT-5.4"),
         # Friendly aliases: keep lookup compatibility while using canonical API ids.
         "gpt-codex-5.3" => codex_model("gpt-5.3-codex", "GPT Codex 5.3"; context_window = 400000),
     )
