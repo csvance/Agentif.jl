@@ -31,7 +31,7 @@
   - `julia --project=Agentif -e 'using Pkg; Pkg.test()'`
   - Added websocket regression coverage for helper keying, same-session reuse, cross-session isolation, and no-session non-reuse.
 
-### [ ] ITEM-002 (P0) Restore Responses/Codex message normalization parity
+### [x] ITEM-002 (P0) Restore Responses/Codex message normalization parity
 - Description: The OpenAI Responses and Codex builders currently walk raw `AgentState` messages directly instead of using the normalization pipeline already used by the chat-completions path. That skips cross-model/provider handoff cleanup, missing-tool-result synthesis, and tool-call ID normalization that pi-mono relies on.
 - Desired outcome: Responses and Codex requests are built from normalized history with the same invariants as the mature pi-mono path, including safe handoff behavior for tool calls, reasoning blocks, and missing tool results.
 - Affected files: `Agentif/src/providers/openai_responses_adapter.jl`, `Agentif/src/providers/openai_codex.jl`, `Agentif/src/stream.jl`, `Agentif/test/runtests.jl`
@@ -52,6 +52,9 @@
 - Completion criteria:
   - Responses and Codex history builders no longer bypass normalization.
   - Regression tests cover normalized handoffs and dangling-tool-call repair.
+- Verification evidence:
+  - `julia --project=Agentif -e 'using Pkg; Pkg.test()'`
+  - Added builder-level regression tests covering same-provider different-model tool-call replay, synthetic missing tool results, and cross-provider thinking downgrade behavior.
 
 ### [ ] ITEM-003 (P1) Fix OpenAI request shaping and usage parity
 - Description: Several OpenAI request/usage behaviors still drift from the reference implementation: direct Responses requests do not map `sessionId` to prompt-cache fields, GPT-5 direct Responses requests do not inject the “reasoning off” developer nudge when no reasoning is requested, cached input tokens are double-counted in usage, chat-completions usage cannot represent reasoning tokens, and incomplete Responses/Codex statuses currently emit error events.

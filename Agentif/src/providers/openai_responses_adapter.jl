@@ -1,6 +1,8 @@
 using HTTP
 using JSON
 
+const OPENAI_RESPONSES_TOOL_CALL_PROVIDERS = Set(["openai", "openai-codex", "opencode"])
+
 function openai_responses_build_tools(tools::Vector{AgentTool})
     isempty(tools) && return nothing
     provider_tools = OpenAIResponses.Tool[]
@@ -77,7 +79,49 @@ function _responses_split_compound_id(id::AbstractString)
     return (String(id[1:idx-1]), String(id[idx+1:end]))
 end
 
-function openai_responses_input_from_message(msg::AgentMessage)
+function openai_responses_normalize_tool_call_id(id::String, model::Model)
+    model.provider in OPENAI_RESPONSES_TOOL_CALL_PROVIDERS || return id
+    call_id, item_id = _responses_split_compound_id(id)
+    item_id === nothing && return id
+
+    normalized_call_id = replace(call_id, r"[^A-Za-z0-9_-]" => "_")
+    normalized_item_id = replace(item_id, r"[^A-Za-z0-9_-]" => "_")
+    startswith(normalized_item_id, "fc") || (normalized_item_id = "fc_" * normalized_item_id)
+
+    length(normalized_call_id) > 64 && (normalized_call_id = first(normalized_call_id, 64))
+    length(normalized_item_id) > 64 && (normalized_item_id = first(normalized_item_id, 64))
+
+    normalized_call_id = replace(normalized_call_id, r"_+$" => "")
+    normalized_item_id = replace(normalized_item_id, r"_+$" => "")
+
+    isempty(normalized_call_id) && (normalized_call_id = "call")
+    isempty(normalized_item_id) && (normalized_item_id = "fc")
+    return "$(normalized_call_id)|$(normalized_item_id)"
+end
+
+function openai_responses_transformed_messages(state::AgentState, input::AgentTurnInput, model::Model)
+    raw_messages = AgentMessage[]
+    for msg in state.messages
+        include_in_context(msg) || continue
+        push!(raw_messages, msg)
+    end
+    if input isa String
+        push!(raw_messages, UserMessage(input))
+    elseif input isa UserMessage
+        push!(raw_messages, input)
+    elseif input isa Vector{UserContentBlock}
+        push!(raw_messages, UserMessage(input))
+    elseif input isa Vector{ToolResultMessage}
+        append!(raw_messages, input)
+    end
+    return transform_messages(raw_messages, model; normalize_tool_call_id = id -> openai_responses_normalize_tool_call_id(id, model))
+end
+
+function openai_responses_is_different_model(msg::AssistantMessage, model::Model)
+    return msg.provider == model.provider && msg.api == model.api && msg.model != model.id
+end
+
+function openai_responses_input_from_message(msg::AgentMessage, model::Model)
     if msg isa UserMessage
         content = Any[]
         for block in msg.content
@@ -90,6 +134,7 @@ function openai_responses_input_from_message(msg::AgentMessage)
         isempty(content) && return Any[]
         return Any[Dict("role" => "user", "content" => content)]
     elseif msg isa AssistantMessage
+        different_model = openai_responses_is_different_model(msg, model)
         parts = Any[]
         for block in msg.content
             if block isa ThinkingContent
@@ -124,6 +169,9 @@ function openai_responses_input_from_message(msg::AgentMessage)
                 push!(parts, msg_item)
             elseif block isa ToolCallContent
                 call_id_raw, item_id = _responses_split_compound_id(block.id)
+                if different_model && item_id !== nothing && startswith(item_id, "fc_")
+                    item_id = nothing
+                end
                 fc = Dict{String, Any}(
                     "type" => "function_call",
                     "call_id" => call_id_raw,
@@ -139,6 +187,9 @@ function openai_responses_input_from_message(msg::AgentMessage)
         if !has_tc_blocks
             for tc in msg.tool_calls
                 call_id_raw, item_id = _responses_split_compound_id(tc.call_id)
+                if different_model && item_id !== nothing && startswith(item_id, "fc_")
+                    item_id = nothing
+                end
                 fc = Dict{String, Any}(
                     "type" => "function_call",
                     "call_id" => call_id_raw,
@@ -166,23 +217,10 @@ function openai_responses_input_from_message(msg::AgentMessage)
     return Any[]
 end
 
-function openai_responses_build_full_input(agent::Agent, state::AgentState, input::AgentTurnInput)
+function openai_responses_build_full_input(agent::Agent, state::AgentState, input::AgentTurnInput, model::Model)
     items = Any[]
-    for msg in state.messages
-        include_in_context(msg) || continue
-        append!(items, openai_responses_input_from_message(msg))
-    end
-    if input isa String
-        push!(items, Dict("role" => "user", "content" => [Dict("type" => "input_text", "text" => input)]))
-    elseif input isa UserMessage
-        append!(items, openai_responses_input_from_message(input))
-    elseif input isa Vector{UserContentBlock}
-        append!(items, openai_responses_input_from_message(UserMessage(input)))
-    elseif input isa Vector{ToolResultMessage}
-        for result in input
-            call_id_raw, _ = _responses_split_compound_id(result.call_id)
-            push!(items, Dict("type" => "function_call_output", "call_id" => call_id_raw, "output" => provider_tool_result_output(result)))
-        end
+    for msg in openai_responses_transformed_messages(state, input, model)
+        append!(items, openai_responses_input_from_message(msg, model))
     end
     return items
 end

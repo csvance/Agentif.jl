@@ -274,7 +274,7 @@ function _split_compound_id(id::AbstractString)
     return (String(id[1:idx-1]), String(id[idx+1:end]))
 end
 
-function codex_input_from_message(msg::AgentMessage)
+function codex_input_from_message(msg::AgentMessage, model::Model)
     if msg isa UserMessage
         content = Any[]
         for block in msg.content
@@ -287,6 +287,7 @@ function codex_input_from_message(msg::AgentMessage)
         isempty(content) && return Any[]
         return Any[Dict("role" => "user", "content" => content)]
     elseif msg isa AssistantMessage
+        different_model = openai_responses_is_different_model(msg, model)
         parts = Any[]
         # Iterate content blocks in order to preserve signatures
         for block in msg.content
@@ -323,6 +324,9 @@ function codex_input_from_message(msg::AgentMessage)
                 push!(parts, msg_item)
             elseif block isa ToolCallContent
                 call_id_raw, item_id = _split_compound_id(block.id)
+                if different_model && item_id !== nothing && startswith(item_id, "fc_")
+                    item_id = nothing
+                end
                 fc = Dict{String, Any}(
                     "type" => "function_call",
                     "call_id" => call_id_raw,
@@ -338,6 +342,9 @@ function codex_input_from_message(msg::AgentMessage)
         if !has_tc_blocks
             for tc in msg.tool_calls
                 call_id_raw, item_id = _split_compound_id(tc.call_id)
+                if different_model && item_id !== nothing && startswith(item_id, "fc_")
+                    item_id = nothing
+                end
                 fc = Dict{String, Any}(
                     "type" => "function_call",
                     "call_id" => call_id_raw,
@@ -366,23 +373,10 @@ function codex_input_from_message(msg::AgentMessage)
     return Any[]
 end
 
-function codex_build_input(agent::Agent, state::AgentState, input::AgentTurnInput)
+function codex_build_input(agent::Agent, state::AgentState, input::AgentTurnInput, model::Model)
     items = Any[]
-    for msg in state.messages
-        include_in_context(msg) || continue
-        append!(items, codex_input_from_message(msg))
-    end
-    if input isa String
-        push!(items, Dict("role" => "user", "content" => [Dict("type" => "input_text", "text" => input)]))
-    elseif input isa UserMessage
-        append!(items, codex_input_from_message(input))
-    elseif input isa Vector{UserContentBlock}
-        append!(items, codex_input_from_message(UserMessage(input)))
-    elseif input isa Vector{ToolResultMessage}
-        for result in input
-            call_id_raw, _ = _split_compound_id(result.call_id)
-            push!(items, Dict("type" => "function_call_output", "call_id" => call_id_raw, "output" => provider_tool_result_output(result)))
-        end
+    for msg in openai_responses_transformed_messages(state, input, model)
+        append!(items, codex_input_from_message(msg, model))
     end
     return items
 end

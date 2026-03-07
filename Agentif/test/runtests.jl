@@ -933,6 +933,100 @@ end
     @test_throws ArgumentError Agentif.resolve_oauth_apikey(:unknown, "OAUTH")
 end
 
+@testset "responses/codex history normalization" begin
+    openai_model = Model(
+        id = "gpt-5.2",
+        name = "gpt-5.2",
+        api = "openai-responses",
+        provider = "openai",
+        baseUrl = "https://api.openai.com/v1",
+        reasoning = true,
+        input = ["text"],
+        cost = Dict("input" => 0.0, "output" => 0.0, "cacheRead" => 0.0, "cacheWrite" => 0.0),
+        contextWindow = 128000,
+        maxTokens = 32000,
+    )
+    codex_model = Model(
+        id = "gpt-5.2-codex",
+        name = "gpt-5.2-codex",
+        api = "openai-codex-responses",
+        provider = "openai-codex",
+        baseUrl = "https://chatgpt.com/backend-api",
+        reasoning = true,
+        input = ["text"],
+        cost = Dict("input" => 0.0, "output" => 0.0, "cacheRead" => 0.0, "cacheWrite" => 0.0),
+        contextWindow = 128000,
+        maxTokens = 32000,
+    )
+
+    let
+        prior = AssistantMessage(
+            provider = "openai",
+            api = "openai-responses",
+            model = "gpt-5.1",
+        )
+        push!(prior.content, Agentif.ToolCallContent(; id = "bad+call|item/with=chars__", name = "read", arguments = Dict("path" => "README.md")))
+        state = AgentState(messages = AgentMessage[prior])
+        items = Agentif.openai_responses_build_full_input(make_agent(), state, "continue", openai_model)
+
+        function_calls = [item for item in items if item isa AbstractDict && get(() -> nothing, item, "type") == "function_call"]
+        tool_outputs = [item for item in items if item isa AbstractDict && get(() -> nothing, item, "type") == "function_call_output"]
+
+        @test length(function_calls) == 1
+        @test get(() -> nothing, function_calls[1], "call_id") == "bad_call"
+        @test !haskey(function_calls[1], "id")
+        @test length(tool_outputs) == 1
+        @test get(() -> nothing, tool_outputs[1], "call_id") == "bad_call"
+        parsed_output = JSON.parse(get(() -> "{}", tool_outputs[1], "output"))
+        @test get(() -> nothing, parsed_output, "message") == "No result provided"
+        @test get(() -> nothing, parsed_output, "tool_error") == true
+    end
+
+    let
+        prior = AssistantMessage(
+            provider = "openai-codex",
+            api = "openai-codex-responses",
+            model = "gpt-5.1-codex",
+        )
+        push!(prior.content, Agentif.ToolCallContent(; id = "bad+call|item/with=chars__", name = "read", arguments = Dict("path" => "README.md")))
+        state = AgentState(messages = AgentMessage[prior])
+        items = Agentif.codex_build_input(make_agent(), state, "continue", codex_model)
+
+        function_calls = [item for item in items if item isa AbstractDict && get(() -> nothing, item, "type") == "function_call"]
+        tool_outputs = [item for item in items if item isa AbstractDict && get(() -> nothing, item, "type") == "function_call_output"]
+
+        @test length(function_calls) == 1
+        @test get(() -> nothing, function_calls[1], "call_id") == "bad_call"
+        @test !haskey(function_calls[1], "id")
+        @test length(tool_outputs) == 1
+        @test get(() -> nothing, tool_outputs[1], "call_id") == "bad_call"
+        parsed_output = JSON.parse(get(() -> "{}", tool_outputs[1], "output"))
+        @test get(() -> nothing, parsed_output, "message") == "No result provided"
+        @test get(() -> nothing, parsed_output, "tool_error") == true
+    end
+
+    let
+        prior = AssistantMessage(
+            provider = "anthropic",
+            api = "anthropic-messages",
+            model = "claude-sonnet",
+        )
+        push!(prior.content, Agentif.ThinkingContent(; thinking = "cross-provider reasoning"))
+        state = AgentState(messages = AgentMessage[prior])
+        items = Agentif.codex_build_input(make_agent(), state, "continue", codex_model)
+
+        assistant_messages = [item for item in items if item isa AbstractDict && get(() -> nothing, item, "role") == "assistant"]
+        reasoning_items = [item for item in items if item isa AbstractDict && get(() -> nothing, item, "type") == "reasoning"]
+
+        @test isempty(reasoning_items)
+        @test length(assistant_messages) == 1
+        content = get(() -> Any[], assistant_messages[1], "content")
+        @test content isa AbstractVector
+        @test get(() -> nothing, content[1], "type") == "output_text"
+        @test get(() -> nothing, content[1], "text") == "cross-provider reasoning"
+    end
+end
+
 @testset "openai_codex stream infers account_id from JWT" begin
     request_headers = Ref(Dict{String, String}())
     request_body = Ref(Dict{String, Any}())

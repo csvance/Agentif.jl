@@ -269,7 +269,7 @@ function stream(
         response_status = Ref{Union{Nothing, String}}(nothing)
 
         system_prompt = agent_system_prompt(agent)
-        full_input = openai_responses_build_full_input(agent, state, input)
+        full_input = openai_responses_build_full_input(agent, state, input, model)
 
         # Build Dict-based request body (allows raw Dict items for opaque reasoning roundtripping)
         body = Dict{String, Any}(
@@ -939,7 +939,7 @@ function stream(
         retry_settings = codex_retry_settings!(codex_kw)
 
         tools = build_codex_tools(agent.tools)
-        current_input = codex_build_input(agent, state, input)
+        current_input = codex_build_input(agent, state, input, model)
         system_prompt = agent_system_prompt(agent)
 
         request_body = Dict{String, Any}(
