@@ -47,6 +47,25 @@ end
     )
     parsed = JSON.parse(JSON.json(chunk), OpenAICompletions.StreamChunk)
     @test parsed.choices[1].delta.tool_calls[1].var"function".name == "read"
+
+    usage_chunk = JSON.parse(
+        """
+        {
+          "choices": [{"delta": {}, "index": 0}],
+          "usage": {
+            "prompt_tokens": 10,
+            "completion_tokens": 4,
+            "total_tokens": 14,
+            "prompt_tokens_details": {"cached_tokens": 3},
+            "completion_tokens_details": {"reasoning_tokens": 2}
+          }
+        }
+        """,
+        OpenAICompletions.StreamChunk,
+    )
+    @test usage_chunk.usage !== nothing
+    @test usage_chunk.usage.prompt_tokens_details.cached_tokens == 3
+    @test usage_chunk.usage.completion_tokens_details.reasoning_tokens == 2
 end
 
 @testset "OpenAIResponses" begin

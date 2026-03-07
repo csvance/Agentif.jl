@@ -4,6 +4,7 @@ using Base64
 using HTTP
 using JSON
 using Logging
+using LLMProviders
 using LLMOAuth
 using LocalSearch
 using SQLite
@@ -1024,6 +1025,139 @@ end
         @test content isa AbstractVector
         @test get(() -> nothing, content[1], "type") == "output_text"
         @test get(() -> nothing, content[1], "text") == "cross-provider reasoning"
+    end
+end
+
+@testset "openai request shaping and usage parity" begin
+    @test Agentif.resolve_openai_cache_retention("none") == "none"
+    @test Agentif.resolve_openai_cache_retention("long") == "long"
+    @test Agentif.openai_prompt_cache_retention("https://api.openai.com/v1", "long") == "24h"
+    @test Agentif.openai_prompt_cache_retention("http://127.0.0.1:8080/v1", "long") === nothing
+
+    responses_usage = Agentif.openai_responses_usage_from_response(
+        LLMProviders.OpenAIResponses.Usage(
+            input_tokens = 10,
+            input_tokens_details = (cached_tokens = 3,),
+            output_tokens = 4,
+            total_tokens = 14,
+        ),
+    )
+    @test responses_usage.input == 7
+    @test responses_usage.cacheRead == 3
+    @test responses_usage.output == 4
+    @test responses_usage.total == 14
+
+    completions_usage = Agentif.openai_completions_usage_from_response(
+        LLMProviders.OpenAICompletions.Usage(
+            prompt_tokens = 10,
+            completion_tokens = 4,
+            total_tokens = 14,
+            prompt_tokens_details = (cached_tokens = 3,),
+            completion_tokens_details = (reasoning_tokens = 2,),
+        ),
+    )
+    @test completions_usage.input == 7
+    @test completions_usage.cacheRead == 3
+    @test completions_usage.output == 6
+    @test completions_usage.total == 16
+end
+
+@testset "openai_responses stream shapes GPT-5 requests and keeps incomplete as length" begin
+    request_body = Ref(Dict{String, Any}())
+    seen_events = Agentif.AgentEvent[]
+
+    server = HTTP.serve!("127.0.0.1", 0) do req
+        request_body[] = JSON.parse(req.body)
+        sse = join([
+            "data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"message\",\"id\":\"msg_1\",\"role\":\"assistant\",\"content\":[]}}",
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"Partial\"}",
+            "data: {\"type\":\"response.incomplete\",\"response\":{\"id\":\"resp_1\",\"model\":\"gpt-5.2\",\"status\":\"incomplete\",\"usage\":{\"input_tokens\":10,\"input_tokens_details\":{\"cached_tokens\":3},\"output_tokens\":4,\"total_tokens\":14}}}",
+            "data: [DONE]",
+        ], "\n\n") * "\n\n"
+        return HTTP.Response(200, ["Content-Type" => "text/event-stream"], sse)
+    end
+
+    try
+        sock = HTTP.Sockets.getsockname(server.listener.server)
+        port = sock[2]
+        model = Model(
+            id = "gpt-5.2",
+            name = "gpt-5.2",
+            api = "openai-responses",
+            provider = "openai",
+            baseUrl = "http://127.0.0.1:$port",
+            reasoning = true,
+            input = ["text"],
+            cost = Dict("input" => 0.0, "output" => 0.0, "cacheRead" => 0.0, "cacheWrite" => 0.0),
+            contextWindow = 128000,
+            maxTokens = 32000,
+        )
+        agent = Agent(
+            id = "responses-gpt5-test",
+            prompt = "You are helpful.",
+            model = model,
+            apikey = "test-key",
+            tools = AgentTool[],
+        )
+
+        result = stream(ev -> (push!(seen_events, ev); ev), agent, AgentState(), "Say hello", Abort(); sessionId = "sess-42")
+        @test result.most_recent_stop_reason == :length
+        @test !any(ev -> ev isa Agentif.AgentErrorEvent, seen_events)
+        @test get(() -> nothing, request_body[], "prompt_cache_key") == "sess-42"
+        @test !haskey(request_body[], "sessionId")
+        input_items = get(() -> Any[], request_body[], "input")
+        @test input_items isa AbstractVector
+        @test get(() -> nothing, input_items[1], "role") == "developer"
+        dev_content = get(() -> Any[], input_items[1], "content")
+        @test dev_content isa AbstractVector
+        @test get(() -> nothing, dev_content[1], "text") == "# Juice: 0 !important"
+    finally
+        close(server)
+    end
+end
+
+@testset "openai_codex stream keeps incomplete as length" begin
+    seen_events = Agentif.AgentEvent[]
+
+    server = HTTP.serve!("127.0.0.1", 0) do req
+        sse = join([
+            "data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"message\",\"id\":\"msg_1\",\"role\":\"assistant\",\"content\":[]}}",
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"Partial codex\"}",
+            "data: {\"type\":\"response.incomplete\",\"response\":{\"status\":\"incomplete\",\"usage\":{\"input_tokens\":10,\"input_tokens_details\":{\"cached_tokens\":3},\"output_tokens\":4,\"total_tokens\":14}}}",
+            "data: [DONE]",
+        ], "\n\n") * "\n\n"
+        return HTTP.Response(200, ["Content-Type" => "text/event-stream"], sse)
+    end
+
+    try
+        sock = HTTP.Sockets.getsockname(server.listener.server)
+        port = sock[2]
+        model = Model(
+            id = "gpt-5.2-codex",
+            name = "gpt-5.2-codex",
+            api = "openai-codex-responses",
+            provider = "openai-codex",
+            baseUrl = "http://127.0.0.1:$port",
+            reasoning = true,
+            input = ["text"],
+            cost = Dict("input" => 0.0, "output" => 0.0, "cacheRead" => 0.0, "cacheWrite" => 0.0),
+            contextWindow = 128000,
+            maxTokens = 32000,
+        )
+        token = fake_jwt(Dict("https://api.openai.com/auth" => Dict("chatgpt_account_id" => "acct-jwt-incomplete")))
+        agent = Agent(
+            id = "codex-incomplete-test",
+            prompt = "You are helpful.",
+            model = model,
+            apikey = token,
+            tools = AgentTool[],
+        )
+
+        result = stream(ev -> (push!(seen_events, ev); ev), agent, AgentState(), "Say hello", Abort())
+        @test result.most_recent_stop_reason == :length
+        @test !any(ev -> ev isa Agentif.AgentErrorEvent, seen_events)
+    finally
+        close(server)
     end
 end
 

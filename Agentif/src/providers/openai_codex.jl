@@ -590,7 +590,7 @@ function openai_codex_event_callback(
                 rid = get(() -> nothing, response, "id")
                 rid !== nothing && (assistant_message.response_id = string(rid))
             end
-        elseif event_type == "response.failed" || event_type == "response.incomplete"
+        elseif event_type == "response.failed"
             response = get(() -> nothing, raw, "response")
             if response isa AbstractDict
                 usage = get(() -> nothing, response, "usage")
@@ -610,6 +610,20 @@ function openai_codex_event_callback(
                     f(MessageEndEvent(:assistant, assistant_message))
                 end
                 f(AgentErrorEvent(ErrorException(error_msg)))
+            end
+        elseif event_type == "response.incomplete"
+            response = get(() -> nothing, raw, "response")
+            if response isa AbstractDict
+                usage = get(() -> nothing, response, "usage")
+                usage !== nothing && (response_usage[] = usage)
+                status = get(() -> nothing, response, "status")
+                status !== nothing && (response_status[] = String(status))
+                rid = get(() -> nothing, response, "id")
+                rid !== nothing && (assistant_message.response_id = string(rid))
+                if started[] && !ended[]
+                    ended[] = true
+                    f(MessageEndEvent(:assistant, assistant_message))
+                end
             end
         elseif event_type == "error"
             code = String(get(() -> "", raw, "code"))

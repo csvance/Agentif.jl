@@ -170,6 +170,26 @@ end
 
 agent_system_prompt(agent::Agent) = agent.prompt
 
+function resolve_openai_cache_retention(cache_retention)
+    if cache_retention === nothing
+        return lowercase(strip(get(ENV, "PI_CACHE_RETENTION", ""))) == "long" ? "long" : "short"
+    end
+    value = lowercase(strip(string(cache_retention)))
+    return value in ("none", "short", "long") ? value : "short"
+end
+
+function openai_prompt_cache_retention(base_url::AbstractString, cache_retention::AbstractString)
+    cache_retention == "long" || return nothing
+    return occursin("api.openai.com", lowercase(String(base_url))) ? "24h" : nothing
+end
+
+function openai_responses_zero_juice_item()
+    return Dict(
+        "role" => "developer",
+        "content" => [Dict("type" => "input_text", "text" => "# Juice: 0 !important")],
+    )
+end
+
 
 const GOOGLE_THOUGHT_SIGNATURE_REGEX = r"^[A-Za-z0-9+/]+={0,2}$"
 
@@ -270,6 +290,11 @@ function stream(
 
         system_prompt = agent_system_prompt(agent)
         full_input = openai_responses_build_full_input(agent, state, input, model)
+        session_id = get(() -> nothing, kw_nt, :session_id)
+        session_id === nothing && (session_id = get(() -> nothing, kw_nt, :sessionId))
+        cache_retention = get(() -> nothing, kw_nt, :cache_retention)
+        cache_retention === nothing && (cache_retention = get(() -> nothing, kw_nt, :cacheRetention))
+        cache_retention = resolve_openai_cache_retention(cache_retention)
 
         # Build Dict-based request body (allows raw Dict items for opaque reasoning roundtripping)
         body = Dict{String, Any}(
@@ -290,16 +315,26 @@ function stream(
 
         # Reasoning config (for reasoning models)
         reasoning_effort = get(() -> nothing, kw_nt, :reasoning_effort)
+        reasoning_effort === nothing && (reasoning_effort = get(() -> nothing, kw_nt, :reasoningEffort))
         reasoning_summary = get(() -> nothing, kw_nt, :reasoning_summary)
+        reasoning_summary === nothing && (reasoning_summary = get(() -> nothing, kw_nt, :reasoningSummary))
         if model.reasoning
             if reasoning_effort !== nothing || reasoning_summary !== nothing
                 body["reasoning"] = Dict(
                     "effort" => something(reasoning_effort, "medium"),
                     "summary" => something(reasoning_summary, "auto"),
                 )
+            elseif startswith(lowercase(model.name), "gpt-5")
+                body["input"] = Any[openai_responses_zero_juice_item(), body["input"]...]
             end
             body["include"] = ["reasoning.encrypted_content"]
         end
+
+        if session_id !== nothing && cache_retention != "none"
+            body["prompt_cache_key"] = string(session_id)
+        end
+        prompt_cache_retention = openai_prompt_cache_retention(model.baseUrl, cache_retention)
+        prompt_cache_retention !== nothing && (body["prompt_cache_retention"] = prompt_cache_retention)
 
         # Pass through model.kw (temperature, max_output_tokens, etc.)
         for (k, v) in pairs(model.kw)
@@ -311,7 +346,20 @@ function stream(
 
         # Pass through stream kwargs (except ones we handle specially)
         for k in keys(kw_nt)
-            k in (:instructions, :apikey, :reasoning_effort, :reasoning_summary, :model, :http_kw, :session_id) && continue
+            k in (
+                :instructions,
+                :apikey,
+                :reasoning_effort,
+                :reasoningEffort,
+                :reasoning_summary,
+                :reasoningSummary,
+                :model,
+                :http_kw,
+                :session_id,
+                :sessionId,
+                :cache_retention,
+                :cacheRetention,
+            ) && continue
             k_str = string(k)
             haskey(body, k_str) || (body[k_str] = kw_nt[k])
         end

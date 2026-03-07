@@ -229,12 +229,13 @@ function openai_responses_usage_from_response(u::Union{Nothing, OpenAIResponses.
     u === nothing && return Usage()
     input = something(u.input_tokens, 0)
     output = something(u.output_tokens, 0)
-    total = something(u.total_tokens, input + output)
     cached = 0
     if u.input_tokens_details !== nothing
         cached = something(u.input_tokens_details.cached_tokens, 0)
     end
-    return Usage(; input, output, cacheRead = cached, total)
+    billable_input = max(0, input - cached)
+    total = something(u.total_tokens, billable_input + output + cached)
+    return Usage(; input = billable_input, output, cacheRead = cached, total)
 end
 
 function openai_responses_stop_reason(status::Union{Nothing, String}, tool_calls::Vector{AgentToolCall})
@@ -262,9 +263,17 @@ function openai_responses_event_callback(
     )
     return function (stream, event)
         maybe_abort!(abort, stream)
+        data = String(event.data)
+        if strip(data) == "[DONE]"
+            if started[] && !ended[]
+                ended[] = true
+                f(MessageEndEvent(:assistant, assistant_message))
+            end
+            return
+        end
         local parsed
         try
-            parsed = JSON.parse(String(event.data), OpenAIResponses.StreamEvent)
+            parsed = JSON.parse(data, OpenAIResponses.StreamEvent)
         catch e
             f(AgentErrorEvent(ErrorException(sprint(showerror, e))))
             return
@@ -426,13 +435,9 @@ function openai_responses_event_callback(
         elseif parsed isa OpenAIResponses.StreamResponseIncompleteEvent
             response_status[] = parsed.response.status
             response_usage[] = parsed.response.usage
-            already_ended = ended[]
             if started[] && !ended[]
                 ended[] = true
                 f(MessageEndEvent(:assistant, assistant_message))
-            end
-            if !already_ended
-                f(AgentErrorEvent(ErrorException("Response incomplete")))
             end
         elseif parsed isa OpenAIResponses.StreamOutputDoneEvent || parsed isa OpenAIResponses.StreamDoneEvent
             if started[] && !ended[]

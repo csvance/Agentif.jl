@@ -56,7 +56,7 @@
   - `julia --project=Agentif -e 'using Pkg; Pkg.test()'`
   - Added builder-level regression tests covering same-provider different-model tool-call replay, synthetic missing tool results, and cross-provider thinking downgrade behavior.
 
-### [ ] ITEM-003 (P1) Fix OpenAI request shaping and usage parity
+### [x] ITEM-003 (P1) Fix OpenAI request shaping and usage parity
 - Description: Several OpenAI request/usage behaviors still drift from the reference implementation: direct Responses requests do not map `sessionId` to prompt-cache fields, GPT-5 direct Responses requests do not inject the “reasoning off” developer nudge when no reasoning is requested, cached input tokens are double-counted in usage, chat-completions usage cannot represent reasoning tokens, and incomplete Responses/Codex statuses currently emit error events.
 - Desired outcome: OpenAI Responses, chat-completions, and Codex request/usage/status handling match the intended parity behavior for session caching, GPT-5 reasoning control, cached-token accounting, reasoning-token accounting, and incomplete-status handling.
 - Affected files: `Agentif/src/stream.jl`, `Agentif/src/providers/openai_responses_adapter.jl`, `Agentif/src/providers/openai_completions_adapter.jl`, `Agentif/src/providers/openai_codex.jl`, `LLMProviders/src/providers/openai_completions.jl`, `Agentif/test/runtests.jl`, `LLMProviders/test/runtests.jl`
@@ -79,6 +79,10 @@
   - Direct Responses maps session identifiers cleanly.
   - Usage accounting matches cached/reasoning token expectations.
   - Incomplete statuses no longer surface as hard errors.
+- Verification evidence:
+  - `julia --project=LLMProviders -e 'using Pkg; Pkg.test()'`
+  - `julia --project=Agentif -e 'using Pkg; Pkg.test()'`
+  - Added regression coverage for prompt-cache/session mapping, GPT-5 zero-juice request shaping, cached/reasoning token accounting, and incomplete-status handling for both Responses and Codex.
 
 ### [ ] ITEM-004 (P1) Harden Codex OAuth login and refresh behavior
 - Description: The current Codex OAuth flow assumes the localhost callback server always binds successfully and does not provide a manual paste fallback. Refresh handling also rebuilds credentials from the refresh response without preserving the previous refresh token if the server omits a new one.

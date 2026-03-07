@@ -366,12 +366,18 @@ function openai_completions_usage_from_response(u::Union{Nothing, OpenAICompleti
     u === nothing && return Usage()
     input = something(u.prompt_tokens, 0)
     output = something(u.completion_tokens, 0)
-    total = something(u.total_tokens, input + output)
     cached = 0
     if u.prompt_tokens_details !== nothing
         cached = something(u.prompt_tokens_details.cached_tokens, 0)
     end
-    return Usage(; input, output, cacheRead = cached, total)
+    reasoning_tokens = 0
+    if u.completion_tokens_details !== nothing
+        reasoning_tokens = something(u.completion_tokens_details.reasoning_tokens, 0)
+    end
+    billable_input = max(0, input - cached)
+    total_output = output + reasoning_tokens
+    total = billable_input + total_output + cached
+    return Usage(; input = billable_input, output = total_output, cacheRead = cached, total)
 end
 
 function openai_completions_stop_reason(reason::Union{Nothing, String}, tool_calls::Vector{AgentToolCall})
