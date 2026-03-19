@@ -195,8 +195,20 @@ get_event_handlers(::EventSource) = EventHandler[]
 get_tools(::EventSource) = Agentif.AgentTool[]
 start!(::EventSource, ::AgentAssistant) = nothing
 
-function run(; event_sources=nothing, kwargs...)
-    return init!(""; event_sources, kwargs...)
+"""
+    run(; post_init=nothing, kwargs...)
+
+Initialize Claw (same keyword arguments as `init!`) and **block forever** so the
+process stays alive while the webhook and event-loop tasks run.
+
+`post_init` may be a one-argument function `f(assistant)` invoked immediately after
+`init!` returns (e.g. to register event handlers that need a live `AgentAssistant`).
+"""
+function run(; event_sources=nothing, post_init=nothing, kwargs...)
+    assistant = init!(""; event_sources, kwargs...)
+    post_init === nothing || post_init(assistant)
+    wait(Threads.Event())
+    return nothing
 end
 
 # ─── Event interface ───
