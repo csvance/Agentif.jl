@@ -203,9 +203,11 @@ process stays alive while the webhook and event-loop tasks run.
 
 `post_init` may be a one-argument function `f(assistant)` invoked immediately after
 `init!` returns (e.g. to register event handlers that need a live `AgentAssistant`).
+
+`db_path` is forwarded as the first argument to `init!` (same as `Claw.init!(db_path; …)`).
 """
-function run(; event_sources=nothing, post_init=nothing, kwargs...)
-    assistant = init!(""; event_sources, kwargs...)
+function run(; db_path::String="", event_sources=nothing, post_init=nothing, kwargs...)
+    assistant = init!(db_path; event_sources, kwargs...)
     post_init === nothing || post_init(assistant)
     wait(Threads.Event())
     return nothing
