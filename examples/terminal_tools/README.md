@@ -75,17 +75,14 @@ You can run any example with:
 
 ```bash
 cd /Users/jacob.quinn/.julia/dev/Agentif
-julia --project examples/terminal_tools/01_simple_echo.jl
+julia --project=. examples/terminal_tools/01_simple_echo.jl
 ```
 
 Or run all examples:
 
 ```bash
-for f in examples/terminal_tools/*.jl; do
-    echo "Running $f"
-    julia --project "$f"
-    echo ""
-done
+cd /Users/jacob.quinn/.julia/dev/Agentif
+julia --project=. examples/terminal_tools/run_all.jl
 ```
 
 ## Tool Parameters

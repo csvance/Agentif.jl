@@ -12,7 +12,6 @@ agent = Agent(
     model = getModel("anthropic", "claude-sonnet-4-5"),
     apikey = ENV["ANTHROPIC_API_KEY"],
     tools = tools,
-    stream_output = true
 )
 
 println("Testing 50ms grace period captures output from fast-exiting commands...")

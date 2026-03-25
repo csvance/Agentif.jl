@@ -162,14 +162,16 @@ These tests verify that all proposed features from the Codex analysis have been 
 
 ### Run Individual Test:
 ```bash
-julia --project=/Users/jacob.quinn/.julia/dev/Agentif examples/terminal_tools/phase_tests/01_test_session_metadata.jl
+cd /Users/jacob.quinn/.julia/dev/Agentif
+julia --project=. examples/terminal_tools/phase_tests/01_test_session_metadata.jl
 ```
 
 ### Run All Tests:
 ```bash
+cd /Users/jacob.quinn/.julia/dev/Agentif
 for f in examples/terminal_tools/phase_tests/*.jl; do
     echo "Running $f"
-    julia --project "$f"
+    julia --project=. "$f"
     echo ""
 done
 ```
@@ -177,21 +179,21 @@ done
 ### Run Specific Phase:
 ```bash
 # Phase 1 tests (critical fixes)
-julia --project examples/terminal_tools/phase_tests/01_test_session_metadata.jl
-julia --project examples/terminal_tools/phase_tests/02_test_auto_cleanup.jl
-julia --project examples/terminal_tools/phase_tests/03_test_grace_period.jl
-julia --project examples/terminal_tools/phase_tests/04_test_session_limits.jl
+julia --project=. examples/terminal_tools/phase_tests/01_test_session_metadata.jl
+julia --project=. examples/terminal_tools/phase_tests/02_test_auto_cleanup.jl
+julia --project=. examples/terminal_tools/phase_tests/03_test_grace_period.jl
+julia --project=. examples/terminal_tools/phase_tests/04_test_session_limits.jl
 
 # Phase 2 tests (QoL features)
-julia --project examples/terminal_tools/phase_tests/05_test_kill_session.jl
-julia --project examples/terminal_tools/phase_tests/06_test_list_sessions.jl
+julia --project=. examples/terminal_tools/phase_tests/05_test_kill_session.jl
+julia --project=. examples/terminal_tools/phase_tests/06_test_list_sessions.jl
 
 # Phase 3 tests (advanced features)
-julia --project examples/terminal_tools/phase_tests/07_test_max_output_lines.jl
-julia --project examples/terminal_tools/phase_tests/08_test_head_tail_buffer.jl
+julia --project=. examples/terminal_tools/phase_tests/07_test_max_output_lines.jl
+julia --project=. examples/terminal_tools/phase_tests/08_test_head_tail_buffer.jl
 
 # Integration test
-julia --project examples/terminal_tools/phase_tests/09_test_integrated_workflow.jl
+julia --project=. examples/terminal_tools/phase_tests/09_test_integrated_workflow.jl
 ```
 
 ## Expected Test Behavior
