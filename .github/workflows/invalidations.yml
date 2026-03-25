@@ -2,6 +2,15 @@ name: Invalidations
 
 on:
   pull_request:
+    # Limit invalidations gating to runtime surfaces that can change Agentif import behavior.
+    # Monorepo/docs/CI-only changes should not be blocked by this check.
+    paths:
+    - Agentif/src/**
+    - Agentif/ext/**
+    - Agentif/Project.toml
+    - LLMProviders/src/**
+    - LLMProviders/ext/**
+    - LLMProviders/Project.toml
 
 concurrency:
   # Skip intermediate builds: always.
