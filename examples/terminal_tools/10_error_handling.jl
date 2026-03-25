@@ -10,7 +10,6 @@ agent = Agent(
     model = getModel("anthropic", "claude-sonnet-4-5"),
     apikey = ENV["ANTHROPIC_API_KEY"],
     tools = tools,
-    stream_output = true
 )
 
 result = evaluate(

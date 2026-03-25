@@ -1,4 +1,5 @@
 using Agentif
+using LLMTools
 
 const PROMPTS = [
     "Say hello in one sentence.",
@@ -61,10 +62,10 @@ function request_kwargs(model::Model)
 end
 
 function run_prompt(agent::Agent, prompt::String; kw)
-    result = evaluate(agent, prompt; kw...)
-    idx = findlast(msg -> msg isa AssistantMessage, result.state.messages)
+    state = evaluate(agent, prompt; kw...)
+    idx = findlast(msg -> msg isa AssistantMessage, state.messages)
     idx === nothing && return ""
-    return message_text(result.state.messages[idx])
+    return message_text(state.messages[idx])
 end
 
 function run_provider(provider::String)
@@ -89,9 +90,8 @@ function run_provider(provider::String)
         agent = Agent(
             model = model,
             apikey = api.value,
-            tools = read_only_tools(),
+            tools = LLMTools.read_only_tools(),
             prompt = "You are a concise assistant.",
-            stream_output = false,
         )
 
         kw = request_kwargs(model)
