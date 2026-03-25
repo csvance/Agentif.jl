@@ -4,6 +4,12 @@
 .DS_Store
 /docs/build/
 /docs/Manifest.toml
-/Manifest.toml
-Manifest-v1.12.toml
-Manifest.toml
+/Agentif/Manifest.toml
+/Agentif/Manifest-v*.toml
+/Claw/Manifest.toml
+/Claw/Manifest-v*.toml
+/LLMOAuth/Manifest.toml
+/LLMProviders/Manifest.toml
+/LLMProviders/Manifest-v*.toml
+/LLMTools/Manifest.toml
+/projects/**/Manifest.toml
