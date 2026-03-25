@@ -10,6 +10,8 @@ Current tool areas include:
 - web fetch and search
 - Codex/subagent helpers
 
+Semantic/code-search experiments are no longer exposed from `LLMTools`; that work moved to `LocalSearch.jl`.
+
 ## Repo-Root Workflow
 
 ```julia
