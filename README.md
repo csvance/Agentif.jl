@@ -1,107 +1,81 @@
-# Agentif.jl
+# Agentif Monorepo
 
-Agentif.jl is a lightweight Julia framework for building autonomous AI agents powered by large language models (LLMs) with seamless tool integration and streaming support.
+This repository contains the core packages that power the `Agentif` Julia agent stack.
 
-## Features
-- **Multi-provider LLM support**: OpenAI (Responses &amp; Completions APIs), Anthropic, Google Generative AI, Google Gemini CLI
-- **Streaming events**: Real-time updates for agent evaluation, messages, tool calls &amp; executions
-- **Tool ecosystem**:
-  - `@tool` macro to turn Julia functions into agent-callable tools
-  - Predefined suites: `coding_tools()`, `read_only_tools()`, `all_tools()`
-  - Includes file I/O (`read`, `write`, `edit`), shell (`bash`), filesystem (`ls`, `grep`, `find`)
-- **Agent Skills support**:
-  - Auto-discovery from `.agentif/skills` (project) then `~/.agentif/skills` (user)
-  - Spec-compliant `<available_skills>` prompt injection
-  - Built-in `skill_loader` tool to load `SKILL.md` instructions
-- **Advanced capabilities**:
-  - Input guardrails to prevent unsafe queries
-  - Tool call caching for resumable sessions
-  - Automatic tool approval or manual `approve!()` for safety
-- **REPL-friendly**: `evaluate(agent, query)` with live streaming
+The intended workflow is monorepo-first:
 
-## Installation
 ```julia
 using Pkg
-Pkg.add(&quot;Agentif&quot;)
+Pkg.activate(".")
+Pkg.instantiate()
 ```
-Requires Julia ≥1.6.
+
+After that, you can load any of the top-level packages directly from the repo root:
+
+```julia
+using Agentif, LLMTools, LLMProviders, Claw, LLMOAuth, Juco
+```
+
+## Packages
+
+- `Agentif`: core agent runtime, message/state types, middleware, sessions, skills, and provider adapters.
+- `LLMTools`: tool suites for file editing, shell/PTY sessions, worker execution, web fetch/search, and subagents.
+- `LLMProviders`: model registry plus request/response types for the supported LLM providers.
+- `Claw`: SQLite-backed event-driven assistant app built on top of `Agentif` and `LLMTools`.
+- `LLMOAuth`: OAuth helpers for Codex/OpenAI and Anthropic flows.
+- `Juco`: placeholder coding-assistant package that will be rewritten; see `Juco/README.md` before using it.
+
+Each package has its own README:
+
+- [`Agentif/README.md`](Agentif/README.md)
+- [`LLMTools/README.md`](LLMTools/README.md)
+- [`LLMProviders/README.md`](LLMProviders/README.md)
+- [`Claw/README.md`](Claw/README.md)
+- [`LLMOAuth/README.md`](LLMOAuth/README.md)
+- [`Juco/README.md`](Juco/README.md)
 
 ## Quick Start
-```julia
-using Agentif
 
-# Set API key in env (OPENAI_API_KEY, ANTHROPIC_API_KEY, etc.)
+Build a basic agent with read-only tools:
+
+```julia
+using Agentif, LLMTools
+
 agent = Agent(
-    model = getModel(&quot;openai&quot;, &quot;gpt-4o-mini&quot;),
-    tools = coding_tools(),  # or read_only_tools()
-    prompt = &quot;You are a helpful coding assistant.&quot;
+    prompt = "You are a concise assistant.",
+    model = getModel("openai", "gpt-4.1-mini"),
+    apikey = ENV["OPENAI_API_KEY"],
+    tools = LLMTools.read_only_tools(pwd()),
 )
 
-# Interactive eval with streaming
-evaluate(agent, &quot;Write a Julia function for fibonacci.&quot;)
-```
-
-For a full coding agent REPL (like this conversation):
-```bash
-julia examples/coding_agent.jl
-```
-
-## Defining Tools
-```julia
-@tool function add(a::Int, b::Int)
-    return a + b
-end
-
-push!(agent.tools, AgentTool(add))
-```
-
-Add a subagent tool for delegation and nesting:
-```julia
-other_tools = coding_tools()
-agent.tools = [create_subagent_tool(agent), other_tools...]
-```
-
-Enable skills with the built-in loader tool:
-```julia
-skills = create_skill_registry()
-tools = coding_tools()
-push!(tools, create_skill_loader_tool(skills))
-agent = Agent(
-    model = getModel("openai", "gpt-4o-mini"),
-    tools = tools,
-    prompt = "You are a helpful coding assistant.",
-    skills = skills,
-)
-```
-
-## Models &amp; Providers
-```julia
-getProviders()  # [:openai, :anthropic, ...]
-getModels(&quot;openai&quot;)  # [&quot;gpt-4o&quot;, &quot;gpt-4o-mini&quot;, ...]
-```
-
-Full list &amp; config in docs.
-
-## Events &amp; Streaming
-```julia
-evaluate(callback, agent, query, api_key) do event
-    event isa MessageUpdateEvent &amp;&amp; print(event.delta)
-    # Handle ToolCallRequestEvent, ToolExecutionStartEvent, etc.
-end
+state = evaluate(agent, "List the files in the current directory.")
+println(message_text(state.messages[end]))
 ```
 
 ## Examples
-- `examples/coding_agent.jl`: Full-featured coding assistant REPL
-- `client.jl` / `server.jl`: Standalone HTTP client/server
 
-## Documentation
-Build HTML docs:
+- `examples/coding_agent.jl`: interactive coding-agent REPL built on `Agentif` + `LLMTools`.
+- `examples/provider_smoke_test.jl`: provider/model smoke test across the configured registry.
+- `examples/terminal_tools/README.md`: standalone examples for PTY-backed terminal tools.
+- `Claw/examples/`: live and smoke-style integration examples for Claw event sources.
+
+## Testing
+
+Run the full repo test suite from the root environment:
+
 ```bash
-julia --project=docs docs/make.jl
+julia --project=. test/runtests.jl
 ```
-View in `docs/build`.
 
-## Development
-See [AGENTS.md](AGENTS.md) for build/test/performance guidelines.
+Run a single package test entrypoint:
+
+```bash
+julia --project=. test/runtests.jl Agentif
+```
+
+## Notes
+
+- The repo-root environment currently relies on Julia `1.11+` because the monorepo setup uses `Project.toml` `[sources]` entries.
+- There is no separate `docs/` site right now; the READMEs are the source of truth.
 
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE.md)
