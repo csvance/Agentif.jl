@@ -17,10 +17,11 @@ end
 function schema(::Type{T}) where {T}
     sch = JSONSchema.schema(T; all_fields_required = true, additionalProperties = false)
     required = _required_field_names(T)
+    data = JSONSchema.spec(sch)
     if isempty(required)
-        haskey(sch.data, "required") && delete!(sch.data, "required")
+        haskey(data, "required") && delete!(data, "required")
     else
-        sch.data["required"] = required
+        data["required"] = required
     end
     return sch
 end
