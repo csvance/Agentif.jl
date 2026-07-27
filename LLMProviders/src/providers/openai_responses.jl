@@ -18,9 +18,9 @@ function schema(::Type{T}) where {T}
     sch = JSONSchema.schema(T; all_fields_required = true, additionalProperties = false)
     required = _required_field_names(T)
     if isempty(required)
-        haskey(sch.spec, "required") && delete!(sch.spec, "required")
+        haskey(sch.data, "required") && delete!(sch.data, "required")
     else
-        sch.spec["required"] = required
+        sch.data["required"] = required
     end
     return sch
 end
@@ -211,7 +211,7 @@ end
     type::String = "text"
 end
 
-@omit_null @kwarg struct TextFormatJSONSchema{T}
+@omit_null @kwarg struct TextFormatJSONSchema
     type::String = "json_schema"
     name::String
     description::Union{Nothing, String} = nothing
@@ -219,7 +219,7 @@ end
     # non-nullable fields marked required.
     # allOf, not, dependentRequired, dependentSchemas, if, then, else are not supported
     # root schema must be an object
-    schema::JSONSchema.Schema{T}
+    schema::JSONSchema.Schema
     strict::Union{Nothing, Bool} = nothing
 end
 
@@ -247,12 +247,12 @@ end
     verbosity::Union{Nothing, String} = nothing # low, medium, high
 end
 
-@omit_null @kwarg struct FunctionTool{T}
+@omit_null @kwarg struct FunctionTool
     name::String
     strict::Bool = true
     type::String = "function"
     description::Union{Nothing, String} = nothing
-    parameters::JSONSchema.Schema{T}
+    parameters::JSONSchema.Schema
 end
 
 

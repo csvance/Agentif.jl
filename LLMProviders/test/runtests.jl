@@ -98,7 +98,7 @@ end
     @test unknown_event isa OpenAIResponses.UnknownStreamEvent
 
     params_schema = OpenAIResponses.schema(@NamedTuple{required::String, optional::Union{Nothing, String}})
-    required_fields = haskey(params_schema.spec, "required") ? Set(String.(params_schema.spec["required"])) : Set{String}()
+    required_fields = haskey(params_schema.data, "required") ? Set(String.(params_schema.data["required"])) : Set{String}()
     @test "required" in required_fields
     @test !("optional" in required_fields)
 end
