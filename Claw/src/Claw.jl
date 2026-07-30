@@ -109,6 +109,11 @@ Base.@kwdef struct AgentConfig
     enable_coding::Bool = false
 end
 
+# ─── Watcher (dual-model supervised evaluation) ───
+# Included here so WatcherConfig is defined before the AgentAssistant struct below.
+
+include("watcher.jl")
+
 struct AgentAssistant
     config::AgentConfig
     db::SQLite.DB
@@ -118,6 +123,24 @@ struct AgentAssistant
     tools::Vector{Agentif.AgentTool}
     scheduler::Tempus.Scheduler
     log_level::Union{Nothing, LogLevel}
+    watcher::Union{Nothing, WatcherConfig}
+end
+
+# Preserve the pre-watcher positional constructor. WatcherConfig remains an
+# opt-in keyword on the public AgentAssistant constructor below.
+function AgentAssistant(
+        config::AgentConfig,
+        db::SQLite.DB,
+        channels::Dict{String, Agentif.AbstractChannel},
+        event_queue::Base.Channel{Event},
+        session_store::Agentif.SessionStore,
+        tools::Vector{Agentif.AgentTool},
+        scheduler::Tempus.Scheduler,
+        log_level::Union{Nothing, LogLevel},
+    )
+    return AgentAssistant(
+        config, db, channels, event_queue, session_store, tools, scheduler,
+        log_level, nothing)
 end
 
 # ─── SQLite schema ───
@@ -184,6 +207,28 @@ function _init_claw_schema!(db::SQLite.DB)
             updated_at REAL NOT NULL
         )
     """)
+
+    SQLite.DBInterface.execute(db, """
+        CREATE TABLE IF NOT EXISTS claw_evals (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            event_name TEXT NOT NULL,
+            handler_id TEXT NOT NULL,
+            channel_id TEXT,
+            status TEXT NOT NULL CHECK (status IN
+                ('running','completed','failed','stalled','overrun','aborted')),
+            failure_class TEXT,
+            started_at REAL NOT NULL,
+            last_activity_at REAL NOT NULL,
+            finished_at REAL,
+            turns INTEGER NOT NULL DEFAULT 0,
+            tool_calls INTEGER NOT NULL DEFAULT 0,
+            error TEXT,
+            fallback_sent INTEGER NOT NULL DEFAULT 0,
+            watcher_note TEXT
+        )
+    """)
+    SQLite.DBInterface.execute(db, "CREATE INDEX IF NOT EXISTS idx_claw_evals_status ON claw_evals(status)")
+
     _ensure_agent_metadata_defaults!(db)
 end
 
@@ -942,6 +987,7 @@ function evaluate(
         input;
         channel::Union{Nothing, Agentif.AbstractChannel} = nothing,
         level::Union{Nothing, LogLevel, Int, Symbol, AbstractString} = nothing,
+        observer::Function = identity,
         kw...,
     )
     cfg = assistant.config
@@ -959,7 +1005,7 @@ function evaluate(
     # LLM provider prefix-based prompt caching across turns.
     ctx = build_context_prefix(cfg)
     prefixed_input = input isa String ? string(ctx, "\n\n", input) : input
-    return Agentif.evaluate(agent, prefixed_input;
+    return Agentif.evaluate(observer, agent, prefixed_input;
         session_store = assistant.session_store,
         channel = channel,
         compaction_config = Agentif.CompactionConfig(),
@@ -1073,14 +1119,19 @@ function _run_event_handler!(
         ev::Event,
         handler;
         level::Union{Nothing, LogLevel} = assistant.log_level,
+        eval_kw...,  # forwarded to evaluate (test seam, e.g. base_handler)
     )
     ch = _resolve_event_channel(assistant, ev, handler.channel_id)
     if ch === nothing
         ch = SinkChannel("handler:$(handler.id)")
     end
+    if assistant.watcher !== nothing
+        supervised_evaluate(assistant, ev, handler, ch; level, eval_kw...)
+        return nothing
+    end
     input = make_prompt(handler.prompt, ev)
     @debug "Claw handler evaluate start" handler_id = handler.id event_name = get_name(ev) channel_id = Agentif.channel_id(ch)
-    evaluate(assistant, input; channel = ch, level = level)
+    evaluate(assistant, input; channel = ch, level = level, eval_kw...)
     @debug "Claw handler evaluate end" handler_id = handler.id event_name = get_name(ev)
     return nothing
 end
@@ -1136,7 +1187,9 @@ function AgentAssistant(db_path::String="";
     enable_web::Bool=false,
     enable_coding::Bool=false,
     level::Union{Nothing, LogLevel, Int, Symbol, AbstractString}=nothing,
+    watcher::Union{Nothing, WatcherConfig}=nothing,
 )
+    watcher !== nothing && validate_watcher_config(watcher)
     db_path = isempty(db_path) ? joinpath(pwd(), "$(something(name, "claw")).sqlite") : db_path
     db = SQLite.DB(db_path)
     _init_claw_schema!(db)
@@ -1151,6 +1204,7 @@ function AgentAssistant(db_path::String="";
         Dict{String, Agentif.AbstractChannel}(),
         Base.Channel{Event}(Inf),
         session_store, Agentif.AgentTool[], scheduler, log_level,
+        watcher,
     )
 end
 
@@ -1165,6 +1219,14 @@ function init!(
     sources = event_sources === nothing ? lock(() -> collect(EVENT_SOURCES), EVENT_SOURCES_LOCK) : event_sources
     assistant = AgentAssistant(db_path; level, kwargs...)
     CURRENT_ASSISTANT[] = assistant
+    # Crash recovery: evals left 'running' by a previous process can never
+    # complete; flip them to failed/process_crash for post-crash forensics.
+    _with_busy_retry() do
+        SQLite.DBInterface.execute(assistant.db,
+            "UPDATE claw_evals SET status = 'failed', failure_class = 'process_crash', finished_at = ? WHERE status = 'running'",
+            (time(),))
+        return nothing
+    end
     # Purge ephemeral tables (re-populated from EventSources)
     SQLite.DBInterface.execute(assistant.db, "DELETE FROM claw_event_types")
     # Re-seed event types for persisted Tempus jobs: they are only inserted at
