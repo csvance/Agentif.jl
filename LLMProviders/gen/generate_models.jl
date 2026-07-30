@@ -1,27 +1,28 @@
 #!/usr/bin/env julia
 #
 # generate_models.jl -- regenerate LLMProviders/src/models_generated.jl from
-# pi-mono's packages/ai/src/models.generated.ts.
+# pi-mono's generated JSON model catalog.
 #
 # Usage:
-#     julia LLMProviders/gen/generate_models.jl [SOURCE_TS] [OUTPUT_JL]
+#     julia LLMProviders/gen/generate_models.jl [SOURCE] [OUTPUT_JL]
 #
 # Defaults:
-#     SOURCE_TS  $PI_MONO_MODELS_TS, else $PI_MONO/packages/ai/src/models.generated.ts,
-#                else ~/pi-mono/packages/ai/src/models.generated.ts
+#     SOURCE     $PI_MONO_MODELS_JSON, else
+#                $PI_MONO/.artifacts/model-catalog/models.json,
+#                with legacy monolithic models.generated.ts support
 #     OUTPUT_JL  <this file>/../../src/models_generated.jl
 #
-# The script is intentionally dependency-free (Base only) and does not shell out
-# to any TypeScript tooling: `models.generated.ts` is itself machine-generated,
-# so its shape is a strictly regular nesting of literal objects that a
-# line-oriented parser can read reliably. See gen/README.md.
+# The script is dependency-free (Base only). pi-mono owns network discovery and
+# emits the JSON snapshot; this script performs a deterministic conversion of
+# that snapshot. See gen/README.md.
 
-const DEFAULT_TS_RELPATH = "packages/ai/src/models.generated.ts"
+const DEFAULT_JSON_RELPATH = joinpath(".artifacts", "model-catalog", "models.json")
+const LEGACY_TS_RELPATH = joinpath("packages", "ai", "src", "models.generated.ts")
 
 # ---------------------------------------------------------------------------
 # Value model
 #
-# Parsed TS values are kept in a tiny tagged representation so that numbers can
+# Parsed catalog values are kept in a tiny tagged representation so that numbers can
 # survive as their *verbatim source token*. Reparsing them as Float64 and
 # re-printing would silently rewrite upstream values (e.g. 0.19999999999999998
 # vs 0.2); the existing checked-in file preserves the raw tokens, and so do we.
@@ -156,9 +157,11 @@ function parse_value(s::AbstractString, i::Int)
                 while j <= lastindex(s) && (isletter(s[j]) || isdigit(s[j]) || s[j] in ('_', '$'))
                     j = nextind(s, j)
                 end
+                j == i && error("expected an object key")
                 key = s[i:prevind(s, j)]
                 i = j
             end
+            any(p -> first(p) == key, obj) && error("duplicate object key '$key'")
             i = skipws(s, i)
             s[i] == ':' || error("expected ':' after object key '$key'")
             v, i = parse_value(s, nextind(s, i))
@@ -192,6 +195,24 @@ function parse_value(s::AbstractString, i::Int)
         return TSNum(tok), j
     end
     return error("unrecognized value starting with '$c'")
+end
+
+function parse_complete_value(s::AbstractString; context::AbstractString)
+    isempty(s) && error("$context: empty input")
+    value, i = parse_value(s, firstindex(s))
+    i = skipws(s, i)
+    i > lastindex(s) || error("$context: unexpected trailing content: $(first(SubString(s, i), 80))")
+    return value
+end
+
+function parse_line_value(s::AbstractString; context::AbstractString)
+    value, i = parse_value(s, firstindex(s))
+    i = skipws(s, i)
+    if i <= lastindex(s) && s[i] == ','
+        i = skipws(s, nextind(s, i))
+    end
+    i > lastindex(s) || error("$context: unexpected trailing content: $(first(SubString(s, i), 80))")
+    return value
 end
 
 # ---------------------------------------------------------------------------
@@ -231,6 +252,12 @@ function parse_models_ts(path::AbstractString)
 
     start = findfirst(l -> startswith(l, "export const MODELS"), lines)
     start === nothing && error("could not find `export const MODELS` in $path")
+    any(occursin("readonly "), lines[start:min(length(lines), start + 5)]) &&
+        error(
+        "$path uses pi-mono's split JSON catalog format. " *
+            "Run `npm --prefix packages/ai run generate-model-catalog` in pi-mono, " *
+            "then pass `.artifacts/model-catalog/models.json` to this script."
+    )
 
     provider = ""
     id = ""
@@ -240,11 +267,15 @@ function parse_models_ts(path::AbstractString)
     # depth: 1 = inside MODELS, 2 = inside a provider, 3 = inside a model, 4 = inside a nested block
     depth = 1
 
+    terminated = false
     for lineno in (start + 1):length(lines)
         raw = lines[lineno]
         line = rstrip(raw)
         isempty(strip(line)) && continue
-        line == "} as const;" && break
+        if line == "} as const;"
+            terminated = true
+            break
+        end
 
         indent = something(findfirst(c -> c != '\t', line), length(line) + 1) - 1
         body = lstrip(line, '\t')
@@ -280,7 +311,7 @@ function parse_models_ts(path::AbstractString)
                     nested = TSObject()
                     depth = 4
                 else
-                    v, _ = parse_value(rest, 1)
+                    v = parse_line_value(rest; context = "$path:$lineno")
                     push!(fields, key => v)
                 end
             else
@@ -294,7 +325,7 @@ function parse_models_ts(path::AbstractString)
                 colon = findfirst(==(':'), body)
                 colon === nothing && error("$path:$lineno: missing ':' in nested field line: $line")
                 key = strip(body[1:(colon - 1)], ['"', ' '])
-                v, _ = parse_value(strip(body[(colon + 1):end]), 1)
+                v = parse_line_value(strip(body[(colon + 1):end]); context = "$path:$lineno")
                 push!(nested, key => v)
             else
                 error("$path:$lineno: unexpected line inside \"$id\".$nested_key: $line")
@@ -302,9 +333,39 @@ function parse_models_ts(path::AbstractString)
         end
     end
 
+    terminated || error("$path: missing closing `} as const;`")
     depth == 1 || error("$path: unbalanced literal (ended at depth $depth)")
     isempty(models) && error("$path: parsed zero models")
     return models
+end
+
+"""
+    parse_models_json(path) -> Vector{ParsedModel}
+
+Read the JSON catalog emitted by pi-mono's `generate-model-catalog` task.
+The shape is `{provider: {model_id: model}}`. Numeric tokens stay verbatim.
+"""
+function parse_models_json(path::AbstractString)
+    root = parse_complete_value(read(path, String); context = path)
+    root isa TSObject || error("$path: expected a top-level provider object")
+    models = ParsedModel[]
+    for (provider, provider_models) in root
+        isempty(provider) && error("$path: provider name cannot be empty")
+        provider_models isa TSObject ||
+            error("$path: provider \"$provider\" must map to an object")
+        for (id, fields) in provider_models
+            isempty(id) && error("$path: model id cannot be empty in provider \"$provider\"")
+            fields isa TSObject ||
+                error("$path: model \"$provider/$id\" must map to an object")
+            push!(models, ParsedModel(provider, id, fields))
+        end
+    end
+    isempty(models) && error("$path: parsed zero models")
+    return models
+end
+
+function parse_models(path::AbstractString)
+    return endswith(lowercase(path), ".json") ? parse_models_json(path) : parse_models_ts(path)
 end
 
 # ---------------------------------------------------------------------------
@@ -327,6 +388,12 @@ function jl_string(s::AbstractString)
             print(io, "\\t")
         elseif c == '\r'
             print(io, "\\r")
+        elseif c == '\b'
+            print(io, "\\b")
+        elseif c == '\f'
+            print(io, "\\f")
+        elseif UInt32(c) < 0x20
+            print(io, "\\u", uppercase(string(UInt32(c); base = 16, pad = 4)))
         else
             print(io, c)
         end
@@ -353,124 +420,342 @@ function require_field(m::ParsedModel, key::AbstractString)
     return v
 end
 
-"""
-    emit_model(io, m)
-
-Write one `"<id>" => Model(...)` entry in the exact field order and formatting
-used by the checked-in file. `headers`/`compat` are always emitted (as `nothing`
-when absent upstream) so entries are shape-stable; `kw` is never emitted and
-falls back to the struct default.
-"""
 const KNOWN_FIELDS = Set([
     "id", "name", "api", "provider", "baseUrl", "reasoning",
     "input", "cost", "contextWindow", "maxTokens", "headers", "compat",
+    "thinkingLevelMap",
 ])
+const COST_RATE_KEYS = ["input", "output", "cacheRead", "cacheWrite"]
+const COST_TIER_KEYS = ["inputTokensAbove", COST_RATE_KEYS...]
 
-function emit_model(io::IO, m::ParsedModel)
+function require_object_field(object::TSObject, key::AbstractString, context::AbstractString)
+    value = getfieldval(object, key)
+    value === nothing && error("$context is missing required field `$key`")
+    return value
+end
+
+function validate_number(value, context::AbstractString)
+    value isa TSNum || error("$context must be numeric")
+    return value
+end
+
+function validate_cost_tiers(value, context::AbstractString)
+    value === nothing && return nothing
+    value isa TSArray || error("$context must be an array")
+    for (index, tier) in enumerate(value)
+        tier_context = "$context[$index]"
+        tier isa TSObject || error("$tier_context must be an object")
+        keys = first.(tier)
+        allunique(keys) || error("$tier_context has duplicate keys")
+        issetequal(keys, COST_TIER_KEYS) ||
+            error("$tier_context has unexpected keys $keys")
+        threshold = validate_number(
+            require_object_field(tier, "inputTokensAbove", tier_context),
+            "$tier_context.inputTokensAbove",
+        )
+        occursin(r"^\d+$", threshold.token) ||
+            error("$tier_context.inputTokensAbove must be a non-negative integer")
+        for key in COST_RATE_KEYS
+            validate_number(
+                require_object_field(tier, key, tier_context),
+                "$tier_context.$key",
+            )
+        end
+    end
+    return nothing
+end
+
+function validate_string_field(m::ParsedModel, key::AbstractString)
+    value = require_field(m, key)
+    value isa TSStr || error("model $(m.provider)/$(m.id): `$key` must be a string")
+    return value
+end
+
+function validate_positive_integer_field(m::ParsedModel, key::AbstractString)
+    value = require_field(m, key)
+    value isa TSNum || error("model $(m.provider)/$(m.id): `$key` must be numeric")
+    occursin(r"^\d+$", value.token) ||
+        error("model $(m.provider)/$(m.id): `$key` must be a positive integer")
+    parse(Int, value.token) > 0 ||
+        error("model $(m.provider)/$(m.id): `$key` must be positive")
+    return value
+end
+
+function validate_model(m::ParsedModel)
     # Fail loud on upstream schema growth rather than silently dropping a field
     # that `Model` might need to carry.
+    field_keys = first.(m.fields)
+    allunique(field_keys) ||
+        error("model $(m.provider)/$(m.id): duplicate model fields")
     for (k, _) in m.fields
         k in KNOWN_FIELDS ||
-            error("model $(m.provider)/$(m.id): unknown upstream field `$k` -- update KNOWN_FIELDS/emit_model")
+            error("model $(m.provider)/$(m.id): unknown upstream field `$k` -- update KNOWN_FIELDS/validate_model")
     end
-    idfield = require_field(m, "id")
-    idfield isa TSStr && idfield.value == m.id ||
+    idfield = validate_string_field(m, "id")
+    idfield.value == m.id ||
         error("model $(m.provider)/$(m.id): `id` field does not match its object key")
+    providerfield = validate_string_field(m, "provider")
+    providerfield.value == m.provider ||
+        error("model $(m.provider)/$(m.id): `provider` field does not match its provider key")
+    for key in ("name", "api", "baseUrl")
+        validate_string_field(m, key)
+    end
+    require_field(m, "reasoning") isa TSBool ||
+        error("model $(m.provider)/$(m.id): `reasoning` must be boolean")
+    input = require_field(m, "input")
+    input isa TSArray && !isempty(input) && all(x -> x isa TSStr, input) ||
+        error("model $(m.provider)/$(m.id): `input` must be a non-empty string array")
+    validate_positive_integer_field(m, "contextWindow")
+    validate_positive_integer_field(m, "maxTokens")
 
     cost = require_field(m, "cost")
     cost isa TSObject || error("model $(m.provider)/$(m.id): `cost` is not an object")
-    issetequal(first.(cost), ["input", "output", "cacheRead", "cacheWrite"]) ||
-        error("model $(m.provider)/$(m.id): unexpected `cost` keys $(first.(cost))")
+    cost_keys = first.(cost)
+    allunique(cost_keys) ||
+        error("model $(m.provider)/$(m.id): duplicate `cost` keys")
+    allowed_cost_keys = [COST_RATE_KEYS..., "tiers"]
+    issetequal(intersect(cost_keys, COST_RATE_KEYS), COST_RATE_KEYS) &&
+        all(k -> k in allowed_cost_keys, cost_keys) ||
+        error("model $(m.provider)/$(m.id): unexpected `cost` keys $cost_keys")
+    for key in COST_RATE_KEYS
+        validate_number(
+            require_object_field(cost, key, "model $(m.provider)/$(m.id).cost"),
+            "model $(m.provider)/$(m.id).cost.$key",
+        )
+    end
+    validate_cost_tiers(
+        getfieldval(cost, "tiers"),
+        "model $(m.provider)/$(m.id).cost.tiers",
+    )
     headers = getfieldval(m.fields, "headers")
+    headers === nothing || headers isa TSObject ||
+        error("model $(m.provider)/$(m.id): `headers` must be an object or null")
     compat = getfieldval(m.fields, "compat")
-
-    println(io, "        ", jl_string(m.id), " => Model(")
-    println(io, "            id = ", jl_string(m.id), ",")
-    println(io, "            name = ", jl_value(require_field(m, "name")), ",")
-    println(io, "            api = ", jl_value(require_field(m, "api")), ",")
-    println(io, "            provider = ", jl_value(require_field(m, "provider")), ",")
-    println(io, "            baseUrl = ", jl_value(require_field(m, "baseUrl")), ",")
-    println(io, "            reasoning = ", jl_value(require_field(m, "reasoning")), ",")
-    println(io, "            input = ", jl_value(require_field(m, "input")), ",")
-    println(io, "            cost = ", jl_value(cost), ",")
-    println(io, "            contextWindow = ", jl_value(require_field(m, "contextWindow")), ",")
-    println(io, "            maxTokens = ", jl_value(require_field(m, "maxTokens")), ",")
-    println(io, "            headers = ", jl_value(headers), ",")
-    println(io, "            compat = ", jl_value(compat), ",")
-    println(io, "        ),")
+    compat === nothing || compat isa TSObject ||
+        error("model $(m.provider)/$(m.id): `compat` must be an object or null")
+    thinking_level_map = getfieldval(m.fields, "thinkingLevelMap")
+    thinking_level_map === nothing || thinking_level_map isa TSObject ||
+        error("model $(m.provider)/$(m.id): `thinkingLevelMap` must be an object or null")
     return nothing
+end
+
+function json_string(s::AbstractString)
+    io = IOBuffer()
+    print(io, '"')
+    for c in s
+        if c == '"'
+            print(io, "\\\"")
+        elseif c == '\\'
+            print(io, "\\\\")
+        elseif c == '\n'
+            print(io, "\\n")
+        elseif c == '\t'
+            print(io, "\\t")
+        elseif c == '\r'
+            print(io, "\\r")
+        elseif c == '\b'
+            print(io, "\\b")
+        elseif c == '\f'
+            print(io, "\\f")
+        elseif UInt32(c) < 0x20
+            print(io, "\\u", lowercase(string(UInt32(c); base = 16, pad = 4)))
+        else
+            print(io, c)
+        end
+    end
+    print(io, '"')
+    return String(take!(io))
+end
+
+json_value(v::TSStr) = json_string(v.value)
+json_value(v::TSNum) = v.token
+json_value(v::TSBool) = v.value ? "true" : "false"
+json_value(::Nothing) = "null"
+json_value(v::TSArray) = "[" * join(json_value.(v), ",") * "]"
+json_value(v::TSObject) =
+    "{" * join(["$(json_string(k)):$(json_value(x))" for (k, x) in v], ",") * "}"
+
+function canonical_catalog(models::Vector{ParsedModel})
+    by_provider = Dict{String, Vector{ParsedModel}}()
+    for model in models
+        validate_model(model)
+        push!(get!(() -> ParsedModel[], by_provider, model.provider), model)
+    end
+    catalog = TSObject()
+    for provider in sort!(collect(keys(by_provider)))
+        entries = sort!(by_provider[provider]; by = model -> model.id)
+        ids = [model.id for model in entries]
+        allunique(ids) || error("duplicate model ids within provider \"$provider\"")
+        provider_models = TSObject()
+        for model in entries
+            push!(provider_models, model.id => model.fields)
+        end
+        push!(catalog, provider => provider_models)
+    end
+    return catalog
+end
+
+function catalog_json(catalog::TSObject)
+    io = IOBuffer()
+    println(io, "{")
+    for (provider_index, (provider, models)) in enumerate(catalog)
+        println(io, "  ", json_string(provider), ": {")
+        for (model_index, (id, fields)) in enumerate(models)
+            suffix = model_index == length(models) ? "" : ","
+            println(io, "    ", json_string(id), ": ", json_value(fields), suffix)
+        end
+        suffix = provider_index == length(catalog) ? "" : ","
+        println(io, "  }", suffix)
+    end
+    println(io, "}")
+    return String(take!(io))
 end
 
 function git_describe(path::AbstractString)
     dir = isdir(path) ? path : dirname(path)
     try
-        out = read(`git -C $dir describe --always --dirty`, String)
+        out = read(pipeline(`git -C $dir describe --always --dirty`; stderr = devnull), String)
         return strip(out)
     catch
         return "unknown"
     end
 end
 
-"""
-    generate(ts_path, out_path; source_label, describe, date)
+function loader_source(
+        source_label::AbstractString,
+        describe::AbstractString,
+        date::AbstractString,
+        json_filename::AbstractString,
+    )
+    return """# This file is auto-generated from pi-mono's model catalog
+# Do not edit manually -- run `julia LLMProviders/gen/generate_models.jl` to refresh.
+#
+# Source:    $source_label
+# Source rev: $describe
+# Generated: $date
 
-Parse `ts_path` and write the Julia registry initializer to `out_path`.
-Output is deterministic: providers and model ids are sorted by codepoint, and
-every value is derived only from the source file plus the header metadata.
+const _GENERATED_MODELS_PATH = joinpath(@__DIR__, $(jl_string(json_filename)))
+Base.include_dependency(_GENERATED_MODELS_PATH)
+
+function _generated_optional_dict(data::AbstractDict, key::AbstractString)
+    value = get(() -> nothing, data, key)
+    value === nothing && return nothing
+    value isa AbstractDict || error("generated model field `\$key` must be an object")
+    result = Dict{String, Any}()
+    for (k, v) in value
+        result[String(k)] = v
+    end
+    return result
+end
+
+function _generated_headers(data::AbstractDict)
+    value = get(() -> nothing, data, "headers")
+    value === nothing && return nothing
+    value isa AbstractDict || error("generated model field `headers` must be an object")
+    result = Dict{String, String}()
+    for (k, v) in value
+        result[String(k)] = String(v)
+    end
+    return result
+end
+
+function _generated_cost_tiers(cost::AbstractDict)
+    values = get(() -> Any[], cost, "tiers")
+    values isa AbstractVector || error("generated model cost tiers must be an array")
+    tiers = ModelCostTier[]
+    for value in values
+        value isa AbstractDict || error("generated model cost tier must be an object")
+        push!(
+            tiers,
+            ModelCostTier(;
+                inputTokensAbove = Int(value["inputTokensAbove"]),
+                input = Float64(value["input"]),
+                output = Float64(value["output"]),
+                cacheRead = Float64(value["cacheRead"]),
+                cacheWrite = Float64(value["cacheWrite"]),
+            ),
+        )
+    end
+    return tiers
+end
+
+function _generated_model(data::AbstractDict)
+    cost_data = data["cost"]
+    cost_data isa AbstractDict || error("generated model cost must be an object")
+    cost = Dict{String, Float64}(
+        key => Float64(cost_data[key])
+        for key in ("input", "output", "cacheRead", "cacheWrite")
+    )
+    return Model(;
+        id = String(data["id"]),
+        name = String(data["name"]),
+        api = String(data["api"]),
+        provider = String(data["provider"]),
+        baseUrl = String(data["baseUrl"]),
+        reasoning = Bool(data["reasoning"]),
+        input = String[String(value) for value in data["input"]],
+        cost,
+        contextWindow = Int(data["contextWindow"]),
+        maxTokens = Int(data["maxTokens"]),
+        headers = _generated_headers(data),
+        compat = _generated_optional_dict(data, "compat"),
+        costTiers = _generated_cost_tiers(cost_data),
+        thinkingLevelMap = _generated_optional_dict(data, "thinkingLevelMap"),
+    )
+end
+
+function _init_model_registry!()
+    catalog = JSON.parse(read(_GENERATED_MODELS_PATH, String))
+    catalog isa AbstractDict || error("generated model catalog must be an object")
+    empty!(_model_registry)
+    for provider in sort!(String[String(key) for key in keys(catalog)])
+        entries = catalog[provider]
+        entries isa AbstractDict || error("generated provider `\$provider` must be an object")
+        models = Dict{String, Model}()
+        for id in sort!(String[String(key) for key in keys(entries)])
+            models[id] = _generated_model(entries[id])
+        end
+        _model_registry[provider] = models
+    end
+    return _model_registry
+end
+
+_init_model_registry!()
+"""
+end
+
+"""
+    generate(source_path, out_path; source_label, describe, date)
+
+Parse and validate `source_path`, then write a canonical JSON snapshot next to
+the compact Julia loader at `out_path`. Providers and model ids are sorted by
+codepoint. Numbers remain verbatim source tokens.
 """
 function generate(
-        ts_path::AbstractString,
+        source_path::AbstractString,
         out_path::AbstractString;
-        source_label::AbstractString = ts_path,
-        describe::AbstractString = git_describe(ts_path),
+        source_label::AbstractString = source_path,
+        describe::AbstractString = git_describe(source_path),
         date::AbstractString = string(Dates_today()),
     )
-    models = parse_models_ts(ts_path)
-
-    by_provider = Dict{String, Vector{ParsedModel}}()
-    for m in models
-        push!(get!(() -> ParsedModel[], by_provider, m.provider), m)
-    end
-    providers = sort!(collect(keys(by_provider)))
-
-    io = IOBuffer()
-    println(io, "# This file is auto-generated from models.generated.ts")
-    println(io, "# Do not edit manually -- run `julia LLMProviders/gen/generate_models.jl` to refresh.")
-    println(io, "#")
-    println(io, "# Source:    ", source_label)
-    println(io, "# Source rev: ", describe)
-    println(io, "# Generated: ", date)
-    println(io)
-    println(io, "# Initialize model registry")
-    println(io, "function _init_model_registry!()")
-    println(io, "    empty!(_model_registry)")
-
-    for (idx, provider) in enumerate(providers)
-        entries = sort!(by_provider[provider]; by = m -> m.id)
-        ids = [m.id for m in entries]
-        allunique(ids) || error("duplicate model ids within provider \"$provider\"")
-
-        println(io)
-        println(io, "    # $provider models")
-        # JuliaFormatter renders the final statement of the function with an
-        # explicit `return`; keep that so a formatter pass is a no-op.
-        prefix = idx == length(providers) ? "    return " : "    "
-        println(io, prefix, "_model_registry[", jl_string(provider), "] = Dict{String, Model}(")
-        for m in entries
-            emit_model(io, m)
-        end
-        println(io, "    )")
-    end
-
-    println(io)
-    println(io, "end")
-    println(io)
-    println(io, "# Initialize on module load")
-    println(io, "_init_model_registry!()")
-
-    mkpath(dirname(abspath(out_path)))
-    write(out_path, String(take!(io)))
-    return (; providers = length(providers), models = length(models), path = abspath(out_path))
+    models = parse_models(source_path)
+    catalog = canonical_catalog(models)
+    loader_path = abspath(out_path)
+    endswith(lowercase(loader_path), ".jl") ||
+        error("output path must end in .jl: $loader_path")
+    json_path = first(splitext(loader_path)) * ".json"
+    mkpath(dirname(loader_path))
+    write(json_path, catalog_json(catalog))
+    write(
+        loader_path,
+        loader_source(source_label, describe, date, basename(json_path)),
+    )
+    return (
+        providers = length(catalog),
+        models = length(models),
+        loader_path,
+        json_path,
+    )
 end
 
 # `Dates` is not a dependency of LLMProviders; derive the ISO date from Base.
@@ -502,21 +787,34 @@ function tildify(path::AbstractString)
     return startswith(path, home * "/") ? "~" * path[(length(home) + 1):end] : path
 end
 
-function default_ts_path()
-    env = get(ENV, "PI_MONO_MODELS_TS", "")
-    isempty(env) || return env
+function default_source_path()
+    json_env = get(ENV, "PI_MONO_MODELS_JSON", "")
+    isempty(json_env) || return json_env
+    legacy_env = get(ENV, "PI_MONO_MODELS_TS", "")
+    isempty(legacy_env) || return legacy_env
     root = get(ENV, "PI_MONO", joinpath(homedir(), "pi-mono"))
-    return joinpath(root, DEFAULT_TS_RELPATH)
+    json_path = joinpath(root, DEFAULT_JSON_RELPATH)
+    isfile(json_path) && return json_path
+    legacy_path = joinpath(root, LEGACY_TS_RELPATH)
+    if isfile(legacy_path) && occursin("export const MODELS = {", read(legacy_path, String))
+        return legacy_path
+    end
+    return json_path
 end
 
 function main(args::Vector{String})
-    ts_path = (isempty(args) || isempty(args[1])) ? default_ts_path() : args[1]
+    source_path = (isempty(args) || isempty(args[1])) ? default_source_path() : args[1]
     out_path = length(args) >= 2 ? args[2] :
         normpath(joinpath(@__DIR__, "..", "src", "models_generated.jl"))
-    isfile(ts_path) || error("source file not found: $ts_path (set PI_MONO or PI_MONO_MODELS_TS, or pass it as arg 1)")
+    isfile(source_path) || error(
+        "source file not found: $source_path\n" *
+            "Run `npm --prefix packages/ai run generate-model-catalog` in pi-mono, " *
+            "set PI_MONO_MODELS_JSON, or pass models.json as argument 1."
+    )
 
-    result = generate(ts_path, out_path; source_label = tildify(abspath(ts_path)))
-    println("wrote $(result.path)")
+    result = generate(source_path, out_path; source_label = tildify(abspath(source_path)))
+    println("wrote $(result.loader_path)")
+    println("wrote $(result.json_path)")
     println("  providers: $(result.providers)")
     println("  models:    $(result.models)")
     return nothing
