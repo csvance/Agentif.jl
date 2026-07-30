@@ -1,4 +1,5 @@
-function anthropic_build_tools(tools::Vector{AgentTool}, tool_name_map::Dict{String, String})
+function anthropic_build_tools(
+        tools::Vector{<:AgentTool}, tool_name_map::Dict{String, String})
     isempty(tools) && return nothing
     provider_tools = AnthropicMessages.Tool[]
     for tool in tools
@@ -92,7 +93,7 @@ function anthropic_insert_missing_tool_results(messages::Vector{StoredAgentMessa
     return normalized
 end
 
-function anthropic_tool_name_maps(tools::Vector{AgentTool}, is_oauth::Bool)
+function anthropic_tool_name_maps(tools::Vector{<:AgentTool}, is_oauth::Bool)
     tool_name_map = Dict{String, String}()
     tool_name_reverse_map = Dict{String, String}()
     is_oauth || return tool_name_map, tool_name_reverse_map

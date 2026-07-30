@@ -1,4 +1,4 @@
-function google_generative_build_tools(tools::Vector{AgentTool})
+function google_generative_build_tools(tools::Vector{<:AgentTool})
     isempty(tools) && return nothing
     decls = GoogleGenerativeAI.FunctionDeclaration[]
     for tool in tools

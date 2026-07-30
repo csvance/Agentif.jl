@@ -3,7 +3,7 @@ using JSON
 
 const OPENAI_RESPONSES_TOOL_CALL_PROVIDERS = Set(["openai", "openai-codex", "opencode"])
 
-function openai_responses_build_tools(tools::Vector{AgentTool})
+function openai_responses_build_tools(tools::Vector{<:AgentTool})
     isempty(tools) && return nothing
     provider_tools = OpenAIResponses.Tool[]
     for tool in tools

@@ -139,7 +139,8 @@ function openai_completions_append_thinking_with_details!(assistant_message::Ass
     return
 end
 
-function openai_completions_build_tools(tools::Vector{AgentTool}; force_empty::Bool = false)
+function openai_completions_build_tools(
+        tools::Vector{<:AgentTool}; force_empty::Bool = false)
     isempty(tools) && return force_empty ? OpenAICompletions.Tool[] : nothing
     provider_tools = OpenAICompletions.Tool[]
     for tool in tools

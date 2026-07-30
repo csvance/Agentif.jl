@@ -192,7 +192,7 @@ function generate_summary(
         apikey = agent.apikey,
         tools = empty_agent_tools(),
         http_kw = agent.http_kw,
-        api = agent.api,
+        api = Val(Symbol(model.api)),
     )
     result = stream(identity, summary_agent, AgentState(), summary_input, Abort())
     return message_text(last_assistant_message(result))

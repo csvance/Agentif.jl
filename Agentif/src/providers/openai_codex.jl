@@ -114,41 +114,44 @@ function codex_retry_settings!(kw::Dict{Symbol, Any})
     return (; max_retries, retry_base_ms, retry_max_ms)
 end
 
+codex_optional_string(value)::Union{Nothing, String} =
+    value === nothing ? nothing : string(value)
+
 function trimmed_codex_options(kw::NamedTuple)
     account_id = if hasproperty(kw, :account_id)
-        string(getproperty(kw, :account_id))
+        codex_optional_string(getproperty(kw, :account_id))
     elseif hasproperty(kw, :accountId)
-        string(getproperty(kw, :accountId))
+        codex_optional_string(getproperty(kw, :accountId))
     else
         nothing
     end
     session_id = if hasproperty(kw, :session_id)
-        string(getproperty(kw, :session_id))
+        codex_optional_string(getproperty(kw, :session_id))
     elseif hasproperty(kw, :sessionId)
-        string(getproperty(kw, :sessionId))
+        codex_optional_string(getproperty(kw, :sessionId))
     else
         nothing
     end
     reasoning_effort = if hasproperty(kw, :reasoning_effort)
-        string(getproperty(kw, :reasoning_effort))
+        codex_optional_string(getproperty(kw, :reasoning_effort))
     elseif hasproperty(kw, :reasoningEffort)
-        string(getproperty(kw, :reasoningEffort))
+        codex_optional_string(getproperty(kw, :reasoningEffort))
     elseif hasproperty(kw, :reasoning)
-        string(getproperty(kw, :reasoning))
+        codex_optional_string(getproperty(kw, :reasoning))
     else
         nothing
     end
     reasoning_summary = if hasproperty(kw, :reasoning_summary)
-        string(getproperty(kw, :reasoning_summary))
+        codex_optional_string(getproperty(kw, :reasoning_summary))
     elseif hasproperty(kw, :reasoningSummary)
-        string(getproperty(kw, :reasoningSummary))
+        codex_optional_string(getproperty(kw, :reasoningSummary))
     else
         nothing
     end
     text_verbosity = if hasproperty(kw, :text_verbosity)
-        string(getproperty(kw, :text_verbosity))
+        codex_optional_string(getproperty(kw, :text_verbosity))
     elseif hasproperty(kw, :textVerbosity)
-        string(getproperty(kw, :textVerbosity))
+        codex_optional_string(getproperty(kw, :textVerbosity))
     else
         nothing
     end
@@ -185,7 +188,7 @@ function trimmed_codex_options(kw::NamedTuple)
     )
 end
 
-function build_codex_tools(tools::Vector{AgentTool})
+function build_codex_tools(tools::Vector{<:AgentTool})
     isempty(tools) && return nothing
     provider_tools = Vector{Dict{String, Any}}()
     for tool in tools
@@ -1122,6 +1125,21 @@ function codex_websocket_pool_key(ws_url::String, headers::Dict{String, String})
     return (ws_url, account, String(session_id))
 end
 
+function codex_websocket_open_kw(http_kw)
+    http_nt = http_kw isa NamedTuple ? http_kw : (; http_kw...)
+    ws_open_kw = Base.structdiff(
+        http_nt,
+        (; retry = nothing, retries = nothing, retry_non_idempotent = nothing),
+    )
+    if isdefined(HTTP.WebSockets, :server_addr) && haskey(ws_open_kw, :readtimeout)
+        readtimeout = ws_open_kw.readtimeout
+        ws_open_kw = Base.structdiff(ws_open_kw, (; readtimeout = nothing))
+        haskey(ws_open_kw, :read_idle_timeout) ||
+            (ws_open_kw = merge(ws_open_kw, (; read_idle_timeout = readtimeout)))
+    end
+    return ws_open_kw
+end
+
 function codex_stream_websocket!(
         callback::Function,
         ws_url::String,
@@ -1130,8 +1148,7 @@ function codex_stream_websocket!(
         abort::Abort;
         http_kw = (;),
     )
-    http_nt = http_kw isa NamedTuple ? http_kw : (; http_kw...)
-    ws_open_kw = merge(http_nt, (; retry = false))
+    ws_open_kw = codex_websocket_open_kw(http_kw)
     ws_headers = create_codex_websocket_headers(headers)
     start_request = copy(request_body)
     start_request["type"] = "response.create"

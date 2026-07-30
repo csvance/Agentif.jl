@@ -8,6 +8,7 @@ using LLMProviders
 using LLMOAuth
 using LocalSearch
 using SQLite
+using Sockets
 
 function dummy_model()
     return Model(
@@ -40,6 +41,21 @@ function make_agent(; prompt = "test prompt", tools = AgentTool[])
         apikey = "test-key",
         tools = tools,
     )
+end
+
+function test_server_port(server)
+    if applicable(HTTP.port, server)
+        port = HTTP.port(server)
+        port != 0 && return port
+    end
+    if hasproperty(server, :listener) && hasproperty(server.listener, :server)
+        return Sockets.getsockname(server.listener.server)[2]
+    end
+    return parse(Int, last(rsplit(HTTP.WebSockets.server_addr(server), ':'; limit = 2)))
+end
+
+function test_websocket_request(ws)
+    return hasproperty(ws, :handshake_request) ? ws.handshake_request : ws.request
 end
 
 function fake_jwt(payload::AbstractDict)
@@ -122,6 +138,22 @@ Agentif.close_channel(ch::StreamTestChannel) = (ch.closed += 1)
     agent = make_agent(; tools = [tool])
     @test eltype(agent.tools) === typeof(tool)
     @test @inferred(Agentif.findtool(agent.tools, "echo_text")) === tool
+    default_agent = Agent(
+        id = "default-tools",
+        prompt = "test",
+        model = dummy_model(),
+        apikey = "test-key",
+    )
+    @test Agentif.openai_responses_build_tools(default_agent.tools) === nothing
+    @test Agentif.openai_completions_build_tools(default_agent.tools) === nothing
+    @test Agentif.build_codex_tools(default_agent.tools) === nothing
+    @test Agentif.google_generative_build_tools(default_agent.tools) === nothing
+    @test Agentif.google_gemini_cli_build_tools(default_agent.tools) === nothing
+    tool_name_map, tool_name_reverse_map =
+        Agentif.anthropic_tool_name_maps(default_agent.tools, true)
+    @test isempty(tool_name_map)
+    @test isempty(tool_name_reverse_map)
+    @test Agentif.anthropic_build_tools(default_agent.tools, tool_name_map) === nothing
     pending = Agentif.PendingToolCall(; call_id = "call-1", name = "echo_pending", arguments = "{}")
     @test tool_name(pending) == "echo_pending"
     @test tool_name("literal-name") == "literal-name"
@@ -863,6 +895,78 @@ end
         # state.usage.input should now be 5000+10000=15000
     end
 
+    @testset "compaction summary uses override model API" begin
+        request_target = Ref("")
+        server = HTTP.serve!("127.0.0.1", 0) do req
+            request_target[] = string(req.target)
+            if endswith(request_target[], "/chat/completions")
+                sse = join([
+                    "data: {\"id\":\"summary-1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"summary\"},\"finish_reason\":null}]}",
+                    "data: {\"id\":\"summary-1\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}",
+                    "data: [DONE]",
+                ], "\n\n") * "\n\n"
+                return HTTP.Response(
+                    200, ["Content-Type" => "text/event-stream"], sse)
+            end
+            return HTTP.Response(400, "wrong provider API")
+        end
+
+        try
+            port = test_server_port(server)
+            summary_model = Model(
+                id = "summary-model",
+                name = "summary-model",
+                api = "openai-completions",
+                provider = "test",
+                baseUrl = "http://127.0.0.1:$port/v1",
+                reasoning = false,
+                input = ["text"],
+                cost = Dict(
+                    "input" => 0.0,
+                    "output" => 0.0,
+                    "cacheRead" => 0.0,
+                    "cacheWrite" => 0.0,
+                ),
+                contextWindow = 100000,
+                maxTokens = 4096,
+            )
+            source_model = Model(
+                id = "source-model",
+                name = "source-model",
+                api = "openai-responses",
+                provider = "test",
+                baseUrl = "http://127.0.0.1:$port/v1",
+                reasoning = false,
+                input = ["text"],
+                cost = Dict(
+                    "input" => 0.0,
+                    "output" => 0.0,
+                    "cacheRead" => 0.0,
+                    "cacheWrite" => 0.0,
+                ),
+                contextWindow = 100000,
+                maxTokens = 4096,
+            )
+            agent = Agent(
+                id = "source-agent",
+                prompt = "test",
+                model = source_model,
+                apikey = "test-key",
+            )
+            summary = Agentif.generate_summary(
+                agent,
+                Agentif.StoredAgentMessage[UserMessage("old context")],
+                nothing,
+                CompactionConfig(),
+                summary_model,
+            )
+            @test summary == "summary"
+            @test endswith(request_target[], "/chat/completions")
+        finally
+            close(server)
+        end
+    end
+
     @testset "CompactionConfig defaults" begin
         config = CompactionConfig()
         @test config.enabled == true
@@ -939,6 +1043,19 @@ end
     @test Agentif.normalize_codex_transport("auto") == :auto
     @test Agentif.normalize_codex_transport(true) == :websocket
     @test_throws ArgumentError Agentif.normalize_codex_transport("bogus")
+
+    empty_options = Agentif.trimmed_codex_options((
+        account_id = nothing,
+        sessionId = nothing,
+        reasoning = nothing,
+        reasoningSummary = nothing,
+        textVerbosity = nothing,
+    ))
+    @test empty_options.account_id === nothing
+    @test empty_options.session_id === nothing
+    @test empty_options.reasoning_effort === nothing
+    @test empty_options.reasoning_summary === nothing
+    @test empty_options.text_verbosity === nothing
 end
 
 @testset "oauth apikey resolution" begin
@@ -1082,7 +1199,7 @@ end
     seen_events = Agentif.AgentEvent[]
 
     server = HTTP.serve!("127.0.0.1", 0) do req
-        request_body[] = JSON.parse(req.body)
+        request_body[] = JSON.parse(String(req.body))
         sse = join([
             "data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"message\",\"id\":\"msg_1\",\"role\":\"assistant\",\"content\":[]}}",
             "data: {\"type\":\"response.output_text.delta\",\"delta\":\"Partial\"}",
@@ -1093,8 +1210,7 @@ end
     end
 
     try
-        sock = HTTP.Sockets.getsockname(server.listener.server)
-        port = sock[2]
+        port = test_server_port(server)
         model = Model(
             id = "gpt-5.2",
             name = "gpt-5.2",
@@ -1117,7 +1233,8 @@ end
 
         result = stream(ev -> (push!(seen_events, ev); ev), agent, AgentState(), "Say hello", Abort(); sessionId = "sess-42")
         @test result.most_recent_stop_reason == :length
-        @test !any(ev -> ev isa Agentif.AgentErrorEvent, seen_events)
+        errors = [sprint(showerror, ev.error) for ev in seen_events if ev isa Agentif.AgentErrorEvent]
+        @test errors == String[]
         @test get(() -> nothing, request_body[], "prompt_cache_key") == "sess-42"
         @test !haskey(request_body[], "sessionId")
         input_items = get(() -> Any[], request_body[], "input")
@@ -1145,8 +1262,7 @@ end
     end
 
     try
-        sock = HTTP.Sockets.getsockname(server.listener.server)
-        port = sock[2]
+        port = test_server_port(server)
         model = Model(
             id = "gpt-5.2-codex",
             name = "gpt-5.2-codex",
@@ -1181,8 +1297,8 @@ end
     request_body = Ref(Dict{String, Any}())
 
     server = HTTP.serve!("127.0.0.1", 0) do req
-        request_headers[] = Dict{String, String}(String(k) => String(v) for (k, v) in req.headers)
-        request_body[] = JSON.parse(req.body)
+        request_headers[] = Dict{String, String}(lowercase(String(k)) => String(v) for (k, v) in req.headers)
+        request_body[] = JSON.parse(String(req.body))
         sse = join([
             "data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"message\",\"id\":\"msg_1\",\"role\":\"assistant\",\"content\":[]}}",
             "data: {\"type\":\"response.output_text.delta\",\"delta\":\"Hello\"}",
@@ -1194,8 +1310,7 @@ end
     end
 
     try
-        sock = HTTP.Sockets.getsockname(server.listener.server)
-        port = sock[2]
+        port = test_server_port(server)
         model = Model(
             id = "gpt-5.3-codex-spark",
             name = "gpt-5.3-codex-spark",
@@ -1256,8 +1371,7 @@ end
     end
 
     try
-        sock = HTTP.Sockets.getsockname(server.listener.server)
-        port = sock[2]
+        port = test_server_port(server)
         model = Model(
             id = "gpt-5.3-codex",
             name = "gpt-5.3-codex",
@@ -1320,8 +1434,7 @@ end
     end
 
     try
-        sock = HTTP.Sockets.getsockname(server.listener.server)
-        port = sock[2]
+        port = test_server_port(server)
         model = Model(
             id = "gpt-5.3-codex",
             name = "gpt-5.3-codex",
@@ -1359,7 +1472,8 @@ end
     request_body = Ref(Dict{String, Any}())
 
     ws_server = HTTP.WebSockets.listen!("127.0.0.1", 0) do ws
-        request_headers[] = Dict{String, String}(lowercase(String(k)) => String(v) for (k, v) in ws.request.headers)
+        request = test_websocket_request(ws)
+        request_headers[] = Dict{String, String}(lowercase(String(k)) => String(v) for (k, v) in request.headers)
         msg = HTTP.WebSockets.receive(ws)
         data = msg isa AbstractString ? String(msg) : String(msg)
         request_body[] = JSON.parse(data)
@@ -1376,8 +1490,7 @@ end
     end
 
     try
-        sock = HTTP.Sockets.getsockname(ws_server.listener.server)
-        port = sock[2]
+        port = test_server_port(ws_server)
         model = Model(
             id = "gpt-5.3-codex",
             name = "gpt-5.3-codex",
@@ -1423,7 +1536,8 @@ end
 
     ws_server = HTTP.WebSockets.listen!("127.0.0.1", 0) do ws
         connection_count[] += 1
-        headers = Dict{String, String}(lowercase(String(k)) => String(v) for (k, v) in ws.request.headers)
+        request = test_websocket_request(ws)
+        headers = Dict{String, String}(lowercase(String(k)) => String(v) for (k, v) in request.headers)
         push!(seen_session_headers, get(() -> "", headers, "session_id"))
         try
             while true
@@ -1462,8 +1576,7 @@ end
     end
 
     try
-        sock = HTTP.Sockets.getsockname(ws_server.listener.server)
-        port = sock[2]
+        port = test_server_port(ws_server)
         model = Model(
             id = "gpt-5.3-codex",
             name = "gpt-5.3-codex",

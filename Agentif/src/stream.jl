@@ -1169,7 +1169,7 @@ function stream(
             end
             log_codex_debug(
                 "codex response", Dict(
-                    "url" => resp.request.url,
+                    "url" => url,
                     "status" => resp.status,
                     "content_type" => HTTP.header(resp, "content-type"),
                     "cf_ray" => HTTP.header(resp, "cf-ray"),

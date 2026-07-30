@@ -1,4 +1,4 @@
-function google_gemini_cli_build_tools(tools::Vector{AgentTool})
+function google_gemini_cli_build_tools(tools::Vector{<:AgentTool})
     isempty(tools) && return nothing
     decls = GoogleGeminiCli.FunctionDeclaration[]
     for tool in tools
