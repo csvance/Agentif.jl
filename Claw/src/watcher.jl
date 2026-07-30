@@ -155,7 +155,7 @@ end
 
 Map an exception (possibly wrapped in TaskFailedException/CompositeException/
 CapturedException layers) to a failure class:
-`:rate_limit | :auth | :overloaded | :network | :aborted | :unknown`.
+`:rate_limit | :auth | :billing | :overloaded | :network | :aborted | :unknown`.
 """
 function classify_eval_failure(err)
     e = _unwrap_error(err)
@@ -163,18 +163,23 @@ function classify_eval_failure(err)
         s = Int(e.status)
         s == 429 && return :rate_limit
         (s == 401 || s == 403) && return :auth
+        s == 402 && return :billing
         (s == 500 || s == 502 || s == 503 || s == 504 || s == 529) &&
             return :overloaded
         (s == 408 || s == 599) && return :network
     end
     e isa Agentif.AbortEvaluation && return :aborted
+    e isa InterruptException && return :aborted
     (e isa EOFError || e isa Base.IOError) && return :network
     name = e isa Exception ? nameof(typeof(e)) : Symbol("")
     name in (:ConnectError, :DNSError, :TimeoutError, :ReadTimeoutError, :RequestError) && return :network
     msg = lowercase(e isa Exception ? sprint(showerror, e) : string(e))
     (occursin("rate limit", msg) || occursin("rate_limit", msg)) && return :rate_limit
+    (occursin("insufficient_quota", msg) || occursin("billing", msg) ||
+        occursin("credit balance", msg)) && return :billing
     occursin("overloaded", msg) && return :overloaded
     (occursin("unauthorized", msg) || occursin("invalid api key", msg) ||
+        occursin("invalid_api_key", msg) ||
         occursin("authentication", msg)) && return :auth
     if e isa Exception
         try
@@ -392,7 +397,9 @@ overrun, and on failure/stall/overrun send a watcher-composed note to `ch` (unle
 `base_handler` injection). Never throws for eval failures — they are journaled.
 """
 function supervised_evaluate(assistant, ev::Event, handler, ch::Agentif.AbstractChannel;
-        level = assistant.log_level, eval_kw...)
+        level = assistant.log_level,
+        abort::Union{Nothing, Agentif.Abort} = nothing,
+        eval_kw...)
     cfg = assistant.watcher
     cfg isa WatcherConfig ||
         throw(ArgumentError("supervised_evaluate requires a configured watcher"))
@@ -404,9 +411,9 @@ function supervised_evaluate(assistant, ev::Event, handler, ch::Agentif.Abstract
     eval_id = _journal_insert!(db, event_name, String(handler.id), Agentif.channel_id(ch), started)
     ws = WatchState(eval_id)
     observer = watch_observer(ws)
-    abort = Agentif.Abort()
+    eval_abort = abort === nothing ? Agentif.Abort() : abort
     @debug "Claw watcher: supervised evaluate start" eval_id handler_id = handler.id event_name channel_id = Agentif.channel_id(ch)
-    task = @async evaluate(assistant, input; channel = ch, observer, abort, level, eval_kw...)
+    task = @async evaluate(assistant, input; channel = ch, observer, abort = eval_abort, level, eval_kw...)
     abort_reason = nothing
     ontrack_note = nothing
     status = "completed"
@@ -428,12 +435,12 @@ function supervised_evaluate(assistant, ev::Event, handler, ch::Agentif.Abstract
             if idle_s > cfg.stall_timeout_s
                 abort_reason = :stalled
                 @warn "Claw watcher: eval stalled; aborting" eval_id handler_id = handler.id idle_s = round(idle_s; digits = 1)
-                Agentif.abort!(abort)
+                Agentif.abort!(eval_abort)
                 break
             elseif elapsed_s > cfg.max_eval_duration_s
                 abort_reason = :overrun
                 @warn "Claw watcher: eval overran; aborting" eval_id handler_id = handler.id elapsed_s = round(elapsed_s; digits = 1)
-                Agentif.abort!(abort)
+                Agentif.abort!(eval_abort)
                 break
             end
             if last_journal_monotonic == 0 ||
@@ -457,7 +464,7 @@ function supervised_evaluate(assistant, ev::Event, handler, ch::Agentif.Abstract
                         abort_reason = :off_track
                         ontrack_note = sentence
                         @warn "Claw watcher: off-track verdict; aborting" eval_id handler_id = handler.id note = sentence
-                        Agentif.abort!(abort)
+                        Agentif.abort!(eval_abort)
                         break
                     elseif verdict === :concern
                         @info "Claw watcher: on-track concern" eval_id note = sentence
