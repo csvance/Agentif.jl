@@ -105,22 +105,15 @@ Claw.event_extra(ev::JMAPNewEmailEvent) = Dict{String, Any}(
 _state_cursor_key(account_id::AbstractString) = "jmap_state:$(account_id):Email"
 
 function _load_persisted_state(assistant::Claw.AgentAssistant, account_id::AbstractString)
-    try
-        return Claw._get_agent_metadata(assistant.db, _state_cursor_key(account_id))
-    catch e
-        @warn "ClawJMAPExt: failed to read persisted Email state" account=account_id exception=(e,)
-        return nothing
-    end
+    return Claw._get_agent_metadata(assistant.db, _state_cursor_key(account_id))
 end
 
 function _persist_state!(assistant::Claw.AgentAssistant, account_id::AbstractString, state::AbstractString)
-    try
-        # Shared handle (same connection `_get_agent_metadata` reads from), via the
-        # statement-resetting helper so the cursor is durably committed rather than
-        # sitting in an uncommitted statement until the next unrelated query.
-        Claw._set_agent_metadata!(assistant.db, _state_cursor_key(account_id), String(state))
-    catch e
-        @warn "ClawJMAPExt: failed to persist Email state cursor" account=account_id exception=(e,)
+    # A state cursor is an upstream acknowledgement. Serialize it through the
+    # durable writer and propagate any failure so the SSE loop reconnects from
+    # the old cursor instead of acknowledging mail that Claw did not record.
+    Claw.execute_write(assistant._writer) do db
+        Claw._set_agent_metadata!(db, _state_cursor_key(account_id), String(state))
     end
     return nothing
 end
@@ -150,20 +143,20 @@ function _refresh_mailbox_cache!(source::FastmailEventSource, session::JMAP.Sess
         lock(source._lock) do
             source._inbox_mailbox_ids[account_id] = inbox_ids
         end
-        isempty(inbox_ids) && @warn "ClawJMAPExt: no inbox mailbox role found; new-email events will be skipped until resolved" account=account_id
+        isempty(inbox_ids) && @warn "ClawJMAPExt: no inbox mailbox role found; Email state will be retained until resolved" account=account_id
+        return !isempty(inbox_ids)
     catch e
         @warn "ClawJMAPExt: failed to refresh mailbox cache" account=account_id exception=(e, catch_backtrace())
+        return false
     end
-    return
 end
 
 function _ensure_inbox_mailboxes!(source::FastmailEventSource, session::JMAP.Session, account_id::String)
     has_inbox = lock(source._lock) do
         haskey(source._inbox_mailbox_ids, account_id) && !isempty(source._inbox_mailbox_ids[account_id])
     end
-    has_inbox && return
-    _refresh_mailbox_cache!(source, session, account_id)
-    return
+    has_inbox && return true
+    return _refresh_mailbox_cache!(source, session, account_id)
 end
 
 function _is_in_inbox(source::FastmailEventSource, account_id::String, mailbox_ids::Vector{String})
@@ -200,10 +193,12 @@ function _fetch_created_email_ids(session::JMAP.Session, since_state::String, ac
         final_state = resp.newState
         cursor = resp.newState
         !resp.hasMoreChanges && return _dedupe_ids(created), final_state
-        page == max_pages && @warn "ClawJMAPExt: reached max Email/changes pages while collecting created IDs" account=account_id pages=max_pages
+        if page == max_pages
+            error("ClawJMAPExt: Email/changes exceeded the $max_pages-page safety limit for account $account_id")
+        end
     end
 
-    return _dedupe_ids(created), final_state
+    error("ClawJMAPExt: unreachable Email/changes pagination state")
 end
 
 function _fetch_created_emails(session::JMAP.Session, account_id::String, ids::Vector{String})
@@ -227,6 +222,7 @@ function _handle_state_change!(source::FastmailEventSource, assistant::Claw.Agen
 
         # First observation is baseline seeding, not an event.
         if isempty(old_state)
+            _persist_state!(assistant, account_id, email_state)
             account_states["Email"] = email_state
             continue
         end
@@ -235,23 +231,27 @@ function _handle_state_change!(source::FastmailEventSource, assistant::Claw.Agen
             _fetch_created_email_ids(session, old_state, account_id)
         catch e
             @warn "ClawJMAPExt: failed to fetch Email/changes" account=account_id exception=(e, catch_backtrace())
-            account_states["Email"] = email_state
-            _persist_state!(assistant, account_id, email_state)
+            # Keep the old cursor. Advancing here acknowledges changes that were
+            # never fetched and loses them permanently.
             continue
         end
 
         if isempty(created_ids)
-            account_states["Email"] = resolved_state
             _persist_state!(assistant, account_id, resolved_state)
+            account_states["Email"] = resolved_state
             continue
         end
 
-        _ensure_inbox_mailboxes!(source, session, account_id)
+        if !_ensure_inbox_mailboxes!(source, session, account_id)
+            @warn "ClawJMAPExt: inbox mailbox ids unavailable; retaining Email state for retry" account=account_id
+            continue
+        end
         emails = try
             _fetch_created_emails(session, account_id, created_ids)
         catch e
             @warn "ClawJMAPExt: failed to fetch created email details" account=account_id count=length(created_ids) exception=(e, catch_backtrace())
-            JMAP.Email[]
+            # Keep the old cursor so the same created ids can be fetched again.
+            continue
         end
 
         for email in emails
@@ -278,8 +278,8 @@ function _handle_state_change!(source::FastmailEventSource, assistant::Claw.Agen
 
         # Advance the cursor only after the events are durably persisted; doing it
         # first is what made a crash here lose the mail permanently.
-        account_states["Email"] = resolved_state
         _persist_state!(assistant, account_id, resolved_state)
+        account_states["Email"] = resolved_state
     end
 end
 
@@ -328,13 +328,9 @@ function _seed_initial_states!(source::FastmailEventSource, assistant::Union{Not
         account_states["Email"] = persisted
         @info "ClawJMAPExt: resuming from persisted Email state" account=account_id
     else
-        try
-            resp = JMAP.email_get(session; account_id=account_id, ids=String[])
-            account_states["Email"] = resp.state
-            assistant === nothing || _persist_state!(assistant, account_id, resp.state)
-        catch e
-            @warn "ClawJMAPExt: failed to seed Email state" exception=(e, catch_backtrace())
-        end
+        resp = JMAP.email_get(session; account_id=account_id, ids=String[])
+        assistant === nothing || _persist_state!(assistant, account_id, resp.state)
+        account_states["Email"] = resp.state
     end
 
     _refresh_mailbox_cache!(source, session, account_id)

@@ -207,6 +207,10 @@ end
 #   set_last_used!(meta::M, t::Float64)
 #   set_status!(meta::M, s::String)
 
+# Sessions normally belong to the registry cleanup task. A higher-level owner
+# can opt out while it still needs to drain process output before close.
+automatic_cleanup(::Any) = true
+
 # --- Registry operations ---
 
 function active_session_count(reg::SessionRegistry)
@@ -250,6 +254,7 @@ function cleanup_exited_sessions!(reg::SessionRegistry)
     to_remove = lock(reg.lock) do
         ids = Int[]
         for (id, meta) in reg.sessions
+            automatic_cleanup(meta) || continue
             status = resolve_status(meta)
             status == SESSION_STATUS_RUNNING && continue
             push!(ids, id)
@@ -289,7 +294,12 @@ function prune_oldest_session!(reg::SessionRegistry)
     prune_id = lock(reg.lock) do
         length(reg.sessions) < config.max_sessions && return nothing
 
-        sorted = sort(collect(reg.sessions), by = p -> session_last_used(p[2]), rev = true)
+        sorted = sort(
+            [pair for pair in reg.sessions if automatic_cleanup(pair[2])],
+            by = p -> session_last_used(p[2]),
+            rev = true,
+        )
+        isempty(sorted) && return nothing
         protected = Set(p[1] for p in sorted[1:min(8, length(sorted))])
 
         for (id, meta) in sorted

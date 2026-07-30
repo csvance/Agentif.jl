@@ -6,6 +6,7 @@ using Mattermost
 using MSTeams
 using Signal
 using Slack
+using Telegram
 using Claw
 
 # Events are now persisted before dispatch, and the in-memory channel carries only
@@ -19,8 +20,11 @@ function pop_event!(assistant)
 end
 
 count_events(assistant, sql, params = ()) =
-    Int(iterate(Claw.SQLite.DBInterface.execute(assistant.db,
-        "SELECT COUNT(*) AS n FROM claw_events " * sql, params))[1].n)
+    Int(Claw._fetch_one(
+        assistant.db,
+        "SELECT COUNT(*) AS n FROM claw_events " * sql,
+        params,
+    ).n)
 
 const HAS_GITHUB = try
     @eval using GitHub
@@ -245,18 +249,70 @@ if HAS_JMAP
         @test source._states["acct-1"]["Email"] == "E4"
         @test !isready(assistant.event_queue)
 
-        # If Email/changes fails, state still advances to avoid stale replay loops.
+        # If Email/changes fails, retain the old cursor. Advancing would lose
+        # changes that were never fetched.
         ext.EMAIL_CHANGES_FN[] = (_session, _since_state; account_id) -> error("boom for $account_id")
         sc_error = JMAP.StateChange("StateChange", Dict("acct-1" => Dict("Email" => "E5")))
         ext._handle_state_change!(source, assistant, sc_error)
-        @test source._states["acct-1"]["Email"] == "E5"
+        @test source._states["acct-1"]["Email"] == "E4"
         @test !isready(assistant.event_queue)
+
+        # The same rule applies when Email/get fails after changes were listed.
+        ext.EMAIL_CHANGES_FN[] = (_session, _since_state; account_id) -> JMAP.ChangesResponse(
+            accountId=account_id,
+            oldState="E4",
+            newState="E5",
+            hasMoreChanges=false,
+            created=["m3"],
+            updated=String[],
+            destroyed=String[],
+        )
+        ext.FETCH_EMAILS_FN[] = (_session, ids; account_id, properties) ->
+            error("email fetch failed")
+        ext._handle_state_change!(source, assistant, sc_error)
+        @test source._states["acct-1"]["Email"] == "E4"
+        @test !isready(assistant.event_queue)
+
+        # A capped page walk is incomplete. It must not acknowledge the
+        # intermediate state because later pages would then be lost.
+        page_count = Ref(0)
+        ext.EMAIL_CHANGES_FN[] = (_session, since_state; account_id) -> begin
+            page_count[] += 1
+            JMAP.ChangesResponse(
+                accountId=account_id,
+                oldState=since_state,
+                newState="E-page-$(page_count[])",
+                hasMoreChanges=true,
+                created=["page-$(page_count[])"],
+                updated=String[],
+                destroyed=String[],
+            )
+        end
+        ext._handle_state_change!(source, assistant, sc_error)
+        @test page_count[] == 20
+        @test source._states["acct-1"]["Email"] == "E4"
+        @test !isready(assistant.event_queue)
+
+        # Persisting the upstream cursor is the acknowledgement boundary. If the
+        # durable writer fails, the callback must throw and retain the old state.
+        ext.EMAIL_CHANGES_FN[] = (_session, _since_state; account_id) -> JMAP.ChangesResponse(
+            accountId=account_id,
+            oldState="E4",
+            newState="E5",
+            hasMoreChanges=false,
+            created=String[],
+            updated=["m2"],
+            destroyed=String[],
+        )
+        Claw.close_writer!(assistant._writer)
+        @test_throws ErrorException ext._handle_state_change!(source, assistant, sc_error)
+        @test source._states["acct-1"]["Email"] == "E4"
     finally
         ext.EMAIL_CHANGES_FN[] = original_email_changes_fn
         ext.FETCH_EMAILS_FN[] = original_fetch_emails_fn
     end
 
-    close(assistant.db)
+    Claw.shutdown!(assistant; timeout_s=5)
 end
 else
     @info "Skipping ClawJMAPExt tests: JMAP package unavailable in test environment"
@@ -294,6 +350,24 @@ end
     @test !msg_event.direct_ping
     @test Agentif.entry_id(Claw.get_channel(msg_event)) == "1700000000.123"
     @test Claw.event_content(msg_event) == "[U123]: hello"
+
+    # Durable replay keeps the source message as the reply root while retaining
+    # the base conversation branch.
+    source.web_client = web_client
+    slack_row = Claw.EventRow(
+        1, "slack", "slack_message", nothing,
+        Agentif.channel_id(Claw.get_channel(msg_event)),
+        Claw.event_content(msg_event),
+        Claw.event_extra(msg_event),
+        Agentif.channel_id(Claw.get_channel(msg_event)),
+        1, nothing,
+    )
+    replayed_slack = ext._rehydrate_slack_channel(source, slack_row)
+    @test replayed_slack !== nothing
+    @test replayed_slack.thread_ts == "1700000000.123"
+    @test replayed_slack.source_ts == "1700000000.123"
+    @test Agentif.channel_id(replayed_slack) == "slack:C123"
+    @test Agentif.entry_id(replayed_slack) == "1700000000.123"
 
     private_msg = Slack.SlackMessageEvent(
         type="message",
@@ -552,8 +626,21 @@ end
     thread_event = ext._extract_message_event(thread_reply, web_client, "", "", nothing, nothing, dm_cache)
     @test Agentif.channel_id(Claw.get_channel(thread_event)) == "slack:D777:1700000100.111"
     @test Agentif.parent_branch_id(Claw.get_channel(thread_event)) == "slack:D777"
+    thread_row = Claw.EventRow(
+        2, "slack", "slack_message", nothing,
+        Agentif.channel_id(Claw.get_channel(thread_event)),
+        Claw.event_content(thread_event),
+        Claw.event_extra(thread_event),
+        Agentif.channel_id(Claw.get_channel(thread_event)),
+        1, nothing,
+    )
+    replayed_thread = ext._rehydrate_slack_channel(source, thread_row)
+    @test replayed_thread.thread_ts == "1700000100.111"
+    @test replayed_thread.source_ts == "1700000300.333"
+    @test Agentif.channel_id(replayed_thread) == "slack:D777:1700000100.111"
+    @test Agentif.entry_id(replayed_thread) == "1700000300.333"
 
-    close(assistant.db)
+    Claw.shutdown!(assistant; timeout_s=5)
 end
 
 @testset "ClawMattermostExt channel + event mapping" begin
@@ -579,6 +666,29 @@ end
     @test user !== nothing
     @test user.id == "user-1"
     @test user.name == "alice"
+
+    # A replayed top-level event still replies under its source post. The source
+    # post remains the entry id, but it does not create a separate branch.
+    source.client = client
+    top_ch = ext.MattermostChannel(
+        "chan-top", "post-top", "post-top", "post-top", client,
+        nothing, nothing, "user-top", "bob", "D", "Direct",
+    )
+    top_event = ext.MattermostMessageEvent(top_ch, "hello", true)
+    mattermost_row = Claw.EventRow(
+        1, "mattermost", "mattermost_message", nothing,
+        Agentif.channel_id(top_ch),
+        Claw.event_content(top_event),
+        Claw.event_extra(top_event),
+        Agentif.channel_id(top_ch),
+        1, nothing,
+    )
+    replayed_mattermost = ext._rehydrate_mattermost_channel(source, mattermost_row)
+    @test replayed_mattermost !== nothing
+    @test replayed_mattermost.root_id == "post-top"
+    @test replayed_mattermost.source_post_id == "post-top"
+    @test Agentif.channel_id(replayed_mattermost) == "mattermost:chan-top"
+    @test Agentif.entry_id(replayed_mattermost) == "post-top"
 
     assistant = Claw.AgentAssistant(":memory:";
         provider="openai-completions",
@@ -777,7 +887,7 @@ end
         ext.STREAM_FINISH_FN[] = original_stream_finish_fn
     end
 
-    close(assistant.db)
+    Claw.shutdown!(assistant; timeout_s=5)
 end
 
 @testset "ClawSignalExt event mapping" begin
@@ -801,6 +911,8 @@ end
     ch = Claw.get_channel(msg_event)
     @test Agentif.channel_id(ch) == "signal:+12223334444"
     @test Agentif.entry_id(ch) == "1700000000000"
+    @test Claw.event_dedup_key(msg_event) ==
+        "signal:+12223334444:+12223334444:1700000000000"
     @test !Agentif.is_group(ch)
     @test Agentif.is_private(ch)
     tools = Agentif.create_channel_tools(ch)
@@ -819,6 +931,33 @@ end
     @test startswith(group_channel.recipient, "group.")
     @test Agentif.is_group(group_channel)
     @test Claw.event_content(group_event) == "[Bob]: group hello"
+    @test occursin("+19998887777:1700000001000", Claw.event_dedup_key(group_event))
+    encoded = Claw._encode_payload(
+        Agentif.channel_id(group_channel),
+        Claw.event_content(group_event),
+        Claw.event_extra(group_event),
+    )
+    cid, content, extra = Claw._decode_payload(encoded)
+    replayed = ext._rehydrate_signal_event(
+        client,
+        (; channel_id=cid, content, extra, name="signal_message"),
+    )
+    @test replayed isa Claw.ReplayedChannelEvent
+    replayed_channel = Claw.get_channel(replayed)
+    @test Agentif.channel_id(replayed_channel) == Agentif.channel_id(group_channel)
+    @test Agentif.is_group(replayed_channel)
+    @test Agentif.get_current_user(replayed_channel).id == "+19998887777"
+
+    no_timestamp = ext._envelope_to_message_event(
+        Signal.Envelope(
+            sourceNumber="+12223334444",
+            dataMessage=Signal.DataMessage(message="no timestamp"),
+        ),
+        client,
+        "+15550000000",
+    )
+    @test no_timestamp !== nothing
+    @test Claw.event_dedup_key(no_timestamp) === nothing
 
     self_dm = Signal.DataMessage(message="self", timestamp=Int64(1700000002000))
     self_envelope = Signal.Envelope(sourceNumber="+15550000000", dataMessage=self_dm)
@@ -857,6 +996,21 @@ end
     @test !Agentif.is_private(msg_channel)
     @test Agentif.entry_id(msg_channel) == "activity-1"
     @test Claw.event_content(msg_event) == "[Alice]: hello teams"
+    encoded = Claw._encode_payload(
+        Agentif.channel_id(msg_channel),
+        Claw.event_content(msg_event),
+        Claw.event_extra(msg_event),
+    )
+    cid, content, extra = Claw._decode_payload(encoded)
+    replayed = ext._rehydrate_msteams_event(
+        client,
+        (; channel_id=cid, content, extra, name="msteams_message"),
+    )
+    @test replayed isa Claw.ReplayedChannelEvent
+    replayed_channel = Claw.get_channel(replayed)
+    @test Agentif.channel_id(replayed_channel) == "msteams:conv-1"
+    @test Agentif.entry_id(replayed_channel) == "activity-1"
+    @test Agentif.get_current_user(replayed_channel).name == "Alice"
 
     dm_activity = Dict{String, Any}(
         "type" => "message",
@@ -908,6 +1062,43 @@ end
         "conversation" => Dict("id" => "conv-4", "conversationType" => "channel"),
     )
     @test isempty(ext._activity_to_events(bot_message, client))
+end
+
+@testset "ClawTelegramExt durable replay" begin
+    ext = Base.get_extension(Claw, :ClawTelegramExt)
+    @test ext !== nothing
+
+    client = Telegram.Client("test-token", "https://example.invalid/")
+    source = ext.TelegramEventSource(; client)
+    ch = ext.TelegramChannel(
+        -100123,
+        Int64(42),
+        client,
+        IOBuffer(),
+        "user-1",
+        "Alice",
+        "supergroup",
+    )
+    ev = ext.TelegramMessageEvent(ch, "hello", true)
+    row = Claw.EventRow(
+        1, "telegram", "telegram_message", nothing,
+        Agentif.channel_id(ch),
+        Claw.event_content(ev),
+        Claw.event_extra(ev),
+        Agentif.channel_id(ch),
+        1, nothing,
+    )
+
+    replayed = ext._rehydrate_telegram_event(source, row)
+    @test replayed isa Claw.ReplayedChannelEvent
+    replayed_channel = Claw.get_channel(replayed)
+    @test replayed_channel.chat_id == -100123
+    @test replayed_channel.message_id == 42
+    @test replayed_channel.user_id == "user-1"
+    @test replayed_channel.user_name == "Alice"
+    @test replayed_channel.chat_type == "supergroup"
+    @test Agentif.entry_id(replayed_channel) == "42"
+    @test !isempty(Agentif.create_channel_tools(replayed_channel))
 end
 
 end # module ExtensionTests

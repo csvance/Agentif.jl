@@ -7,20 +7,44 @@ function web_funcs()
     return Dict(tool.name => tool.func for tool in LLMTools.web_tools())
 end
 
+function web_test_server_port(server)
+    if applicable(HTTP.port, server)
+        port = HTTP.port(server)
+        port != 0 && return port
+    end
+    return Sockets.getsockname(server.listener.server)[2]
+end
+
 @testset "Web tools" begin
     funcs = web_funcs()
     web_fetch = funcs["web_fetch"]
     web_search = funcs["web_search"]
 
+    @testset "Limited response sink implements the IO byte contract" begin
+        output = IOBuffer()
+        sink = LLMTools.LimitedResponseSink(output, 4)
+        bytes = collect(codeunits("abcdef"))
+
+        @test write(sink, bytes) == 6
+        @test String(take!(output)) == "abcd"
+        @test sink.downloaded_bytes == 4
+        @test sink.truncated
+
+        stream_output = IOBuffer()
+        stream_sink = LLMTools.LimitedResponseSink(stream_output, 8)
+        @test write(stream_sink, IOBuffer("stream")) == 6
+        @test String(take!(stream_output)) == "stream"
+        @test !stream_sink.truncated
+    end
+
     @testset "POST requests with body" begin
-        server = HTTP.serve!(ip"127.0.0.1", 0) do req
+        server = HTTP.serve!("127.0.0.1", 0) do req
             body = String(req.body)
             return HTTP.Response(200, ["Content-Type" => "text/plain"], "method=$(req.method);body=$body")
         end
 
         try
-            sock = getsockname(server.listener.server)
-            port = sock[2]
+            port = web_test_server_port(server)
             url = "http://127.0.0.1:$port/echo"
             result = web_fetch(url, "POST", nothing, "hello-post", false, 10, nothing, nothing)
             @test occursin("Status: 200", result)
@@ -47,13 +71,12 @@ end
 
     @testset "Offset preview honors offset on initial fetch" begin
         payload = join(["line $(i)" for i in 1:120], "\n")
-        server = HTTP.serve!(ip"127.0.0.1", 0) do req
+        server = HTTP.serve!("127.0.0.1", 0) do req
             HTTP.Response(200, ["Content-Type" => "text/plain"], payload)
         end
 
         try
-            sock = getsockname(server.listener.server)
-            port = sock[2]
+            port = web_test_server_port(server)
             url = "http://127.0.0.1:$port/lines"
             result = web_fetch(url, "GET", nothing, nothing, false, 10, nothing, 50)
             @test occursin("--- Content Preview ---", result)

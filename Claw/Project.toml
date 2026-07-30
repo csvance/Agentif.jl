@@ -50,6 +50,7 @@ ClawTelegramExt = "Telegram"
 [compat]
 Agentif = "1"
 GitHub = "5"
+HTTP = "1, 2"
 JSON = "1"
 JMAP = "0.1.0"
 MSTeams = "0.1.0"

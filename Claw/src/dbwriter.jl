@@ -24,7 +24,7 @@ Base.@kwdef struct PipelineConfig
     "Global cap on concurrently running handler evaluations."
     max_concurrent_evals::Int = 4
     "Backoff ladder (seconds) for retryable failures."
-    retry_backoff_s::Vector{Float64} = [30.0, 60.0, 300.0, 900.0, 3600.0]
+    retry_backoff_s::Vector{Float64} = [30.0, 60.0, 300.0, 900.0]
     "Total attempts allowed for retryable classes (`:rate_limit`, `:overloaded`, `:network`)."
     max_attempts::Int = 5
     "Total attempts allowed for `:unknown` (initial attempt + 2 retries)."
@@ -157,7 +157,10 @@ end
 function _writer_loop(w::SQLiteWriter)
     for req in w.requests
         result = try
-            (:ok, req.f(w.db))
+            # The writer task can outlive methods defined by extensions, Revise,
+            # or a caller at the REPL. Run each submitted closure in the current
+            # world so a long-lived writer does not reject newer write code.
+            (:ok, Base.invokelatest(req.f, w.db))
         catch e
             (:error, e)
         end

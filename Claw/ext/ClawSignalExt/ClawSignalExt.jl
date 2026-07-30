@@ -158,6 +158,42 @@ function _envelope_to_message_event(envelope::Signal.Envelope, client::Signal.Cl
 end
 
 Claw.event_source_tag(::SignalMessageEvent) = "signal"
+Claw.event_extra(ev::SignalMessageEvent) = Dict{String, Any}(
+    "direct_ping" => ev.direct_ping,
+    "user_id" => ev.channel.user_id,
+    "user_name" => ev.channel.user_name,
+    "is_group" => ev.channel.is_group_chat,
+    "source_timestamp" => ev.channel.source_timestamp,
+)
+function Claw.event_dedup_key(ev::SignalMessageEvent)
+    ch = ev.channel
+    ts = ch.source_timestamp
+    (ts === nothing || isempty(ts)) && return nothing
+    return "signal:$(ch.recipient):$(ch.user_id):$(ts)"
+end
+
+function _rehydrate_signal_event(client::Signal.Client, row)
+    cid = row.channel_id
+    cid isa AbstractString && startswith(cid, "signal:") || return nothing
+    recipient = String(SubString(cid, nextind(cid, firstindex(cid), length("signal:"))))
+    isempty(recipient) && return nothing
+    user_id = get(() -> "", row.extra, "user_id")
+    user_name = get(() -> "", row.extra, "user_name")
+    source_timestamp = get(() -> nothing, row.extra, "source_timestamp")
+    source_timestamp = source_timestamp isa AbstractString ? String(source_timestamp) : nothing
+    is_group_chat = get(() -> false, row.extra, "is_group") === true
+    ch = SignalChannel(
+        recipient,
+        client,
+        nothing,
+        user_id isa AbstractString ? String(user_id) : "",
+        user_name isa AbstractString ? String(user_name) : "",
+        is_group_chat,
+        source_timestamp,
+        "",
+    )
+    return Claw.ReplayedChannelEvent(row.name, row.content, ch)
+end
 
 # ─── start! ───
 
@@ -173,7 +209,10 @@ function Claw.start!(source::SignalEventSource, assistant::Claw.AgentAssistant)
     errormonitor(Threads.@spawn begin
         Signal.with_signal(number; base_url=source.base_url) do
             client = Signal._get_client()
-            Claw.register_rehydrator!("signal", Claw.channel_lookup_rehydrator)
+            Claw.register_rehydrator!(
+                "signal",
+                row -> _rehydrate_signal_event(client, row),
+            )
             @info "ClawSignalExt: Starting websocket listener" number=number base_url=source.base_url
 
             Signal.run_websocket(; auto_reconnect=source.auto_reconnect) do envelope
@@ -181,8 +220,7 @@ function Claw.start!(source::SignalEventSource, assistant::Claw.AgentAssistant)
                 event === nothing && return
                 ch = event.channel
                 @info "ClawSignalExt: message" recipient=ch.recipient user_id=ch.user_id is_group=ch.is_group_chat direct_ping=event.direct_ping
-                Claw.submit_event!(assistant, event;
-                    dedup_key = "signal:$(ch.recipient):$(something(ch.source_timestamp, ""))")
+                Claw.submit_event!(assistant, event)
             end
         end
     end)

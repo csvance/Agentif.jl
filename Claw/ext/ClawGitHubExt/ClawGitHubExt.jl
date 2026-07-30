@@ -467,8 +467,8 @@ function Claw.start!(source::GitHubEventSource, assistant::Claw.AgentAssistant)
 
             ghev = GitHubWebhookEvent(kind, action, payload, repo_name, sender_login)
             @info "ClawGitHubExt: event" kind action repo=repo_name sender=sender_login name=Claw.get_name(ghev)
-            # Persist before returning 200, so a crash after the 200 is covered by
-            # GitHub's own redelivery.
+            # Persist before returning 200. A crash after the response is covered
+            # by Claw's durable inbox; a failure before it lets GitHub redeliver.
             #
             # NOTE: no dedup key yet. GitHub's delivery id arrives as the
             # `X-GitHub-Delivery` *header*, and GitHub.jl's `WebhookEvent` only

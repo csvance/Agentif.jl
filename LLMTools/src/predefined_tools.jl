@@ -900,7 +900,7 @@ const WEB_TEMP_FILES_LOCK = ReentrantLock()
 # Create a temp directory that persists for the session
 const WEB_TEMP_DIR = Ref{Union{Nothing, String}}(nothing)
 
-mutable struct LimitedResponseSink
+mutable struct LimitedResponseSink <: IO
     io::IO
     max_bytes::Int
     downloaded_bytes::Int
@@ -909,18 +909,19 @@ end
 
 LimitedResponseSink(io::IO, max_bytes::Int) = LimitedResponseSink(io, max_bytes, 0, false)
 
-function Base.write(sink::LimitedResponseSink, data::AbstractVector{UInt8})
+function Base.unsafe_write(sink::LimitedResponseSink, pointer::Ptr{UInt8}, nbytes::UInt)
+    count = Int(nbytes)
     remaining = sink.max_bytes - sink.downloaded_bytes
     if remaining > 0
-        to_write = min(length(data), remaining)
-        write(sink.io, @view(data[1:to_write]))
+        to_write = min(count, remaining)
+        Base.unsafe_write(sink.io, pointer, UInt(to_write))
         sink.downloaded_bytes += to_write
-        sink.truncated = sink.truncated || (to_write < length(data))
+        sink.truncated = sink.truncated || (to_write < count)
     else
         sink.truncated = true
     end
     # Report all bytes as consumed so the HTTP stream can continue draining.
-    return length(data)
+    return nbytes
 end
 
 function Base.write(sink::LimitedResponseSink, byte::UInt8)
@@ -931,16 +932,6 @@ function Base.write(sink::LimitedResponseSink, byte::UInt8)
         sink.truncated = true
     end
     return 1
-end
-
-function Base.write(sink::LimitedResponseSink, stream::HTTP.Streams.Stream)
-    consumed = 0
-    while !Base.eof(stream)
-        chunk = Base.readavailable(stream)
-        isempty(chunk) && continue
-        consumed += write(sink, chunk)
-    end
-    return consumed
 end
 
 function get_web_temp_dir()

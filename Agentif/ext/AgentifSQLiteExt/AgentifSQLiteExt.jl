@@ -6,10 +6,25 @@ using JSON
 using LocalSearch
 using SQLite
 
-function _ensure_column!(db::SQLite.DB, table::String, column::String, declaration::String)
-    for row in SQLite.DBInterface.execute(db, "PRAGMA table_info($table)")
-        String(row.name) == column && return false
+function _fetch_one_copy(db::SQLite.DB, sql::AbstractString, params = ())
+    cursor = SQLite.DBInterface.execute(db, sql, params)
+    try
+        state = iterate(cursor)
+        state === nothing && return nothing
+        row = state[1]
+        names = Tuple(propertynames(row))
+        return NamedTuple{names}(map(name -> getproperty(row, name), names))
+    finally
+        SQLite.DBInterface.close!(cursor)
     end
+end
+
+function _ensure_column!(db::SQLite.DB, table::String, column::String, declaration::String)
+    found = false
+    for row in SQLite.DBInterface.execute(db, "PRAGMA table_info($table)")
+        found |= String(row.name) == column
+    end
+    found && return false
     SQLite.execute(db, "ALTER TABLE $table ADD COLUMN $declaration")
     return true
 end
@@ -121,25 +136,23 @@ function Agentif.append_entry!(store::SQLiteSessionStore, entry::Agentif.Session
 end
 
 function Agentif.get_entry(store::SQLiteSessionStore, entry_id::String)
-    rows = SQLite.DBInterface.execute(
+    row = _fetch_one_copy(
         store.db,
         "SELECT entry FROM session_entries WHERE entry_id = ?",
         (entry_id,),
     )
-    row = iterate(rows)
     row === nothing && return nothing
-    return JSON.parse(String(row[1].entry), Agentif.SessionEntry)
+    return JSON.parse(String(row.entry), Agentif.SessionEntry)
 end
 
 function Agentif.get_branch_leaf(store::SQLiteSessionStore, branch_id::String)
-    rows = SQLite.DBInterface.execute(
+    row = _fetch_one_copy(
         store.db,
         "SELECT leaf_entry_id FROM session_branches WHERE branch_id = ?",
         (branch_id,),
     )
-    row = iterate(rows)
     row === nothing && return nothing
-    val = row[1].leaf_entry_id
+    val = row.leaf_entry_id
     return val === missing ? nothing : String(val)
 end
 

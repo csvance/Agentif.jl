@@ -102,7 +102,7 @@ end
     end
     @test !occursin("[dm-a-note]", after_scrub)
 
-    close(assistant.db)
+    Claw.shutdown!(assistant; timeout_s=5)
 end
 
 @testset "DB tools filters and time parsing" begin
@@ -167,7 +167,7 @@ end
     @test ts_rel <= time()
     @test Claw._parse_time_filter("not-a-time") === nothing
 
-    close(assistant.db)
+    Claw.shutdown!(assistant; timeout_s=5)
 end
 
 @testset "DB tools concurrent writes are stable" begin
@@ -188,7 +188,7 @@ end
     latest = Claw.db_search("value-", "race")
     @test occursin("[race-key]", latest)
 
-    close(assistant.db)
+    Claw.shutdown!(assistant; timeout_s=5)
 end
 
 end # module DBToolsTests

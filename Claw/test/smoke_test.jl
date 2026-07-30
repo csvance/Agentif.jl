@@ -54,8 +54,7 @@ end
 
 # Helper to count rows
 function count_rows(db, table)
-    result = iterate(SQLite.DBInterface.execute(db, "SELECT COUNT(*) as n FROM $table"))
-    return result[1].n
+    return Claw._fetch_one(db, "SELECT COUNT(*) as n FROM $table").n
 end
 
 # ============================================================================
@@ -109,6 +108,24 @@ end
         apikey = "test-key",
     )
     @test a_default.log_level === nothing
+
+    # Keep the pre-hardening keyword-only constructor API.
+    mktempdir() do dir
+        cd(dir) do
+            a_keyword = AgentAssistant(;
+                name = "compat",
+                provider = "openai-completions",
+                model_id = "gpt-4o-mini",
+                apikey = "test-key",
+            )
+            @test basename(a_keyword.db_path) == "compat.sqlite"
+            @test realpath(dirname(a_keyword.db_path)) == realpath(dir)
+            Claw.shutdown!(a_keyword; timeout_s = 5)
+        end
+    end
+
+    Claw.shutdown!(a_warn; timeout_s = 5)
+    Claw.shutdown!(a_default; timeout_s = 5)
 end
 
 # ============================================================================
@@ -571,6 +588,8 @@ end
     @test count_rows(a1.db, "claw_event_types") == 1
 
     # Close first db to release lock, simulating process exit
+    Claw.close_writer!(a1._writer)
+    Claw.close_readers!(a1._readers)
     close(a1.db)
 
     # Second init with same db_path: simulates restart
@@ -581,7 +600,7 @@ end
     Claw.CURRENT_ASSISTANT[] = a2
 
     # Purge ephemeral tables (as init! does)
-    SQLite.DBInterface.execute(a2.db, "DELETE FROM claw_event_types")
+    Claw._exec!(a2.db, "DELETE FROM claw_event_types")
 
     @test isempty(a2._channels)  # fresh instance, no channels registered yet
     @test count_rows(a2.db, "claw_event_types") == 0  # purged
@@ -610,6 +629,9 @@ end
     @test occursin("es_handler", result)
 
     # Clean up temp file
+    Claw.close_writer!(a2._writer)
+    Claw.close_readers!(a2._readers)
+    close(a2.db)
     rm(db_path; force=true)
     rm(db_path * "-wal"; force=true)
     rm(db_path * "-shm"; force=true)

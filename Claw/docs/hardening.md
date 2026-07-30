@@ -109,9 +109,10 @@ Failure classification is already implemented for the watcher
 
 | class | policy |
 |---|---|
-| `:rate_limit`, `:overloaded`, `:network` | retry with backoff `[30s, 1m, 5m, 15m, 60m]`, max 5 attempts |
+| `:rate_limit`, `:overloaded`, `:network` | retry with backoff `[30s, 1m, 5m, 15m]`, max 5 total attempts |
 | `:auth`, `:billing` | do **not** retry; mark `dead`, notify the owner channel |
-| `:unknown` | retry twice, then `dead` |
+| `:unknown`, `:stalled`, `:overrun` | retry twice, then `dead` |
+| `:off_track`, `:unsafe_to_retry` | do **not** retry; mark `dead` |
 | `:aborted` (shutdown) | return to `pending`, no attempt increment |
 
 Exhausted retries → `status='dead'` with `last_error`, plus a best-effort apology on
@@ -228,8 +229,8 @@ deserves its own review.
 - **GitHub**: secret is already mandatory as of the round-1 fixes. Using
   `X-GitHub-Delivery` as the `dedup_key` is **blocked upstream**: GitHub.jl's
   `WebhookEvent` carries only `(kind, payload, repository, sender)`, so the header
-  never reaches the callback. Needs a GitHub.jl change; until then GitHub events are
-  deduped only by content, not by delivery id.
+  never reaches the callback. Needs a GitHub.jl change; until then GitHub events have
+  at-least-once delivery but no redelivery deduplication.
 - Default all HTTP-listening sources to `127.0.0.1` unless a host is set explicitly,
   so the safe deployment (behind a proxy) is the default one.
 
@@ -284,9 +285,9 @@ single-user instance.)
   lanes default to 1-per-channel (a behavior change, but the current concurrency is a
   race, not a feature), retries default on, dedup defaults on where a source provides
   an id.
-- `trust` defaults to `:untrusted` for source-registered handlers, which **will**
-  remove tools from existing automations. This is intentional and is the one change
-  that requires reading release notes; the owner list is how you opt back in.
+- `trust` defaults to `:owner`, as decided above. Existing automations keep their
+  tools. Operators must mark handlers fed by third-party content as `:untrusted`;
+  startup warnings make any remaining owner-tier exposure visible.
 
 ## Testing strategy
 

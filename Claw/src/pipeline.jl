@@ -100,6 +100,10 @@ function register_rehydrator!(source_tag::String, f::Function)
     lock(EVENT_REHYDRATORS_LOCK) do
         EVENT_REHYDRATORS[source_tag] = f
     end
+    assistant = CURRENT_ASSISTANT[]
+    if assistant !== nothing && assistant._state[] === :running
+        _rehydration_ready!(assistant)
+    end
     return f
 end
 
@@ -146,7 +150,7 @@ end
 function _register_builtin_rehydrators!()
     register_rehydrator!("repl", row -> ReplInputEvent(row.content, ReplChannel()))
     register_rehydrator!("tempus", row -> TempusJobEvent(row.name))
-    register_rehydrator!("llmtools", channel_lookup_rehydrator)
+    register_rehydrator!("llmtools", _rehydrate_llmtools_event)
     register_rehydrator!("claw", channel_lookup_rehydrator)
     return nothing
 end
@@ -164,8 +168,12 @@ Returns `(:pending | :retry | :dead, delay_s)`.
 """
 function _retry_decision(cfg::PipelineConfig, class::Symbol, attempts::Int)
     class === :aborted && return (:pending, 0.0)
-    (class === :auth || class === :billing) && return (:dead, 0.0)
-    max_attempts = class === :unknown ? cfg.unknown_max_attempts : cfg.max_attempts
+    (class === :auth || class === :billing || class === :off_track ||
+        class === :unsafe_to_retry) &&
+        return (:dead, 0.0)
+    max_attempts = class in (:unknown, :stalled, :overrun) ?
+        cfg.unknown_max_attempts :
+        cfg.max_attempts
     attempts >= max_attempts && return (:dead, 0.0)
     isempty(cfg.retry_backoff_s) && return (:dead, 0.0)
     idx = min(max(attempts, 1), length(cfg.retry_backoff_s))
@@ -200,6 +208,12 @@ stop!(::EventSource) = nothing
 
 # ─── JSON payload helpers ───
 
+struct EventPayloadError <: Exception
+    detail::String
+end
+Base.showerror(io::IO, err::EventPayloadError) =
+    print(io, "invalid persisted event payload: ", err.detail)
+
 function _encode_payload(channel_id, content::String, extra::Dict{String, Any})
     return JSON.json(Dict{String, Any}(
         "channel_id" => channel_id,
@@ -212,20 +226,33 @@ function _decode_payload(payload::AbstractString)
     parsed = try
         JSON.parse(payload)
     catch e
-        @error "Claw: unparseable event payload" exception = (e,)
-        return (nothing, "", Dict{String, Any}())
+        throw(EventPayloadError(sprint(showerror, e)))
     end
-    parsed isa AbstractDict || return (nothing, "", Dict{String, Any}())
+    parsed isa AbstractDict || throw(EventPayloadError("top-level value is not an object"))
     raw_cid = get(() -> nothing, parsed, "channel_id")
-    cid = (raw_cid === nothing || raw_cid === missing) ? nothing : String(raw_cid)
+    cid = if raw_cid === nothing || raw_cid === missing
+        nothing
+    elseif raw_cid isa AbstractString
+        String(raw_cid)
+    else
+        throw(EventPayloadError("channel_id is not a string or null"))
+    end
     raw_content = get(() -> "", parsed, "content")
-    content = raw_content === nothing ? "" : String(raw_content)
+    content = if raw_content === nothing
+        ""
+    elseif raw_content isa AbstractString
+        String(raw_content)
+    else
+        throw(EventPayloadError("content is not a string or null"))
+    end
     raw_extra = get(() -> nothing, parsed, "extra")
     extra = Dict{String, Any}()
     if raw_extra isa AbstractDict
         for (k, v) in raw_extra
             extra[String(k)] = v
         end
+    elseif raw_extra !== nothing
+        throw(EventPayloadError("extra is not an object or null"))
     end
     return (cid, content, extra)
 end
@@ -261,7 +288,8 @@ end
     submit_event!(assistant, ev; source, dedup_key, lane) -> Union{Nothing, Int}
 
 Persist-then-dispatch. Returns the new rowid, or `nothing` when the event was a
-duplicate delivery (UNIQUE `dedup_key` collision) or the pipeline is shut down.
+duplicate delivery (UNIQUE `dedup_key` collision). Preparation and persistence
+failures throw so an upstream source does not acknowledge an event that Claw lost.
 
 Sources must call this *before* acknowledging upstream — that ordering is the
 single change that converts the pipeline from at-most-once to at-least-once.
@@ -271,12 +299,13 @@ function submit_event!(assistant::AgentAssistant, ev::Event;
         dedup_key::Union{Nothing, AbstractString} = event_dedup_key(ev),
         lane::Union{Nothing, AbstractString} = nothing,
     )
-    assistant._state[] in (:stopping, :stopped) && return nothing
+    assistant._state[] in (:stopping, :stopped) &&
+        error("Claw: cannot persist event while the pipeline is $(assistant._state[])")
     name = try
         get_name(ev)
     catch e
         @error "Claw: event rejected; get_name failed" event_type = typeof(ev) exception = (e, catch_backtrace())
-        return nothing
+        rethrow()
     end
     cid = nothing
     if ev isa ChannelEvent
@@ -284,19 +313,20 @@ function submit_event!(assistant::AgentAssistant, ev::Event;
             Agentif.channel_id(get_channel(ev))
         catch e
             @error "Claw: event rejected; get_channel failed" event_name = name exception = (e, catch_backtrace())
-            return nothing
+            rethrow()
         end
     end
     content = try
         event_content(ev)
     catch e
-        @error "Claw: event content failed to render; persisting empty content" event_name = name exception = (e, catch_backtrace())
-        ""
+        @error "Claw: event rejected; content failed to render" event_name = name exception = (e, catch_backtrace())
+        rethrow()
     end
     extra = try
         event_extra(ev)
-    catch
-        Dict{String, Any}()
+    catch e
+        @error "Claw: event rejected; metadata failed to render" event_name = name exception = (e, catch_backtrace())
+        rethrow()
     end
     lane_key = lane === nothing ? event_lane(ev) : String(lane)
     payload = _encode_payload(cid, String(content), extra)
@@ -316,8 +346,8 @@ function submit_event!(assistant::AgentAssistant, ev::Event;
             end
         end
     catch e
-        @error "Claw: failed to persist event; dropping" event_name = name exception = (e, catch_backtrace())
-        return nothing
+        @error "Claw: failed to persist event" event_name = name exception = (e, catch_backtrace())
+        rethrow()
     end
 
     if id === nothing
@@ -405,7 +435,22 @@ function _claim_event!(assistant::AgentAssistant, id::Int)
         result = nothing
         for row in SQLite.DBInterface.execute(db,
                 "SELECT id, source, name, dedup_key, payload, lane, attempts FROM claw_events WHERE id = ?", (id,))
-            cid, content, extra = _decode_payload(String(row.payload))
+            cid, content, extra = try
+                _decode_payload(String(row.payload))
+            catch e
+                if e isa EventPayloadError
+                    detail = first(sprint(showerror, e), 4000)
+                    _exec!(db, """
+                        UPDATE claw_events
+                        SET status='dead', lease_expires_at=NULL, last_error=?
+                        WHERE id=?
+                    """, (detail, id))
+                    @error "Claw: corrupt persisted event dead-lettered" event_id = id error = detail
+                    _forget_live_event!(assistant, id)
+                    return nothing
+                end
+                rethrow()
+            end
             result = EventRow(Int(row.id), String(row.source), String(row.name), _sqlite_str(row.dedup_key),
                 cid, content, extra, String(row.lane), Int(row.attempts), assistant)
         end
@@ -643,7 +688,14 @@ function _process_event!(assistant::AgentAssistant, id::Int)
     try
         for handler in handlers
             @info "Claw: running handler" handler_id = handler.id event_name = row.name event_id = id attempt = row.attempts
-            RUN_EVENT_HANDLER_FN[](assistant, ev, handler; level = assistant.log_level, abort = abort)
+            RUN_EVENT_HANDLER_FN[](
+                assistant,
+                ev,
+                handler;
+                level = assistant.log_level,
+                abort,
+                pipeline_managed = true,
+            )
             @info "Claw: handler completed" handler_id = handler.id event_name = row.name duration_s = round(time() - started_at; digits = 4)
         end
         _finish_event!(assistant, id, "done")
@@ -737,6 +789,23 @@ function _recover_events!(assistant::AgentAssistant)
     return n
 end
 
+function _rehydration_ready!(assistant::AgentAssistant)
+    # A source can only build its runtime channels after start!. Events that were
+    # recovered before that point are parked with a long retry delay. Wake those
+    # rows as soon as any source registers channels instead of waiting a minute.
+    try
+        execute_write(assistant._writer, """
+            UPDATE claw_events
+            SET next_attempt_at = ?
+            WHERE status = 'pending' AND last_error LIKE 'no rehydrator for source %'
+        """, (time(),))
+        _scan_due_events!(assistant)
+    catch e
+        @debug "Claw: failed to wake events after channel registration" exception = (e,)
+    end
+    return nothing
+end
+
 # ─── Event loop ───
 
 function start_event_loop!(assistant::AgentAssistant; level::Union{Nothing, LogLevel} = assistant.log_level)
@@ -793,7 +862,6 @@ function _supervise_source!(assistant::AgentAssistant, ss::SupervisedSource)
             result = start!(ss.source, assistant)
             started = true
             _journal_source!(assistant, ss.tag, "started")
-            backoff = assistant.pipeline.source_restart_backoff_s
             if result isa Task
                 ss.inner = result
                 wait(result)
@@ -854,8 +922,8 @@ function _health_loop(assistant::AgentAssistant)
             ok = try
                 is_healthy(ss.source)
             catch e
-                @warn "Claw: is_healthy threw; treating source as healthy" source = ss.tag exception = (e,)
-                true
+                @warn "Claw: is_healthy threw; treating source as unhealthy" source = ss.tag exception = (e,)
+                false
             end
             ss.healthy[] = ok
             ok && continue
@@ -999,7 +1067,16 @@ function shutdown!(assistant::AgentAssistant; timeout_s::Real = assistant.pipeli
         timedwait(idle, 5.0; pollint = 0.05)
     end
 
-    all_tasks = vcat(assistant._tasks, [l.task for l in lanes if l.task !== nothing])
+    source_tasks = Task[]
+    for ss in assistant._sources
+        ss.task === nothing || push!(source_tasks, ss.task)
+        ss.inner === nothing || push!(source_tasks, ss.inner)
+    end
+    all_tasks = vcat(
+        assistant._tasks,
+        [l.task for l in lanes if l.task !== nothing],
+        source_tasks,
+    )
     timedwait(() -> all(istaskdone, all_tasks), 5.0; pollint = 0.05)
 
     _return_claims!(assistant)
@@ -1012,6 +1089,7 @@ function shutdown!(assistant::AgentAssistant; timeout_s::Real = assistant.pipeli
     end
 
     assistant._state[] = :stopped
+    CURRENT_ASSISTANT[] === assistant && (CURRENT_ASSISTANT[] = nothing)
     notify(assistant._shutdown_complete)
     @info "Claw: shutdown complete"
     return nothing

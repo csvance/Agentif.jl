@@ -240,9 +240,19 @@ end
 Claw.event_source_tag(::SlackMessageEvent) = "slack"
 Claw.event_source_tag(::SlackReactionEvent) = "slack"
 Claw.event_extra(ev::SlackMessageEvent) = Dict{String, Any}(
-    "direct_ping" => ev.direct_ping, "user_id" => ev.channel.user_id, "ts" => ev.channel.source_ts)
+    "direct_ping" => ev.direct_ping,
+    "user_id" => ev.channel.user_id,
+    "user_name" => ev.channel.user_name,
+    "channel_type" => ev.channel.channel_type,
+    "ts" => ev.channel.source_ts,
+)
 Claw.event_extra(ev::SlackReactionEvent) = Dict{String, Any}(
-    "emoji" => ev.emoji, "user_name" => ev.user_name, "reacted_to_ts" => ev.reacted_to_ts)
+    "emoji" => ev.emoji,
+    "user_id" => ev.channel.user_id,
+    "user_name" => ev.user_name,
+    "channel_type" => ev.channel.channel_type,
+    "reacted_to_ts" => ev.reacted_to_ts,
+)
 
 # ─── Event Types & Handlers ───
 
@@ -305,28 +315,44 @@ function Claw.get_event_handlers(::SlackEventSource)
     ]
 end
 
-# Slack channel ids round-trip as "slack:<channel>[:<thread_ts>]", so a replayed
-# event can rebuild its channel from the live web client rather than needing the
-# original object to have survived the restart.
-function _rehydrate_slack_channel(source::SlackEventSource, channel_id::Union{Nothing, String})
+# Slack channel ids preserve the session branch. The event metadata separately
+# preserves the source message id, which is also the reply root for a top-level
+# message. Both are needed after a restart.
+function _rehydrate_slack_channel(source::SlackEventSource, row)
+    channel_id = row.channel_id
     channel_id === nothing && return nothing
     wc = source.web_client
     wc === nothing && return nothing
     m = match(r"^slack:([^:]+)(?::(.+))?$", channel_id)
     m === nothing && return nothing
     chan = String(m.captures[1])
-    thread_ts = m.captures[2] === nothing ? "" : String(m.captures[2])
+    source_ts = let value = get(() -> "", row.extra, "ts")
+        value isa AbstractString && !isempty(value) ? String(value) : begin
+            reacted = get(() -> "", row.extra, "reacted_to_ts")
+            reacted isa AbstractString ? String(reacted) : ""
+        end
+    end
+    # Top-level messages use their own ts as the reply root while retaining the
+    # base conversation branch. True thread replies use the root from channel_id.
+    thread_ts = m.captures[2] === nothing ? source_ts : String(m.captures[2])
     recipient_team_id = let v = strip(source.recipient_team_id); isempty(v) ? nothing : String(v); end
     recipient_user_id = let v = strip(source.recipient_user_id); isempty(v) ? nothing : String(v); end
-    channel_type = _infer_channel_type(chan)
-    # source_ts left empty so `_is_thread` reflects the persisted channel id.
-    return SlackChannel(chan, thread_ts, "", "", wc, nothing, nothing, "", "", channel_type,
+    channel_type = let value = get(() -> "", row.extra, "channel_type")
+        value isa AbstractString && !isempty(value) ? String(value) : _infer_channel_type(chan)
+    end
+    user_id = let value = get(() -> "", row.extra, "user_id")
+        value isa AbstractString ? String(value) : ""
+    end
+    user_name = let value = get(() -> "", row.extra, "user_name")
+        value isa AbstractString ? String(value) : ""
+    end
+    return SlackChannel(chan, thread_ts, "", source_ts, wc, nothing, nothing, user_id, user_name, channel_type,
         recipient_team_id, recipient_user_id, "")
 end
 
 function _register_slack_rehydrator!(source::SlackEventSource)
     Claw.register_rehydrator!("slack", function (row)
-        ch = _rehydrate_slack_channel(source, row.channel_id)
+        ch = _rehydrate_slack_channel(source, row)
         ch === nothing && return nothing
         return Claw.ReplayedChannelEvent(row.name, row.content, ch)
     end)

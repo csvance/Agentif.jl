@@ -73,11 +73,11 @@ function register_test_handler!(a; id = "pipeline_test_handler", channel_id = no
     return nothing
 end
 
-event_row(a, id::Int) = iterate(SQLite.DBInterface.execute(a.db,
-    "SELECT status, attempts, last_error, next_attempt_at FROM claw_events WHERE id = ?", (id,)))[1]
+event_row(a, id::Int) = Claw._fetch_one(a.db,
+    "SELECT status, attempts, last_error, next_attempt_at FROM claw_events WHERE id = ?", (id,))
 
-count_rows(a, sql, params = ()) = Int(iterate(SQLite.DBInterface.execute(a.db,
-    "SELECT COUNT(*) AS n FROM claw_events " * sql, params))[1].n)
+count_rows(a, sql, params = ()) =
+    Int(Claw._fetch_one(a.db, "SELECT COUNT(*) AS n FROM claw_events " * sql, params).n)
 
 # Swap the handler runner for the duration of `f` (same `*_FN` seam convention the
 # extension tests use), so the pipeline can be exercised without an LLM.
@@ -114,7 +114,7 @@ const FAST = (; scan_interval_s = 0.05, min_refire_gap_s = 0.05, lane_backlog_wa
             "INSERT INTO claw_source_journal (ts, source, action, detail) VALUES (?, ?, ?, ?)",
             (time(), "test", "probe", "x"))
         n = Claw.with_read(a._readers) do db
-            Int(iterate(SQLite.DBInterface.execute(db, "SELECT COUNT(*) AS n FROM claw_source_journal"))[1].n)
+            Int(Claw._fetch_one(db, "SELECT COUNT(*) AS n FROM claw_source_journal").n)
         end
         @test n == 1
 
@@ -125,8 +125,8 @@ const FAST = (; scan_interval_s = 0.05, min_refire_gap_s = 0.05, lane_backlog_wa
             (time(), "test", "concurrent", string(i))) for i in 1:20]
         foreach(wait, tasks)
         @test count_rows(a, "") == 0
-        journal_n = Int(iterate(SQLite.DBInterface.execute(a.db,
-            "SELECT COUNT(*) AS n FROM claw_source_journal"))[1].n)
+        journal_n = Int(Claw._fetch_one(a.db,
+            "SELECT COUNT(*) AS n FROM claw_source_journal").n)
         @test journal_n == 21
 
         # Re-running migrations on an existing database is a no-op.
@@ -170,6 +170,18 @@ end
     end
 end
 
+@testset "submission failures propagate so sources do not acknowledge loss" begin
+    a = make_assistant(":memory:"; FAST...)
+    ch = RecordingChannel("persist-failure")
+    Claw.close_writer!(a._writer)
+    @test_throws ErrorException Claw.submit_event!(
+        a,
+        PipelineTestEvent("must not be acknowledged", ch),
+    )
+    Claw.close_readers!(a._readers)
+    close(a.db)
+end
+
 # ─── §1.3 Failure classification + retry policy (pure) ───
 
 @testset "classify_eval_failure + retry policy table" begin
@@ -199,7 +211,7 @@ end
     @test Claw.classify_eval_failure(TaskFailedException(failed_task)) == :rate_limit
 
     cfg = Claw.PipelineConfig()
-    @test cfg.retry_backoff_s == [30.0, 60.0, 300.0, 900.0, 3600.0]
+    @test cfg.retry_backoff_s == [30.0, 60.0, 300.0, 900.0]
     for class in (:rate_limit, :overloaded, :network)
         @test Claw._retry_decision(cfg, class, 1) == (:retry, 30.0)
         @test Claw._retry_decision(cfg, class, 2) == (:retry, 60.0)
@@ -210,10 +222,14 @@ end
     # :auth / :billing never retry.
     @test Claw._retry_decision(cfg, :auth, 1) == (:dead, 0.0)
     @test Claw._retry_decision(cfg, :billing, 1) == (:dead, 0.0)
-    # :unknown retries twice, then dies.
-    @test Claw._retry_decision(cfg, :unknown, 1)[1] == :retry
-    @test Claw._retry_decision(cfg, :unknown, 2)[1] == :retry
-    @test Claw._retry_decision(cfg, :unknown, 3)[1] == :dead
+    @test Claw._retry_decision(cfg, :unsafe_to_retry, 1) == (:dead, 0.0)
+    @test Claw._retry_decision(cfg, :off_track, 1) == (:dead, 0.0)
+    # Unknown and watcher-policy failures retry twice, then die.
+    for class in (:unknown, :stalled, :overrun)
+        @test Claw._retry_decision(cfg, class, 1)[1] == :retry
+        @test Claw._retry_decision(cfg, class, 2)[1] == :retry
+        @test Claw._retry_decision(cfg, class, 3)[1] == :dead
+    end
     # :aborted returns to pending without charging an attempt.
     @test Claw._retry_decision(cfg, :aborted, 4) == (:pending, 0.0)
     # The 2s minimum refire gap wins over a shorter configured backoff.
@@ -491,6 +507,7 @@ end
             Claw.start_event_loop!(recovered)
             @test Claw._recover_events!(recovered) >= 1
             @test timedwait(() -> length(seen) == 1, 20.0) == :ok
+            @test timedwait(() -> event_row(recovered, id).status == "done", 20.0) == :ok
         end
         # Rehydrated through the channel registry, not the (dead) live object.
         @test seen == ["survive me"]
@@ -620,8 +637,8 @@ end
         # An aborted eval is returned to pending with no attempt charged, so the
         # next boot picks it up again.
         probe = SQLite.DB(path)
-        row = iterate(SQLite.DBInterface.execute(probe,
-            "SELECT status, attempts FROM claw_events WHERE id = ?", (id,)))[1]
+        row = Claw._fetch_one(probe,
+            "SELECT status, attempts FROM claw_events WHERE id = ?", (id,))
         @test row.status == "pending"
         @test row.attempts == 0
         close(probe)
@@ -668,9 +685,10 @@ end
                 level = :error, install_signal_handlers = false,
                 pipeline = Claw.PipelineConfig(; FAST...),
             )
-            a._channels[ch.id] = ch      # the owning source re-registers its channel
+            Claw.register_channels!(a, [ch])  # the owning source re-registers its channel
             @test a._state[] == :running
             @test !a._signal_handler_installed[]
+            @test any(ss -> ss.source isa Claw.LLMToolsEventSource, a._sources)
             @test timedwait(() -> length(seen) == 1, 20.0) == :ok
         end
         @test seen == ["from a previous life"]
@@ -710,13 +728,13 @@ Claw.get_tools(::InvalidSource) = Agentif.AgentTool[]
 Claw.validate_source(::InvalidSource) = error("missing MY_TOKEN")
 Claw.start!(::InvalidSource, ::Claw.AgentAssistant) = error("should never be started")
 
-journal_count(a, source, action) = Int(iterate(SQLite.DBInterface.execute(a.db,
+journal_count(a, source, action) = Int(Claw._fetch_one(a.db,
     "SELECT COUNT(*) AS n FROM claw_source_journal WHERE source = ? AND action = ?",
-    (source, action)))[1].n)
+    (source, action)).n)
 
 @testset "source restarts are capped and never take down the others" begin
     a = make_assistant(":memory:";
-        source_restart_cap = 2, source_restart_backoff_s = 0.02,
+        source_restart_cap = 2, source_restart_backoff_s = 0.1,
         source_health_interval_s = 3600.0, FAST...)
     Claw.CURRENT_ASSISTANT[] = a
     flaky = FlakySource()
@@ -724,10 +742,12 @@ journal_count(a, source, action) = Int(iterate(SQLite.DBInterface.execute(a.db,
     invalid = InvalidSource()
 
     Claw.start_event_loop!(a)
+    started_at = time()
     Claw.start_sources!(a, Claw.EventSource[invalid, flaky, healthy])
 
     # Initial start + 2 restarts, then the budget is exhausted.
     @test timedwait(() -> flaky.starts[] == 3, 15.0) == :ok
+    @test time() - started_at >= 0.28  # consecutive failures back off 0.1s, then 0.2s
     sleep(0.5)
     @test flaky.starts[] == 3
     @test journal_count(a, "flakysource", "restart_cap_exceeded") == 1
@@ -786,8 +806,8 @@ end
     @test Agentif.branch_id(async_ch) == "async:digest"
     @test Agentif.branch_id(async_ch) != "parent"
 
-    handler_row = iterate(SQLite.DBInterface.execute(a.db,
-        "SELECT channel_id FROM claw_event_handlers WHERE id = ?", ("subagent:digest",)))[1]
+    handler_row = Claw._fetch_one(a.db,
+        "SELECT channel_id FROM claw_event_handlers WHERE id = ?", ("subagent:digest",))
     @test handler_row.channel_id == "async:digest"
 
     # The completion actually reaches the human who asked for it.
@@ -801,6 +821,28 @@ end
     Agentif.finish_streaming(async_ch)
     Agentif.close_channel(async_ch)
     @test sent_messages(origin)[end] == "partial result"
+
+    # Persisted async completions retain their origin route across a restart.
+    completion = Claw.SubagentOutputEvent("subagent:digest", "digest", "done")
+    extra = Claw.event_extra(completion)
+    @test extra["origin_channel_id"] == "origin-chat"
+    Base.delete!(a._channels, "async:digest")
+    replayed = Claw._rehydrate_llmtools_event(Claw.EventRow(
+        1,
+        "llmtools",
+        "subagent:digest",
+        nothing,
+        nothing,
+        "done",
+        extra,
+        "async",
+        1,
+        a,
+    ))
+    @test replayed isa Claw.ReplayedEvent
+    restored = a._channels["async:digest"]
+    Agentif.send_message(restored, "after restart")
+    @test sent_messages(origin)[end] == "after restart"
 
     Claw._cleanup_session!(es, "digest")
     @test !haskey(a._channels, "async:digest")
@@ -833,6 +875,53 @@ end
 end
 
 if !Sys.iswindows()
+    @testset "PTY cleanup cannot discard unread final output" begin
+        a = make_assistant(":memory:"; pty_notify_interval_s = 5.0, FAST...)
+        Claw.CURRENT_ASSISTANT[] = a
+        es = Claw.LLMToolsEventSource(a.config)
+        tools = Claw.get_tools(es)
+        start_pty = tools[findfirst(t -> t.name == "start_pty", tools)].func
+
+        sync_output = start_pty("sync-race", "printf sync-sentinel; exit 9",
+            nothing, nothing, true)
+        @test occursin("sync-sentinel", sync_output)
+
+        exit_gate = tempname()
+        start_pty("cleanup-race",
+            "printf final-sentinel; while [ ! -f '$exit_gate' ]; do sleep 0.01; done; exit 7",
+            nothing, nothing, nothing)
+        registry_id = lock(es.lock) do
+            es.sessions["cleanup-race"].registry_id
+        end
+        # Hold the poller before its removal step, then let the process exit.
+        # This creates the old cleanup race deterministically.
+        lock(es.lock)
+        try
+            write(exit_gate, "exit")
+            @test timedwait(() -> begin
+                meta = Claw.LLMTools.get_session(Claw.LLMTools.PTY_REGISTRY, registry_id)
+                meta !== nothing && !Claw.LLMTools.PtySessions.isactive(meta.session)
+            end, 5.0) == :ok
+
+            # Claw owns this session until its poller drains the PTY, so the
+            # generic sweep must leave the exited session open.
+            Claw.LLMTools.cleanup_exited_sessions!(Claw.LLMTools.PTY_REGISTRY)
+            @test Claw.LLMTools.get_session(Claw.LLMTools.PTY_REGISTRY, registry_id) !== nothing
+        finally
+            unlock(es.lock)
+            rm(exit_gate; force = true)
+        end
+
+        @test timedwait(() -> count_rows(a, "WHERE name = ?", ("pty:cleanup-race",)) == 1, 10.0) == :ok
+        payload = String(Claw._fetch_one(a.db,
+            "SELECT payload FROM claw_events WHERE name = ? ORDER BY id DESC LIMIT 1",
+            ("pty:cleanup-race",)).payload)
+        @test occursin("final-sentinel", payload)
+        @test occursin("[Process exited with code 7]", payload)
+        @test Claw.LLMTools.get_session(Claw.LLMTools.PTY_REGISTRY, registry_id) === nothing
+        Claw.shutdown!(a; timeout_s = 5)
+    end
+
     @testset "PTY output is coalesced into few events with the real exit code" begin
         a = make_assistant(":memory:"; pty_notify_interval_s = 1.5, pty_max_event_bytes = 4096, FAST...)
         Claw.CURRENT_ASSISTANT[] = a
@@ -854,8 +943,8 @@ if !Sys.iswindows()
 
         n = count_rows(a, "WHERE name = ?", ("pty:chatty",))
         @test 1 <= n <= 5                          # not one per 0.5s poll
-        last_payload = String(iterate(SQLite.DBInterface.execute(a.db,
-            "SELECT payload FROM claw_events WHERE name = ? ORDER BY id DESC LIMIT 1", ("pty:chatty",)))[1].payload)
+        last_payload = String(Claw._fetch_one(a.db,
+            "SELECT payload FROM claw_events WHERE name = ? ORDER BY id DESC LIMIT 1", ("pty:chatty",)).payload)
         @test occursin("[Process exited with code 3]", last_payload)
         @test occursin("line-40", last_payload)
         Claw.shutdown!(a; timeout_s = 5)
@@ -874,8 +963,24 @@ end
     cid2, content2, _ = Claw._decode_payload(Claw._encode_payload(nothing, "", Dict{String, Any}()))
     @test cid2 === nothing
     @test content2 == ""
-    # Unparseable payload degrades instead of throwing.
-    @test Claw._decode_payload("not json")[2] == ""
+    @test_throws Claw.EventPayloadError Claw._decode_payload("not json")
+end
+
+@testset "corrupt persisted payload is dead-lettered" begin
+    a = make_assistant(":memory:"; FAST...)
+    id = Claw.execute_write(a._writer) do db
+        Claw._exec!(db, """
+            INSERT INTO claw_events
+                (source, name, payload, status, attempts, lane, created_at, next_attempt_at)
+            VALUES ('claw', 'pipeline_test_event', 'not json', 'pending', 0, 'default', ?, ?)
+        """, (time(), time()))
+        Int(Claw._scalar(db, "SELECT last_insert_rowid()"))
+    end
+    @test Claw._claim_event!(a, id) === nothing
+    row = event_row(a, id)
+    @test row.status == "dead"
+    @test occursin("invalid persisted event payload", String(row.last_error))
+    Claw.shutdown!(a; timeout_s = 5)
 end
 
 

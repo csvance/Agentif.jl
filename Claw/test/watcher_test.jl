@@ -272,6 +272,35 @@ end
     println("  ✓ 429 failure + fallback passed")
 end
 
+@testset "Durable pipeline receives watcher failures for retry" begin
+    a = make_watcher_assistant(; watcher = watcher_cfg())
+    ch = RecordingChannel("rec-durable-429")
+    a._channels[ch.id] = ch
+    ev = WatcherTestEvent("test_event", "process durable event")
+    handler = (; id = "h-durable-429", prompt = "Test prompt", channel_id = ch.id)
+    err = HTTP.StatusError(429, "POST", "/v1/messages", HTTP.Response(429))
+    failure = try
+        Claw._run_event_handler!(
+            a,
+            ev,
+            handler;
+            pipeline_managed = true,
+            base_handler = make_throwing_handler(err),
+        )
+        nothing
+    catch e
+        e
+    end
+    @test failure isa Claw.SupervisedEvaluationFailure
+    @test Claw.classify_eval_failure(failure) === :rate_limit
+    row = only(fetch_evals(a.db))
+    @test row.status == "failed"
+    @test row.failure_class == "rate_limit"
+    @test row.fallback_sent == 0
+    @test isempty(ch.sent)  # pipeline notifies only if all retry attempts fail
+    Claw.shutdown!(a; timeout_s = 5)
+end
+
 @testset "Soft stream error: returned :error state triggers fallback" begin
     a = make_watcher_assistant(; watcher = watcher_cfg())
     ch = RecordingChannel("rec-soft-error")
@@ -329,6 +358,7 @@ end
     @test length(rows) == 1
     row = rows[1]
     @test row.status == "stalled"
+    @test row.failure_class == "unsafe_to_retry"
     @test row.fallback_sent == 1
     @test ch.sent == Any["Canned watcher note."]
     @test occursin("zombie", something(row.error, ""))
@@ -469,6 +499,8 @@ end
         VALUES ('crash_event', 'h-crash', 'running', ?, ?)
     """, (time(), time()))
     @test fetch_evals(a1.db)[1].status == "running"
+    Claw.close_writer!(a1._writer)
+    Claw.close_readers!(a1._readers)
     close(a1.db)  # simulate process exit
 
     a2 = Claw.init!(db_path;
@@ -483,9 +515,7 @@ end
     @test rows[1].finished_at !== missing
 
     # Teardown the init!-started machinery
-    close(a2.event_queue)
-    close(a2.scheduler)
-    close(a2.db)
+    Claw.shutdown!(a2; timeout_s=5)
     rm(db_path; force = true)
     rm(db_path * "-wal"; force = true)
     rm(db_path * "-shm"; force = true)

@@ -134,6 +134,16 @@ end
 
 # ─── Failure classification ───
 
+struct SupervisedEvaluationFailure <: Exception
+    failure_class::Symbol
+    status::String
+    detail::String
+end
+
+function Base.showerror(io::IO, err::SupervisedEvaluationFailure)
+    print(io, "supervised evaluation ", err.status, " (", err.failure_class, "): ", err.detail)
+end
+
 function _unwrap_error(err)
     e = err
     for _ in 1:20
@@ -159,6 +169,7 @@ CapturedException layers) to a failure class:
 """
 function classify_eval_failure(err)
     e = _unwrap_error(err)
+    e isa SupervisedEvaluationFailure && return e.failure_class
     if e isa HTTP.StatusError
         s = Int(e.status)
         s == 429 && return :rate_limit
@@ -193,56 +204,63 @@ end
 
 # ─── Journal (claw_evals) ───
 
-const WATCHER_JOURNAL_LOCK = ReentrantLock()
-
-function _journal_insert!(db::SQLite.DB, event_name::String, handler_id::String, channel_id::Union{Nothing, String}, started::Float64)
-    # Lock so concurrent handler tasks can't interleave INSERT/last_insert_rowid.
-    return lock(WATCHER_JOURNAL_LOCK) do
+function _journal_insert!(assistant, event_name::String, handler_id::String, channel_id::Union{Nothing, String}, started::Float64)
+    # INSERT and last_insert_rowid must run as one request on the pipeline's
+    # dedicated writer connection. This also prevents watcher tasks from sharing
+    # one SQLite handle concurrently.
+    return execute_write(assistant._writer) do db
         _with_busy_retry() do
-            SQLite.DBInterface.execute(db, """
+            _exec!(db, """
                 INSERT INTO claw_evals (event_name, handler_id, channel_id, status, started_at, last_activity_at)
                 VALUES (?, ?, ?, 'running', ?, ?)
             """, (event_name, handler_id, channel_id, started, started))
-            row = iterate(SQLite.DBInterface.execute(db, "SELECT last_insert_rowid() AS id"))
-            return Int(row[1].id)
+            return Int(_scalar(db, "SELECT last_insert_rowid()"))
         end
     end
 end
 
-function _journal_activity!(db::SQLite.DB, ws::WatchState)
-    _with_busy_retry() do
-        SQLite.DBInterface.execute(db,
+function _journal_activity!(assistant, ws::WatchState)
+    execute_write(assistant._writer) do db
+        _with_busy_retry() do
+            _exec!(db,
             "UPDATE claw_evals SET last_activity_at = ?, turns = ?, tool_calls = ? WHERE id = ?",
             (ws.last_activity[], ws.turns[], ws.tool_calls[], ws.eval_id))
-        return nothing
+            return nothing
+        end
     end
 end
 
-function _journal_note!(db::SQLite.DB, eval_id::Int, note::String)
-    _with_busy_retry() do
-        SQLite.DBInterface.execute(db,
+function _journal_note!(assistant, eval_id::Int, note::String)
+    execute_write(assistant._writer) do db
+        _with_busy_retry() do
+            _exec!(db,
             "UPDATE claw_evals SET watcher_note = ? WHERE id = ?", (note, eval_id))
-        return nothing
+            return nothing
+        end
     end
 end
 
-function _journal_fallback!(db::SQLite.DB, eval_id::Int, note::String, sent::Bool)
-    _with_busy_retry() do
-        SQLite.DBInterface.execute(db,
+function _journal_fallback!(assistant, eval_id::Int, note::String, sent::Bool)
+    execute_write(assistant._writer) do db
+        _with_busy_retry() do
+            _exec!(db,
             "UPDATE claw_evals SET fallback_sent = ?, watcher_note = ? WHERE id = ?",
             (sent ? 1 : 0, note, eval_id))
-        return nothing
+            return nothing
+        end
     end
 end
 
-function _journal_finalize!(db::SQLite.DB, ws::WatchState; status::String, failure_class::Union{Nothing, String}, error::Union{Nothing, String})
-    _with_busy_retry() do
-        SQLite.DBInterface.execute(db, """
+function _journal_finalize!(assistant, ws::WatchState; status::String, failure_class::Union{Nothing, String}, error::Union{Nothing, String})
+    execute_write(assistant._writer) do db
+        _with_busy_retry() do
+            _exec!(db, """
             UPDATE claw_evals SET status = ?, failure_class = ?, error = ?, finished_at = ?,
                 last_activity_at = ?, turns = ?, tool_calls = ?
             WHERE id = ?
         """, (status, failure_class, error, time(), ws.last_activity[], ws.turns[], ws.tool_calls[], ws.eval_id))
-        return nothing
+            return nothing
+        end
     end
 end
 
@@ -394,21 +412,23 @@ Run one event-handler evaluation under watcher supervision (see docs/watcher.md)
 journal to `claw_evals`, observe liveness via `watch_observer`, abort on stall or
 overrun, and on failure/stall/overrun send a watcher-composed note to `ch` (unless
 `ch` is a `SinkChannel`). `eval_kw` is forwarded to `evaluate` (test seam for
-`base_handler` injection). Never throws for eval failures — they are journaled.
+`base_handler` injection). By default eval failures are journaled and consumed.
+With `propagate_failure=true`, the durable pipeline receives a classified
+`SupervisedEvaluationFailure` and owns retry and dead-letter notification.
 """
 function supervised_evaluate(assistant, ev::Event, handler, ch::Agentif.AbstractChannel;
         level = assistant.log_level,
         abort::Union{Nothing, Agentif.Abort} = nothing,
+        propagate_failure::Bool = false,
         eval_kw...)
     cfg = assistant.watcher
     cfg isa WatcherConfig ||
         throw(ArgumentError("supervised_evaluate requires a configured watcher"))
-    db = assistant.db
     event_name = get_name(ev)
     input = make_prompt(handler.prompt, ev)
     started = time()
     started_monotonic = time_ns()
-    eval_id = _journal_insert!(db, event_name, String(handler.id), Agentif.channel_id(ch), started)
+    eval_id = _journal_insert!(assistant, event_name, String(handler.id), Agentif.channel_id(ch), started)
     ws = WatchState(eval_id)
     observer = watch_observer(ws)
     eval_abort = abort === nothing ? Agentif.Abort() : abort
@@ -420,6 +440,7 @@ function supervised_evaluate(assistant, ev::Event, handler, ch::Agentif.Abstract
     failure_class = nothing
     err_text = nothing
     result_state = nothing
+    primary_still_running = false
     try
         # Supervisor loop: small poll granularity so tiny check intervals (tests)
         # and shutdown are responsive even with large configured intervals.
@@ -446,7 +467,7 @@ function supervised_evaluate(assistant, ev::Event, handler, ch::Agentif.Abstract
             if last_journal_monotonic == 0 ||
                     Float64(now_monotonic - last_journal_monotonic) / 1.0e9 >= 2.0
                 try
-                    _journal_activity!(db, ws)
+                    _journal_activity!(assistant, ws)
                 catch e
                     @debug "Claw watcher: journal heartbeat failed" eval_id exception = (e,)
                 end
@@ -468,7 +489,7 @@ function supervised_evaluate(assistant, ev::Event, handler, ch::Agentif.Abstract
                         break
                     elseif verdict === :concern
                         @info "Claw watcher: on-track concern" eval_id note = sentence
-                        _journal_note!(db, eval_id, sentence)
+                        _journal_note!(assistant, eval_id, sentence)
                     end
                 catch e
                     @warn "Claw watcher: on-track check failed" eval_id exception = (e, catch_backtrace())
@@ -484,7 +505,7 @@ function supervised_evaluate(assistant, ev::Event, handler, ch::Agentif.Abstract
             (abort_reason === nothing || timedwait(() -> istaskdone(task), max(cfg.abort_grace_s, 0.01)) === :ok)
         if !settled
             @warn "Claw watcher: primary eval did not stop within abort grace; responding without it" eval_id grace_s = cfg.abort_grace_s
-            err_text = "primary eval task did not terminate after abort (zombie task)"
+            primary_still_running = true
         end
         try
             settled && (result_state = fetch(task))
@@ -510,21 +531,36 @@ function supervised_evaluate(assistant, ev::Event, handler, ch::Agentif.Abstract
             status = "failed"
             failure_class = String(classify_eval_failure(primary_error))
             err_text = String(first(sprint(showerror, primary_error), 2000))
+        elseif abort_reason === nothing && failure_class === nothing &&
+                result_state isa Agentif.AgentState &&
+                result_state.most_recent_stop_reason === :aborted
+            status = "aborted"
+            failure_class = "aborted"
+            err_text = "primary evaluation was aborted"
         end
         if abort_reason === :stalled
             status = "stalled"
             failure_class = "stalled"
+            err_text = "primary evaluation had no activity for more than $(cfg.stall_timeout_s)s"
         elseif abort_reason === :overrun
             status = "overrun"
             failure_class = "overrun"
+            err_text = "primary evaluation exceeded $(cfg.max_eval_duration_s)s"
         elseif abort_reason === :off_track
             status = "aborted"
             failure_class = "off_track"
+            err_text = something(ontrack_note, "watcher classified the evaluation as off track")
+        end
+        # Retrying while the old task is still running can execute the same tool
+        # side effect twice. Dead-letter this attempt instead of overlapping it.
+        if primary_still_running
+            failure_class = "unsafe_to_retry"
+            err_text = "primary eval task did not terminate after abort (zombie task)"
         end
         # Fallback response: only for error/stall/overrun/off-track terminations
         # (silent completions are NOT failures), only onto real channels.
         respond = failure_class !== nothing && failure_class != "aborted" &&
-            cfg.respond_on_failure && !(ch isa SinkChannel)
+            !propagate_failure && cfg.respond_on_failure && !(ch isa SinkChannel)
         if respond
             ctx = _watch_ctx(ws, handler, ev, event_name, started, failure_class)
             note = ontrack_note !== nothing ? ontrack_note : fallback_note_or_default(cfg, ctx)
@@ -536,18 +572,25 @@ function supervised_evaluate(assistant, ev::Event, handler, ch::Agentif.Abstract
                 @warn "Claw watcher: fallback send failed" eval_id channel_id = Agentif.channel_id(ch) exception = (e, catch_backtrace())
             end
             try
-                _journal_fallback!(db, eval_id, sent ? note : string(note, " [send failed]"), sent)
+                _journal_fallback!(assistant, eval_id, sent ? note : string(note, " [send failed]"), sent)
             catch e
                 @debug "Claw watcher: fallback journal failed" eval_id exception = (e,)
             end
         end
     finally
         try
-            _journal_finalize!(db, ws; status, failure_class, error = err_text)
+            _journal_finalize!(assistant, ws; status, failure_class, error = err_text)
         catch e
             @error "Claw watcher: journal finalize failed" eval_id exception = (e, catch_backtrace())
         end
     end
     @debug "Claw watcher: supervised evaluate end" eval_id status failure_class
-    return nothing
+    if propagate_failure && failure_class !== nothing
+        throw(SupervisedEvaluationFailure(
+            Symbol(failure_class),
+            status,
+            something(err_text, "evaluation ended without a result"),
+        ))
+    end
+    return result_state
 end

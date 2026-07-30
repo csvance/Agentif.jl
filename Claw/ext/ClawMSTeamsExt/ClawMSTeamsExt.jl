@@ -218,6 +218,43 @@ end
 
 Claw.event_source_tag(::MSTeamsMessageEvent) = "msteams"
 Claw.event_source_tag(::MSTeamsReactionEvent) = "msteams"
+function _msteams_event_extra(ch::MSTeamsChannel)
+    return Dict{String, Any}(
+        "activity" => ch.activity,
+        "user_id" => ch.user_id,
+        "user_name" => ch.user_name,
+        "message_id" => ch.message_id,
+    )
+end
+function Claw.event_extra(ev::MSTeamsMessageEvent)
+    extra = _msteams_event_extra(ev.channel)
+    extra["direct_ping"] = ev.direct_ping
+    return extra
+end
+function Claw.event_extra(ev::MSTeamsReactionEvent)
+    extra = _msteams_event_extra(ev.channel)
+    extra["reaction"] = ev.reaction
+    extra["action"] = ev.action
+    return extra
+end
+
+_extra_string(extra, key) = let value = get(() -> "", extra, key)
+    value isa AbstractString ? String(value) : ""
+end
+
+function _rehydrate_msteams_event(client::MSTeams.BotClient, row)
+    activity = get(() -> nothing, row.extra, "activity")
+    activity isa AbstractDict || return nothing
+    ch = _activity_channel(
+        activity,
+        client,
+        _extra_string(row.extra, "user_id"),
+        _extra_string(row.extra, "user_name"),
+        _extra_string(row.extra, "message_id"),
+    )
+    Agentif.channel_id(ch) == row.channel_id || return nothing
+    return Claw.ReplayedChannelEvent(row.name, row.content, ch)
+end
 
 # Bot Framework activity ids are unique per delivery.
 function _msteams_dedup_key(activity::AbstractDict, event)
@@ -245,7 +282,10 @@ function Claw.start!(source::MSTeamsEventSource, assistant::Claw.AgentAssistant)
 
     errormonitor(Threads.@spawn begin
         client = MSTeams.BotClient(; app_id=app_id, app_password=app_password)
-        Claw.register_rehydrator!("msteams", Claw.channel_lookup_rehydrator)
+        Claw.register_rehydrator!(
+            "msteams",
+            row -> _rehydrate_msteams_event(client, row),
+        )
         @info "ClawMSTeamsExt: Starting webhook server" host=source.host port=source.port path=source.path
         MSTeams.run_server(; host=source.host, port=source.port, client=client, path=source.path, health_path=source.health_path) do activity
             for event in _activity_to_events(activity, client)
