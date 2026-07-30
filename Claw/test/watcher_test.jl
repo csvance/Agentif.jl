@@ -152,6 +152,16 @@ println("=" ^ 60)
     @test !cfg.on_track_checks
     @test cfg.on_track_every_turns == 5
     @test cfg.base_handler === nothing
+    @test :WatcherConfig ∉ names(Claw)
+    @test_throws ArgumentError make_watcher_assistant(;
+        watcher = watcher_cfg(; check_interval_s = 0.0))
+    @test_throws ArgumentError make_watcher_assistant(;
+        watcher = watcher_cfg(; on_track_every_turns = 0))
+    a = make_watcher_assistant()
+    compat = AgentAssistant(
+        a.config, a.db, a._channels, a.event_queue, a.session_store, a.tools,
+        a.scheduler, a.log_level)
+    @test compat.watcher === nothing
 end
 
 @testset "classify_eval_failure" begin
@@ -159,9 +169,10 @@ end
     @test Claw.classify_eval_failure(se(429)) === :rate_limit
     @test Claw.classify_eval_failure(se(401)) === :auth
     @test Claw.classify_eval_failure(se(403)) === :auth
-    for s in (500, 502, 503, 529)
+    for s in (500, 502, 503, 504, 529)
         @test Claw.classify_eval_failure(se(s)) === :overloaded
     end
+    @test Claw.classify_eval_failure(se(408)) === :network
     @test Claw.classify_eval_failure(Agentif.AbortEvaluation()) === :aborted
     @test Claw.classify_eval_failure(EOFError()) === :network
     @test Claw.classify_eval_failure(ErrorException("provider rate limit exceeded")) === :rate_limit
@@ -192,6 +203,9 @@ end
     @test Claw._parse_on_track_verdict("ON_TRACK — no concern here")[1] === :on_track
     # Unknown/lowercase junk → lenient default
     @test Claw._parse_on_track_verdict("gibberish reply")[1] === :on_track
+    @test Claw._parse_on_track_verdict("Do not ABORT this run")[1] === :on_track
+    @test Claw._parse_on_track_verdict("CONCERN — do not ABORT") ==
+        (:concern, "do not ABORT")
     println("  ✓ on-track verdict parsing passed")
 end
 
@@ -258,6 +272,27 @@ end
     println("  ✓ 429 failure + fallback passed")
 end
 
+@testset "Soft stream error: returned :error state triggers fallback" begin
+    a = make_watcher_assistant(; watcher = watcher_cfg())
+    ch = RecordingChannel("rec-soft-error")
+    a._channels[ch.id] = ch
+    ev = WatcherTestEvent("test_event", "process event")
+    handler = (; id = "h-soft-error", prompt = "Test prompt", channel_id = ch.id)
+    soft_error_handler = function (f, agent, state, input, abort; kw...)
+        f(Agentif.AgentErrorEvent(ErrorException("provider overloaded")))
+        finish_state!(state, input; text = "partial response")
+        state.most_recent_stop_reason = :error
+        return state
+    end
+    run_handler_guarded(a, ev, handler; base_handler = soft_error_handler)
+    row = only(fetch_evals(a.db))
+    @test row.status == "failed"
+    @test row.failure_class == "overloaded"
+    @test row.error == "provider overloaded"
+    @test row.fallback_sent == 1
+    @test ch.sent == Any["Canned watcher note."]
+end
+
 @testset "Stall: abort + status stalled + fallback" begin
     a = make_watcher_assistant(; watcher = watcher_cfg(; stall_timeout_s = 0.5, check_interval_s = 0.1))
     ch = RecordingChannel("rec-stall")
@@ -318,6 +353,58 @@ end
     @test row.fallback_sent == 1
     @test ch.sent == Any["Canned watcher note."]
     println("  ✓ overrun passed")
+end
+
+@testset "Completed primary is not aborted by a stale on-track verdict" begin
+    slow_abort_verdict = function (f, agent, state, input, abort; kw...)
+        sleep(0.3)
+        return finish_state!(state, input; text = "ABORT — stale verdict")
+    end
+    cfg = watcher_cfg(;
+        on_track_checks = true,
+        on_track_every_turns = 1,
+        check_interval_s = 0.01,
+        base_handler = slow_abort_verdict,
+    )
+    a = make_watcher_assistant(; watcher = cfg)
+    ch = RecordingChannel("rec-stale-verdict")
+    a._channels[ch.id] = ch
+    ev = WatcherTestEvent("test_event", "quick work")
+    handler = (; id = "h-stale-verdict", prompt = "Test prompt", channel_id = ch.id)
+    primary = function (f, agent, state, input, abort; kw...)
+        sleep(0.1)
+        return finish_state!(state, input; text = "done")
+    end
+    run_handler_guarded(a, ev, handler; base_handler = primary)
+    row = only(fetch_evals(a.db))
+    @test row.status == "completed"
+    @test row.failure_class === missing
+    @test row.fallback_sent == 0
+    @test isempty(ch.sent)
+end
+
+@testset "On-track abort stops an active primary and sends its reason" begin
+    cfg = watcher_cfg(;
+        on_track_checks = true,
+        on_track_every_turns = 1,
+        check_interval_s = 0.05,
+        base_handler = canned_watcher_handler("ABORT — repeated tool loop"),
+    )
+    a = make_watcher_assistant(; watcher = cfg)
+    ch = RecordingChannel("rec-off-track")
+    a._channels[ch.id] = ch
+    ev = WatcherTestEvent("test_event", "looping work")
+    handler = (; id = "h-off-track", prompt = "Test prompt", channel_id = ch.id)
+    observed = Ref(false)
+    run_handler_guarded(a, ev, handler;
+        base_handler = make_hanging_handler(observed; emit_activity = true))
+    @test observed[]
+    row = only(fetch_evals(a.db))
+    @test row.status == "aborted"
+    @test row.failure_class == "off_track"
+    @test row.fallback_sent == 1
+    @test row.watcher_note == "repeated tool loop"
+    @test ch.sent == Any["repeated tool loop"]
 end
 
 @testset "Watcher model fails: hardcoded fallback sent" begin

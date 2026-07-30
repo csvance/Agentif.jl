@@ -28,8 +28,8 @@ No configured watcher = today's behavior, unchanged.
 ```
 event → handler → supervised_evaluate(assistant, ev, handler)
                     ├── journal row (claw_evals: running, started_at, last_activity_at)
-                    ├── primary task: Claw.evaluate(...; middleware = watch_middleware)
-                    │     └── watch_middleware: every AgentEvent →
+                    ├── primary task: Claw.evaluate(...; observer = watch_observer)
+                    │     └── watch_observer: every AgentEvent →
                     │           touch last_activity (atomic) + throttled journal write,
                     │           append one-line summary to bounded trace ring buffer
                     └── supervisor loop (every check_interval_s):
@@ -49,6 +49,7 @@ event → handler → supervised_evaluate(assistant, ev, handler)
   starts, message deltas, tool executions, errors) flows through it. `watch_observer`
   is that callback: heartbeats + counters + the trace ring buffer, no middleware
   insertion needed. `Claw.evaluate` gained an `observer` kwarg to pass it through.
+  Deadline checks use a monotonic clock; journal timestamps remain wall-clock values.
 - **`Abort`**: the supervisor holds the eval's `Abort` handle and can cancel a stalled
   or overrun eval; the abort is checked between turns/tools and interrupts in-flight
   SSE reads at the next event. Note: an aborted eval can surface either as a thrown
@@ -67,9 +68,12 @@ event → handler → supervised_evaluate(assistant, ev, handler)
 `classify_eval_failure(err) :: Symbol` maps exceptions to
 `:rate_limit | :auth | :overloaded | :network | :aborted | :unknown`
 using provider error shapes (HTTP status where available, message heuristics
-otherwise). Tool exceptions never reach the classifier — tool execution converts
-them to error tool results inside the eval. The class is journaled and given to the watcher model so its note can be
-specific ("hit the provider's rate limit", not "something went wrong").
+otherwise). A provider can report failure either by throwing or by returning an
+`AgentState` with stop reason `:error` after emitting an `AgentErrorEvent`; both paths
+are classified and journaled. Tool exceptions never reach the classifier — tool
+execution converts them to error tool results inside the eval. The class is given to
+the watcher model so its note can be specific ("hit the provider's rate limit", not
+"something went wrong").
 
 ### Group-chat semantics
 

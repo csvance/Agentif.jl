@@ -11,7 +11,7 @@ using Tempus
 using TimeZones
 
 export EventSource, Event, ChannelEvent, EventType, EventHandler
-export AgentConfig, AgentAssistant, WatcherConfig
+export AgentConfig, AgentAssistant
 export get_channels, get_event_types, get_event_handlers, get_tools
 export get_name, get_channel, event_content
 export register_event_source!, register_channels!, register_event_handler!, unregister_event_handler!
@@ -124,6 +124,23 @@ struct AgentAssistant
     scheduler::Tempus.Scheduler
     log_level::Union{Nothing, LogLevel}
     watcher::Union{Nothing, WatcherConfig}
+end
+
+# Preserve the pre-watcher positional constructor. WatcherConfig remains an
+# opt-in keyword on the public AgentAssistant constructor below.
+function AgentAssistant(
+        config::AgentConfig,
+        db::SQLite.DB,
+        channels::Dict{String, Agentif.AbstractChannel},
+        event_queue::Base.Channel{Event},
+        session_store::Agentif.SessionStore,
+        tools::Vector{Agentif.AgentTool},
+        scheduler::Tempus.Scheduler,
+        log_level::Union{Nothing, LogLevel},
+    )
+    return AgentAssistant(
+        config, db, channels, event_queue, session_store, tools, scheduler,
+        log_level, nothing)
 end
 
 # ─── SQLite schema ───
@@ -1172,6 +1189,7 @@ function AgentAssistant(db_path::String="";
     level::Union{Nothing, LogLevel, Int, Symbol, AbstractString}=nothing,
     watcher::Union{Nothing, WatcherConfig}=nothing,
 )
+    watcher !== nothing && validate_watcher_config(watcher)
     db_path = isempty(db_path) ? joinpath(pwd(), "$(something(name, "claw")).sqlite") : db_path
     db = SQLite.DB(db_path)
     _init_claw_schema!(db)
