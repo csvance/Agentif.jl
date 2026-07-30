@@ -291,9 +291,9 @@ end
     pending_tool_calls::Vector{PendingToolCall} = PendingToolCall[]
     most_recent_stop_reason::Union{Nothing, Symbol} = nothing
     last_compaction::Union{Nothing, CompactionSummaryMessage} = nothing
-    # Input tokens (including cache reads) reported by the most recent API call.
-    # 0 means "unknown" (fresh state restored from a session store), in which
-    # case compaction falls back to estimating from `messages`.
+    # Input tokens (including cache reads and cache writes) reported by the most
+    # recent API call. 0 means "unknown" (fresh state restored from a session
+    # store), in which case compaction falls back to estimating from `messages`.
     context_tokens::Int = 0
     # Provenance for messages that a session store already persisted:
     # how many leading messages of `messages` (skipping a leading compaction

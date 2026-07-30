@@ -192,6 +192,13 @@ function _unique_entry_id(store::SessionStore, base_id::String)
     end
 end
 
+function _reset_persisted_prefix!(state::AgentState)
+    has_summary = !isempty(state.messages) && state.messages[1] isa CompactionSummaryMessage
+    state.persisted_prefix_start = has_summary ? 2 : 1
+    state.persisted_prefix_count = length(state.messages) - (has_summary ? 1 : 0)
+    return state
+end
+
 function session_middleware(agent_handler::AgentHandler, store::Union{Nothing, SessionStore}; channel::Union{Nothing, AbstractChannel} = nothing)
     search_tool = store === nothing ? nothing : _create_search_session_tool(store)
     return function (f::F, agent::Agent, state::AgentState, current_input::AgentTurnInput, abort::Abort; kw...) where {F <: Function}
@@ -209,15 +216,16 @@ function session_middleware(agent_handler::AgentHandler, store::Union{Nothing, S
             pre_eval_msg_count = length(current_state.messages)
             # Everything we just loaded is already persisted; compact! keeps this
             # provenance up to date if it runs mid-evaluation.
-            current_state.persisted_prefix_count = pre_eval_msg_count
-            current_state.persisted_prefix_start = 1
+            _reset_persisted_prefix!(current_state)
             current_leaf = get_branch_leaf(store, bid)
 
             agent = search_tool === nothing ? agent : with_tools(agent, vcat(agent.tools, [search_tool]))
             current_state = agent_handler(f, agent, current_state, current_input, abort; kw...)
 
             # Resolve final entry ID
-            base_eid = something(captured_eid, response_entry_id(current_channel), string(UID8()))
+            response_eid = response_entry_id(current_channel)
+            platform_post_id = captured_eid === nothing ? response_eid : captured_eid
+            base_eid = platform_post_id === nothing ? string(UID8()) : platform_post_id
             final_eid = _unique_entry_id(store, base_eid)
             user_id, ch_id, sch_id, ch_flags = _entry_metadata(current_channel)
 
@@ -234,7 +242,15 @@ function session_middleware(agent_handler::AgentHandler, store::Union{Nothing, S
                     first_kept_idx = current_state.persisted_prefix_start
                     for b in entry_boundaries
                         if b.message_start <= first_kept_idx <= b.message_end
-                            first_kept_eid = b.entry_id
+                            # Lineage pointers operate at entry granularity. If
+                            # the cut lands inside an entry, persist the kept
+                            # suffix again under the new compaction instead of
+                            # replaying the entry's already-summarized prefix.
+                            if first_kept_idx == b.message_start
+                                first_kept_eid = b.entry_id
+                            else
+                                kept_persisted = 0
+                            end
                             break
                         end
                     end
@@ -267,7 +283,7 @@ function session_middleware(agent_handler::AgentHandler, store::Union{Nothing, S
                         channel_id = ch_id,
                         search_channel_id = sch_id,
                         channel_flags = ch_flags,
-                        post_id = captured_eid,
+                        post_id = platform_post_id,
                     )
                     append_entry!(store, eval_entry)
                     set_branch_leaf!(store, bid, eval_entry.id)
@@ -275,8 +291,7 @@ function session_middleware(agent_handler::AgentHandler, store::Union{Nothing, S
                     set_branch_leaf!(store, bid, compaction_entry.id)
                 end
                 current_state.last_compaction = nothing
-                current_state.persisted_prefix_count = length(current_state.messages)
-                current_state.persisted_prefix_start = 1
+                _reset_persisted_prefix!(current_state)
             elseif length(current_state.messages) > pre_eval_msg_count
                 # No compaction: save new messages as a single entry
                 new_messages = current_state.messages[pre_eval_msg_count + 1:end]
@@ -288,11 +303,11 @@ function session_middleware(agent_handler::AgentHandler, store::Union{Nothing, S
                     channel_id = ch_id,
                     search_channel_id = sch_id,
                     channel_flags = ch_flags,
-                    post_id = captured_eid,
+                    post_id = platform_post_id,
                 )
                 append_entry!(store, eval_entry)
                 set_branch_leaf!(store, bid, eval_entry.id)
-                current_state.persisted_prefix_count = length(current_state.messages)
+                _reset_persisted_prefix!(current_state)
             end
 
             return current_state

@@ -105,6 +105,15 @@ function _collect_lineage(store::SessionStore, leaf_entry_id::String)
         push!(seen, current_id)
         entry = get_entry(store, current_id)
         entry === nothing && break
+
+        # The newest compaction summary replaces every older summary. Keep
+        # walking through an older compaction's parent to reach the retained
+        # entries, but never replay that stale summary.
+        if entry.is_compaction && compaction_idx != 0
+            current_id = entry.parent_id
+            continue
+        end
+
         push!(entries, entry)
 
         if entry.is_compaction && compaction_idx == 0

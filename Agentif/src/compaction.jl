@@ -301,7 +301,7 @@ Rough token estimate for a whole conversation. Used as the compaction trigger
 when no measured token count is available (e.g. the first call of an evaluation
 whose state was just restored from a session store).
 """
-function estimate_context_tokens(messages::Vector{AgentMessage})
+function estimate_context_tokens(messages::AbstractVector{<:AgentMessage})
     total = 0
     for msg in messages
         total += estimate_message_tokens(msg)
@@ -357,11 +357,12 @@ function is_context_overflow_error(e::HTTP.StatusError)
     return is_context_overflow_error(body) || is_context_overflow_error(sprint(showerror, e))
 end
 
+_context_input_tokens(usage::Usage) = usage.input + usage.cacheRead + usage.cacheWrite
+
 function _record_context_tokens!(state::AgentState, total_before::Int)
-    # Track full input token count (including cached) for accurate context
-    # window utilization. usage.input has cached tokens subtracted, so we add
-    # cacheRead back.
-    total_after = state.usage.input + state.usage.cacheRead
+    # Track every input token that occupies the context window. Providers can
+    # report uncached, cache-read, and newly cache-written tokens separately.
+    total_after = _context_input_tokens(state.usage)
     state.context_tokens = max(0, total_after - total_before)
     return state
 end
@@ -401,28 +402,60 @@ function compaction_middleware(agent_handler::AgentHandler, config::CompactionCo
             compact!(agent, state, config, resolved_model; abort) && (state.context_tokens = 0)
         end
 
-        # Hold back a context-overflow error: if compaction can rescue the call
-        # we retry instead of surfacing it, otherwise we forward it unchanged.
+        # Hold back an empty response lifecycle and a context-overflow error. A
+        # rejected HTTP call can emit start/end before its error; those events
+        # must not close the consumer's stream before a successful retry.
+        # Once substantive output is visible, retrying would duplicate it, so
+        # an overflow after progress is forwarded without a retry.
         overflow_event = Ref{Union{Nothing, AgentErrorEvent}}(nothing)
-        guarded_f = function (event)
-            if overflow_event[] === nothing && event isa AgentErrorEvent && is_context_overflow_error(event.error)
-                overflow_event[] = event
-                return nothing
+        pending_lifecycle = AgentEvent[]
+        stream_progressed = Ref(false)
+        flush_pending! = function ()
+            for pending_event in pending_lifecycle
+                f(pending_event)
             end
-            return f(event)
+            empty!(pending_lifecycle)
+            return nothing
+        end
+        guarded_f = function (event)
+            overflow_event[] === nothing || return nothing
+            if event isa MessageStartEvent ||
+                    (event isa MessageEndEvent && !stream_progressed[])
+                if !stream_progressed[]
+                    push!(pending_lifecycle, event)
+                    return nothing
+                end
+                return f(event)
+            elseif event isa AgentErrorEvent
+                if !stream_progressed[] && is_context_overflow_error(event.error)
+                    overflow_event[] = event
+                    return nothing
+                end
+                flush_pending!()
+                return f(event)
+            else
+                flush_pending!()
+                stream_progressed[] = true
+                return f(event)
+            end
         end
 
         msg_count_before = length(state.messages)
-        total_before = state.usage.input + state.usage.cacheRead
+        total_before = _context_input_tokens(state.usage)
         overflow_thrown = Ref{Union{Nothing, Exception}}(nothing)
         result = try
             agent_handler(guarded_f, agent, state, current_input, abort; model, kw...)
         catch e
-            (e isa Exception && !isaborted(abort) && is_context_overflow_error(e)) || rethrow()
+            if !(e isa Exception && !isaborted(abort) &&
+                    !stream_progressed[] && is_context_overflow_error(e))
+                flush_pending!()
+                rethrow()
+            end
             overflow_event[] = AgentErrorEvent(e)
             overflow_thrown[] = e
             state
         end
+        overflow_event[] === nothing && flush_pending!()
         _record_context_tokens!(result, total_before)
 
         if overflow_event[] !== nothing
@@ -439,13 +472,15 @@ function compaction_middleware(agent_handler::AgentHandler, config::CompactionCo
                 compacted || append!(result.messages, failed_tail)
             end
             if compacted
+                empty!(pending_lifecycle)
                 result.context_tokens = 0
-                total_before = result.usage.input + result.usage.cacheRead
+                total_before = _context_input_tokens(result.usage)
                 result = agent_handler(f, agent, result, current_input, abort; model, kw...)
                 _record_context_tokens!(result, total_before)
             else
                 # Compaction cannot help: leave the failed call exactly as it
                 # was, error and all.
+                flush_pending!()
                 overflow_thrown[] === nothing || throw(overflow_thrown[])
                 f(overflow_event[])
             end

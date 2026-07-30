@@ -206,16 +206,15 @@ function Agentif.scrub_post!(store::SQLiteSessionStore, post_id::String)
         entry = JSON.parse(String(row.entry), Agentif.SessionEntry)
         # Rewrite the stored entry without its messages: flagging is_deleted is
         # not enough, the lineage walk replays whatever the entry JSON holds.
+        # Delete the search document first. If that fails, leave the row active
+        # so the caller can retry instead of silently retaining searchable text.
         scrubbed = Agentif.scrubbed_entry(entry)
+        Base.delete!(store.search_store, "session:entry:$(row.entry_id)")
         SQLite.execute(
             store.db,
             "UPDATE session_entries SET entry = ?, is_deleted = 1, user_id = NULL WHERE entry_id = ?",
             (JSON.json(scrubbed), row.entry_id),
         )
-        try
-            Base.delete!(store.search_store, "session:entry:$(row.entry_id)")
-        catch
-        end
     end
     @info "scrub_post!: scrubbed session entries" post_id count = length(rows)
     return nothing
