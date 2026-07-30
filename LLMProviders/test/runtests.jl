@@ -208,6 +208,14 @@ end
     @test adaptive_body["metadata"]["user_id"] == "u-1"
     @test !haskey(adaptive_body, "temperature")
 
+    sampled = AnthropicMessages.Request(
+        ; model = "claude-3-5-haiku-latest",
+        messages = AnthropicMessages.Message[],
+        max_tokens = 1024,
+        top_k = 40,
+    )
+    @test JSON.parse(JSON.json(sampled))["top_k"] == 40
+
     # budget-based thinking keeps budget_tokens strictly below max_tokens
     budgeted = AnthropicMessages.Request(
         ; model = "claude-haiku-4-5",

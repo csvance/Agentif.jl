@@ -121,8 +121,15 @@ end
 function anthropic_cache_control(base_url::AbstractString, cache_retention)
     retention = resolve_openai_cache_retention(cache_retention)
     retention == "none" && return nothing
-    # The 1h beta TTL only exists on Anthropic's own endpoint; proxies reject it.
-    ttl = (retention == "long" && occursin("api.anthropic.com", lowercase(String(base_url)))) ? "1h" : nothing
+    # The 1h TTL is only enabled for Anthropic's own endpoint. Compare the parsed
+    # host exactly; a substring check also matches proxy or attacker-controlled hosts
+    # such as `api.anthropic.com.example.test`.
+    native_host = try
+        rstrip(lowercase(HTTP.URI(String(base_url)).host), '.') == "api.anthropic.com"
+    catch
+        false
+    end
+    ttl = retention == "long" && native_host ? "1h" : nothing
     return AnthropicMessages.CacheControl(; type = "ephemeral", ttl)
 end
 
@@ -159,38 +166,32 @@ function anthropic_apply_cache_control!(messages::Vector{AnthropicMessages.Messa
 end
 
 # --- Per-model thinking/effort capabilities -----------------------------------------
-# Source: Anthropic docs fetched 2026-07-30 —
-#   /docs/en/build-with-claude/thinking  and  /docs/en/build-with-claude/effort.
-# There are two distinct thinking mechanisms and the newest models only support the
-# newer one, so selection is capability-driven rather than a single global mapping.
+# Prefer the registry's `compat` and `thinkingLevelMap` metadata. The model-name
+# fallbacks keep manually constructed models and older snapshots working.
 
 anthropic_model_matches(model_id::AbstractString, patterns) =
     any(p -> occursin(p, lowercase(String(model_id))), patterns)
 
-# Adaptive-only: extended thinking (`budget_tokens`) returns a 400 here. These are also
-# the models that reject non-default temperature/top_p/top_k on *every* request.
+# Mythos Preview is intentionally absent. It supports both adaptive thinking and
+# manual `budget_tokens`; classifying it as adaptive-only corrupts explicit requests.
 const ANTHROPIC_ADAPTIVE_ONLY_MODELS = (
     "opus-4-7", "opus-4.7", "opus-4-8", "opus-4.8",
-    "opus-5", "sonnet-5", "fable-5", "mythos-5", "mythos-preview",
+    "opus-5", "sonnet-5", "fable-5", "mythos-5",
 )
 
-# The 4.6 family supports both mechanisms (extended thinking deprecated there).
 const ANTHROPIC_ADAPTIVE_THINKING_MODELS = (
-    ANTHROPIC_ADAPTIVE_ONLY_MODELS..., "opus-4-6", "opus-4.6", "sonnet-4-6", "sonnet-4.6",
+    ANTHROPIC_ADAPTIVE_ONLY_MODELS..., "mythos-preview",
+    "opus-4-6", "opus-4.6", "sonnet-4-6", "sonnet-4.6",
 )
 
-# Thinking cannot be turned off at all on these; `{type: "disabled"}` is rejected.
 const ANTHROPIC_ALWAYS_THINKING_MODELS = ("fable-5", "mythos-5", "mythos-preview")
-
-# `effort` also works on Opus 4.5, the one extended-thinking-only model that supports it
-# (there it composes with `budget_tokens`).
 const ANTHROPIC_EFFORT_MODELS = (ANTHROPIC_ADAPTIVE_THINKING_MODELS..., "opus-4-5", "opus-4.5")
-
-# `max` is available on the 4.6 family and newer; `xhigh` arrived with Opus 4.7 and is
-# not available on Mythos Preview or the 4.6 family.
 const ANTHROPIC_MAX_EFFORT_MODELS = ANTHROPIC_ADAPTIVE_THINKING_MODELS
 const ANTHROPIC_XHIGH_EFFORT_MODELS = (
     "opus-4-7", "opus-4.7", "opus-4-8", "opus-4.8", "opus-5", "sonnet-5", "fable-5", "mythos-5",
+)
+const ANTHROPIC_REJECTS_SAMPLING_MODELS = (
+    ANTHROPIC_ADAPTIVE_ONLY_MODELS..., "mythos-preview",
 )
 
 anthropic_supports_adaptive_thinking(model_id::AbstractString) = anthropic_model_matches(model_id, ANTHROPIC_ADAPTIVE_THINKING_MODELS)
@@ -199,16 +200,51 @@ anthropic_thinking_always_on(model_id::AbstractString) = anthropic_model_matches
 anthropic_supports_effort(model_id::AbstractString) = anthropic_model_matches(model_id, ANTHROPIC_EFFORT_MODELS)
 anthropic_supports_max_effort(model_id::AbstractString) = anthropic_model_matches(model_id, ANTHROPIC_MAX_EFFORT_MODELS)
 anthropic_supports_xhigh_effort(model_id::AbstractString) = anthropic_model_matches(model_id, ANTHROPIC_XHIGH_EFFORT_MODELS)
-# Non-default temperature/top_p/top_k are rejected outright on the adaptive-only models;
-# on older models they only conflict while thinking is on.
-anthropic_rejects_sampling_params(model_id::AbstractString) = anthropic_model_matches(model_id, ANTHROPIC_ADAPTIVE_ONLY_MODELS)
-# Interleaved thinking is automatic under adaptive thinking (no header); under extended
-# thinking it needs a beta header, and Claude Haiku 4.5 does not support it at all.
-anthropic_needs_interleaved_thinking_beta(model_id::AbstractString) =
-    !anthropic_supports_adaptive_thinking(model_id) && !anthropic_model_matches(model_id, ("haiku-4-5", "haiku-4.5"))
+anthropic_rejects_sampling_params(model_id::AbstractString) = anthropic_model_matches(model_id, ANTHROPIC_REJECTS_SAMPLING_MODELS)
 
-# pi-mono's mapThinkingLevelToEffort, made capability-driven: a level the model does not
-# support steps down to the highest rung it does support.
+function anthropic_compat_flag(model::Model, key::AbstractString)
+    model.compat === nothing && return nothing
+    value = get(() -> nothing, model.compat, String(key))
+    return value isa Bool ? value : nothing
+end
+
+function anthropic_supports_adaptive_thinking(model::Model)
+    override = anthropic_compat_flag(model, "forceAdaptiveThinking")
+    return override === nothing ? anthropic_supports_adaptive_thinking(model.id) : override
+end
+function anthropic_supports_extended_thinking(model::Model)
+    override = anthropic_compat_flag(model, "forceAdaptiveThinking")
+    override === false && return true
+    return anthropic_supports_extended_thinking(model.id)
+end
+function anthropic_thinking_always_on(model::Model)
+    level_map = model.thinkingLevelMap
+    if level_map !== nothing && haskey(level_map, "off")
+        return level_map["off"] === nothing
+    end
+    return anthropic_thinking_always_on(model.id)
+end
+function anthropic_supports_effort(model::Model)
+    override = anthropic_compat_flag(model, "forceAdaptiveThinking")
+    override !== nothing && return override
+    return anthropic_supports_effort(model.id)
+end
+function anthropic_rejects_sampling_params(model::Model)
+    supports_temperature = anthropic_compat_flag(model, "supportsTemperature")
+    return supports_temperature === nothing ?
+        anthropic_rejects_sampling_params(model.id) : !supports_temperature
+end
+
+# Interleaved thinking is automatic in adaptive mode. In manual mode it needs a
+# beta header except on Haiku 4.5 (unsupported) and Opus 4.6 (no manual-mode
+# interleaving). Sonnet 4.6 still accepts the header in manual mode.
+function anthropic_needs_interleaved_thinking_beta(model::Model, thinking)
+    anthropic_thinking_type(thinking) == "enabled" || return false
+    anthropic_model_matches(model.id, ("haiku-4-5", "haiku-4.5")) && return false
+    anthropic_model_matches(model.id, ("opus-4-6", "opus-4.6")) && return false
+    return true
+end
+
 function anthropic_effort_for_level(level::AbstractString, model_id::AbstractString)
     lvl = lowercase(strip(String(level)))
     lvl == "minimal" && (lvl = "low")
@@ -221,6 +257,21 @@ function anthropic_effort_for_level(level::AbstractString, model_id::AbstractStr
     return "high"
 end
 
+function anthropic_effort_for_level(level::AbstractString, model::Model)
+    lvl = lowercase(strip(String(level)))
+    lvl == "minimal" && (lvl = "low")
+    level_map = model.thinkingLevelMap
+    if level_map !== nothing
+        mapped = get(() -> nothing, level_map, lvl)
+        mapped isa AbstractString && return String(mapped)
+        if lvl == "xhigh"
+            max_mapped = get(() -> nothing, level_map, "max")
+            max_mapped isa AbstractString && return String(max_mapped)
+        end
+    end
+    return anthropic_effort_for_level(lvl, model.id)
+end
+
 const ANTHROPIC_DEFAULT_THINKING_BUDGETS = Dict("minimal" => 1024, "low" => 2048, "medium" => 8192, "high" => 16384)
 const ANTHROPIC_MIN_OUTPUT_TOKENS = 1024
 
@@ -228,14 +279,18 @@ const ANTHROPIC_MIN_OUTPUT_TOKENS = 1024
 # budget, clamp to the model ceiling, and keep budget_tokens strictly below max_tokens
 # (the API rejects budget_tokens >= max_tokens).
 function anthropic_adjust_max_tokens_for_thinking(base_max_tokens::Int, model_max_tokens::Int, level::AbstractString)
+    base_max_tokens > 0 || throw(ArgumentError("max_tokens must be positive"))
+    model_max_tokens > ANTHROPIC_MIN_OUTPUT_TOKENS ||
+        throw(ArgumentError("model maxTokens must exceed $ANTHROPIC_MIN_OUTPUT_TOKENS for extended thinking"))
     lvl = lowercase(strip(String(level)))
-    # Budget-based models have no rung above "high".
     lvl in ("xhigh", "max") && (lvl = "high")
     budget = get(() -> ANTHROPIC_DEFAULT_THINKING_BUDGETS["high"], ANTHROPIC_DEFAULT_THINKING_BUDGETS, lvl)
     max_tokens = min(base_max_tokens + budget, model_max_tokens)
     if max_tokens <= budget
-        budget = max(0, max_tokens - ANTHROPIC_MIN_OUTPUT_TOKENS)
+        budget = max_tokens - ANTHROPIC_MIN_OUTPUT_TOKENS
     end
+    budget >= 1024 ||
+        throw(ArgumentError("max_tokens is too small for the minimum 1,024-token thinking budget"))
     return (; max_tokens, thinking_budget = budget)
 end
 
@@ -246,9 +301,9 @@ end
 function anthropic_thinking_request(model::Model, level, base_max_tokens::Int)
     (level === nothing || !model.reasoning) && return (; thinking = nothing, output_config = nothing, max_tokens = base_max_tokens)
     lvl = string(level)
-    output_config = anthropic_supports_effort(model.id) ?
-        AnthropicMessages.OutputConfig(; effort = anthropic_effort_for_level(lvl, model.id)) : nothing
-    if anthropic_supports_adaptive_thinking(model.id)
+    output_config = anthropic_supports_effort(model) ?
+        AnthropicMessages.OutputConfig(; effort = anthropic_effort_for_level(lvl, model)) : nothing
+    if anthropic_supports_adaptive_thinking(model)
         # `display` defaults to "omitted" on the 5-generation models, which would stream
         # empty thinking blocks; Agentif surfaces reasoning, so ask for summaries.
         return (;
@@ -272,6 +327,43 @@ function anthropic_thinking_type(thinking)
     return nothing
 end
 
+function anthropic_thinking_field(thinking, key::Symbol)
+    thinking isa AnthropicMessages.ThinkingConfig && return getproperty(thinking, key)
+    if thinking isa AbstractDict
+        value = get(() -> nothing, thinking, String(key))
+        return value === nothing ? get(() -> nothing, thinking, key) : value
+    end
+    thinking isa NamedTuple && return get(() -> nothing, thinking, key)
+    return nothing
+end
+
+function anthropic_output_effort(output_config)
+    output_config isa AnthropicMessages.OutputConfig && return output_config.effort
+    if output_config isa AbstractDict
+        value = get(() -> nothing, output_config, "effort")
+        return value === nothing ? get(() -> nothing, output_config, :effort) : value
+    end
+    output_config isa NamedTuple && return get(() -> nothing, output_config, :effort)
+    return nothing
+end
+
+function anthropic_disabled_effort_conflict(model::Model, thinking, output_config)
+    anthropic_thinking_type(thinking) == "disabled" || return false
+    anthropic_model_matches(model.id, ("opus-5",)) || return false
+    effort = anthropic_output_effort(output_config)
+    return effort !== nothing && lowercase(String(effort)) in ("xhigh", "max")
+end
+
+function anthropic_tool_choice_type(tool_choice)
+    if tool_choice isa AbstractDict
+        value = get(() -> nothing, tool_choice, "type")
+        return value === nothing ? get(() -> nothing, tool_choice, :type) : value
+    end
+    tool_choice isa NamedTuple && return get(() -> nothing, tool_choice, :type)
+    tool_choice isa AbstractString && return tool_choice
+    return nothing
+end
+
 # Caller-supplied `thinking` kwargs win over the derived config; we still need to know
 # whether thinking ends up on so the sampling guard and beta header stay correct.
 function anthropic_thinking_is_enabled(thinking)
@@ -281,24 +373,79 @@ function anthropic_thinking_is_enabled(thinking)
     return String(type) != "disabled"
 end
 
-# Reconcile a caller-supplied thinking config with the model's capabilities so an
-# unsupported shape degrades to the supported mechanism instead of returning a 400.
+function anthropic_normalize_extended_thinking(thinking, model::Model, base_max_tokens::Int)
+    raw_budget = anthropic_thinking_field(thinking, :budget_tokens)
+    budget = raw_budget === nothing ? 1024 : try
+        Int(raw_budget)
+    catch
+        throw(ArgumentError("thinking.budget_tokens must be an integer"))
+    end
+    if budget < 1024
+        @warn "Anthropic requires a minimum 1,024-token thinking budget; clamping" requested = budget
+        budget = 1024
+    end
+    model.maxTokens > ANTHROPIC_MIN_OUTPUT_TOKENS ||
+        throw(ArgumentError("model maxTokens must exceed $ANTHROPIC_MIN_OUTPUT_TOKENS for extended thinking"))
+    max_tokens = min(max(base_max_tokens, budget + ANTHROPIC_MIN_OUTPUT_TOKENS), model.maxTokens)
+    if budget >= max_tokens
+        clamped = max_tokens - ANTHROPIC_MIN_OUTPUT_TOKENS
+        clamped >= 1024 ||
+            throw(ArgumentError("max_tokens is too small for the minimum 1,024-token thinking budget"))
+        @warn "thinking.budget_tokens must be below max_tokens; clamping" requested = budget clamped max_tokens
+        budget = clamped
+    end
+    display = anthropic_thinking_field(thinking, :display)
+    if display !== nothing && !(String(display) in ("omitted", "summarized"))
+        @warn "Ignoring unsupported Anthropic thinking display" display
+        display = nothing
+    end
+    config = AnthropicMessages.ThinkingConfig(;
+        type = "enabled",
+        budget_tokens = budget,
+        display = display === nothing ? nothing : String(display),
+    )
+    return (; thinking = config, max_tokens)
+end
+
+# Reconcile a caller-supplied thinking config with model capabilities. Invalid
+# configurations are normalized before they reach the API.
 function anthropic_normalize_thinking(thinking, model::Model, base_max_tokens::Int)
     thinking === nothing && return (; thinking = nothing, max_tokens = base_max_tokens)
     type = anthropic_thinking_type(thinking)
-    type = type === nothing ? nothing : String(type)
-    if type == "disabled" && anthropic_thinking_always_on(model.id)
+    type === nothing && throw(ArgumentError("thinking.type is required"))
+    type = lowercase(String(type))
+    type in ("adaptive", "enabled", "disabled") ||
+        throw(ArgumentError("unsupported thinking.type: $type"))
+    if type == "disabled" && anthropic_thinking_always_on(model)
         @warn "Thinking cannot be disabled on this model; ignoring thinking=disabled" model = model.id
         return (; thinking = nothing, max_tokens = base_max_tokens)
-    elseif type == "enabled" && !anthropic_supports_extended_thinking(model.id)
+    elseif type == "enabled" && !anthropic_supports_extended_thinking(model)
         @warn "Extended thinking (budget_tokens) is not supported on this model; falling back to adaptive thinking" model = model.id
         return (; thinking = AnthropicMessages.ThinkingConfig(; type = "adaptive", display = "summarized"), max_tokens = base_max_tokens)
-    elseif type == "adaptive" && !anthropic_supports_adaptive_thinking(model.id)
+    elseif type == "enabled"
+        return anthropic_normalize_extended_thinking(thinking, model, base_max_tokens)
+    elseif type == "adaptive" && !anthropic_supports_adaptive_thinking(model)
         @warn "Adaptive thinking is not supported on this model; falling back to extended thinking" model = model.id
         adjusted = anthropic_adjust_max_tokens_for_thinking(base_max_tokens, model.maxTokens, "high")
         return (; thinking = AnthropicMessages.ThinkingConfig(; type = "enabled", budget_tokens = adjusted.thinking_budget), max_tokens = adjusted.max_tokens)
+    elseif type == "adaptive"
+        display = anthropic_thinking_field(thinking, :display)
+        if display !== nothing && !(String(display) in ("omitted", "summarized"))
+            @warn "Ignoring unsupported Anthropic thinking display" display
+            display = nothing
+        end
+        return (;
+            thinking = AnthropicMessages.ThinkingConfig(;
+                type = "adaptive",
+                display = display === nothing ? nothing : String(display),
+            ),
+            max_tokens = base_max_tokens,
+        )
     end
-    return (; thinking, max_tokens = base_max_tokens)
+    return (;
+        thinking = AnthropicMessages.ThinkingConfig(; type = "disabled"),
+        max_tokens = base_max_tokens,
+    )
 end
 
 function anthropic_message_from_agent(msg::AgentMessage, tool_name_map::Dict{String, String}, model::Model)
@@ -448,7 +595,7 @@ function anthropic_stop_reason(reason::Union{Nothing, String}, tool_calls::Vecto
     end
     if reason == "tool_use"
         return :tool_calls
-    elseif reason == "max_tokens"
+    elseif reason == "max_tokens" || reason == "model_context_window_exceeded"
         return :length
     elseif reason == "stop_sequence"
         return :stop
@@ -457,9 +604,9 @@ function anthropic_stop_reason(reason::Union{Nothing, String}, tool_calls::Vecto
     elseif reason == "refusal"
         return :error
     elseif reason == "pause_turn"
-        # The stream driver resubmits paused turns (bounded); reaching here means the
-        # resubmit budget ran out, so the turn is reported as a normal stop.
-        return :stop
+        # The stream driver resubmits paused turns (bounded). Reaching here means the
+        # turn is still incomplete, so never report it as a successful stop.
+        return :length
     elseif reason == "error"
         # Synthesized by the stream driver on HTTP errors.
         return :error
@@ -477,16 +624,22 @@ function anthropic_event_callback(
         latest_usage::Base.RefValue{Union{Nothing, AnthropicMessages.Usage}},
         blocks_by_index::Dict{Int, AssistantContentBlock},
         partial_json_by_index::Dict{Int, String},
+        wire_blocks_by_index::Dict{Int, Dict{String, Any}},
+        wire_partial_json_by_index::Dict{Int, String},
+        wire_replay_safe::Base.RefValue{Bool},
         tool_name_reverse_map::Dict{String, String},
         abort::Abort,
     ) where {F <: Function}
     stop_on_tool_call = get(ENV, "AGENTIF_STOP_ON_TOOL_CALL", "") != ""
     return function (stream, event)
         maybe_abort!(abort, stream)
-        local parsed
+        local parsed, wire_event
         try
-            parsed = JSON.parse(String(event.data), AnthropicMessages.StreamEvent)
+            data = String(event.data)
+            wire_event = JSON.parse(data)
+            parsed = JSON.parse(data, AnthropicMessages.StreamEvent)
         catch e
+            wire_replay_safe[] = false
             f(AgentErrorEvent(ErrorException(sprint(showerror, e))))
             return
         end
@@ -502,6 +655,13 @@ function anthropic_event_callback(
                 f(MessageStartEvent(:assistant, assistant_message))
             end
         elseif parsed isa AnthropicMessages.StreamContentBlockStartEvent
+            wire_block = get(() -> nothing, wire_event, "content_block")
+            if wire_block isa AbstractDict
+                wire_blocks_by_index[parsed.index] =
+                    Dict{String, Any}(String(key) => value for (key, value) in wire_block)
+            else
+                wire_replay_safe[] = false
+            end
             if parsed.content_block isa AnthropicMessages.TextBlock
                 block = TextContent(; text = parsed.content_block.text)
                 push!(assistant_message.content, block)
@@ -537,6 +697,32 @@ function anthropic_event_callback(
                 @debug "Ignoring unknown Anthropic content block" type = parsed.content_block.type index = parsed.index
             end
         elseif parsed isa AnthropicMessages.StreamContentBlockDeltaEvent
+            wire_delta = get(() -> nothing, wire_event, "delta")
+            wire_block = get(() -> nothing, wire_blocks_by_index, parsed.index)
+            if wire_delta isa AbstractDict && wire_block isa AbstractDict
+                delta_type = get(() -> nothing, wire_delta, "type")
+                if delta_type == "text_delta"
+                    wire_block["text"] = string(get(() -> "", wire_block, "text"),
+                        get(() -> "", wire_delta, "text"))
+                elseif delta_type == "thinking_delta"
+                    wire_block["thinking"] = string(get(() -> "", wire_block, "thinking"),
+                        get(() -> "", wire_delta, "thinking"))
+                elseif delta_type == "signature_delta"
+                    wire_block["signature"] = string(get(() -> "", wire_block, "signature"),
+                        get(() -> "", wire_delta, "signature"))
+                elseif delta_type == "input_json_delta"
+                    partial = get(() -> "", wire_partial_json_by_index, parsed.index)
+                    wire_partial_json_by_index[parsed.index] =
+                        partial * string(get(() -> "", wire_delta, "partial_json"))
+                else
+                    # Unknown deltas cannot be applied to a final content block
+                    # without knowing their merge semantics. Do not replay a
+                    # potentially corrupted paused turn.
+                    wire_replay_safe[] = false
+                end
+            else
+                wire_replay_safe[] = false
+            end
             if parsed.delta isa AnthropicMessages.TextDelta
                 block = get(() -> nothing, blocks_by_index, parsed.index)
                 block isa TextContent || return
@@ -571,6 +757,21 @@ function anthropic_event_callback(
                 @debug "Ignoring unknown Anthropic content block delta" type = parsed.delta.type index = parsed.index
             end
         elseif parsed isa AnthropicMessages.StreamContentBlockStopEvent
+            wire_partial = get(() -> nothing, wire_partial_json_by_index, parsed.index)
+            if wire_partial !== nothing
+                wire_block = get(() -> nothing, wire_blocks_by_index, parsed.index)
+                if wire_block isa AbstractDict
+                    try
+                        wire_block["input"] = isempty(wire_partial) ?
+                            get(() -> Dict{String, Any}(), wire_block, "input") :
+                            JSON.parse(wire_partial)
+                    catch
+                        wire_replay_safe[] = false
+                    end
+                else
+                    wire_replay_safe[] = false
+                end
+            end
             block = get(() -> nothing, blocks_by_index, parsed.index)
             if block isa ToolCallContent
                 partial = get(() -> "", partial_json_by_index, parsed.index)

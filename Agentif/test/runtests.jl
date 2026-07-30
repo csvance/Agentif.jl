@@ -1554,7 +1554,15 @@ end
     end
 end
 
-function anthropic_test_model(; id = "claude-opus-5", reasoning = true, maxTokens = 32000, baseUrl = "http://127.0.0.1:1", kw = (;))
+function anthropic_test_model(;
+        id = "claude-opus-5",
+        reasoning = true,
+        maxTokens = 32000,
+        baseUrl = "http://127.0.0.1:1",
+        compat = nothing,
+        thinkingLevelMap = nothing,
+        kw = (;),
+    )
     return Model(
         id = id,
         name = id,
@@ -1566,17 +1574,23 @@ function anthropic_test_model(; id = "claude-opus-5", reasoning = true, maxToken
         cost = Dict("input" => 0.0, "output" => 0.0, "cacheRead" => 0.0, "cacheWrite" => 0.0),
         contextWindow = 200000,
         maxTokens = maxTokens,
+        compat = compat,
+        thinkingLevelMap = thinkingLevelMap,
         kw = kw,
     )
 end
 
 @testset "anthropic per-model thinking capabilities" begin
+    @test Agentif.anthropic_stop_reason(
+        "model_context_window_exceeded", Agentif.AgentToolCall[]) == :length
+
     # Adaptive thinking: 4.6 family and newer
     @test Agentif.anthropic_supports_adaptive_thinking("claude-opus-4-6")
     @test Agentif.anthropic_supports_adaptive_thinking("claude-sonnet-4-6")
     @test Agentif.anthropic_supports_adaptive_thinking("claude-opus-5")
     @test Agentif.anthropic_supports_adaptive_thinking("claude-sonnet-5")
     @test Agentif.anthropic_supports_adaptive_thinking("claude-fable-5")
+    @test Agentif.anthropic_supports_adaptive_thinking("claude-mythos-preview")
     @test !Agentif.anthropic_supports_adaptive_thinking("claude-opus-4-5")
     @test !Agentif.anthropic_supports_adaptive_thinking("claude-haiku-4-5-20251001")
 
@@ -1588,10 +1602,12 @@ end
     @test !Agentif.anthropic_supports_extended_thinking("claude-opus-5")
     @test !Agentif.anthropic_supports_extended_thinking("claude-sonnet-5")
     @test !Agentif.anthropic_supports_extended_thinking("claude-fable-5")
+    @test Agentif.anthropic_supports_extended_thinking("claude-mythos-preview")
 
     # Thinking cannot be turned off on the always-thinking models
     @test Agentif.anthropic_thinking_always_on("claude-fable-5")
     @test Agentif.anthropic_thinking_always_on("claude-mythos-5")
+    @test Agentif.anthropic_thinking_always_on("claude-mythos-preview")
     @test !Agentif.anthropic_thinking_always_on("claude-opus-5")
 
     # effort: 4.6 family and newer, plus Opus 4.5 (the one extended-only model with effort)
@@ -1610,13 +1626,23 @@ end
     # Sampling params are rejected outright on the adaptive-only models
     @test Agentif.anthropic_rejects_sampling_params("claude-opus-5")
     @test Agentif.anthropic_rejects_sampling_params("claude-sonnet-5")
+    @test Agentif.anthropic_rejects_sampling_params("claude-mythos-preview")
     @test !Agentif.anthropic_rejects_sampling_params("claude-opus-4-6")
     @test !Agentif.anthropic_rejects_sampling_params("claude-haiku-4-5-20251001")
 
-    # Interleaved thinking: automatic under adaptive, header under extended, absent on Haiku
-    @test !Agentif.anthropic_needs_interleaved_thinking_beta("claude-opus-5")
-    @test !Agentif.anthropic_needs_interleaved_thinking_beta("claude-haiku-4-5-20251001")
-    @test Agentif.anthropic_needs_interleaved_thinking_beta("claude-sonnet-4-5")
+    # Interleaved thinking depends on the selected mode, not only model capability.
+    adaptive = LLMProviders.AnthropicMessages.ThinkingConfig(; type = "adaptive")
+    enabled = LLMProviders.AnthropicMessages.ThinkingConfig(; type = "enabled", budget_tokens = 2048)
+    @test !Agentif.anthropic_needs_interleaved_thinking_beta(
+        anthropic_test_model(id = "claude-opus-5"), adaptive)
+    @test !Agentif.anthropic_needs_interleaved_thinking_beta(
+        anthropic_test_model(id = "claude-haiku-4-5-20251001"), enabled)
+    @test Agentif.anthropic_needs_interleaved_thinking_beta(
+        anthropic_test_model(id = "claude-sonnet-4-5"), enabled)
+    @test Agentif.anthropic_needs_interleaved_thinking_beta(
+        anthropic_test_model(id = "claude-sonnet-4-6"), enabled)
+    @test !Agentif.anthropic_needs_interleaved_thinking_beta(
+        anthropic_test_model(id = "claude-opus-4-6"), enabled)
 end
 
 @testset "anthropic thinking config, effort mapping, and budget clamping" begin
@@ -1679,6 +1705,34 @@ end
     @test Agentif.anthropic_thinking_request(adaptive_model, nothing, 8192).thinking === nothing
     @test Agentif.anthropic_thinking_request(anthropic_test_model(reasoning = false), "high", 8192).thinking === nothing
 
+    # Registry metadata wins over model-name inference.
+    metadata_model = anthropic_test_model(
+        id = "custom-anthropic-model",
+        compat = Dict{String, Any}("forceAdaptiveThinking" => true),
+        thinkingLevelMap = Dict{String, Any}(
+            "off" => "disabled",
+            "high" => "medium",
+            "max" => "high",
+        ),
+    )
+    metadata_cfg = Agentif.anthropic_thinking_request(metadata_model, "max", 8192)
+    @test metadata_cfg.thinking.type == "adaptive"
+    @test metadata_cfg.output_config.effort == "high"
+
+    opt_out_model = anthropic_test_model(
+        id = "claude-opus-4-8",
+        maxTokens = 64000,
+        compat = Dict{String, Any}(
+            "forceAdaptiveThinking" => false,
+            "supportsTemperature" => true,
+        ),
+    )
+    opt_out_cfg = Agentif.anthropic_thinking_request(opt_out_model, "medium", 4096)
+    @test opt_out_cfg.thinking.type == "enabled"
+    @test opt_out_cfg.output_config === nothing
+    @test Agentif.anthropic_supports_extended_thinking(opt_out_model)
+    @test !Agentif.anthropic_rejects_sampling_params(opt_out_model)
+
     @test Agentif.anthropic_thinking_is_enabled(nothing) == false
     @test Agentif.anthropic_thinking_is_enabled(Dict("type" => "disabled")) == false
     @test Agentif.anthropic_thinking_is_enabled(Dict("type" => "adaptive")) == true
@@ -1712,11 +1766,25 @@ end
     )
     @test dropped.thinking === nothing
 
-    # Supported configs pass through untouched
+    # Supported configs are converted to validated typed values.
     supported = Agentif.anthropic_normalize_thinking(Dict("type" => "adaptive"), opus5, 32000)
-    @test supported.thinking["type"] == "adaptive"
-    @test Agentif.anthropic_normalize_thinking(Dict("type" => "disabled"), opus5, 32000).thinking["type"] == "disabled"
-    @test Agentif.anthropic_normalize_thinking(Dict("type" => "enabled", "budget_tokens" => 2048), haiku, 32000).thinking["budget_tokens"] == 2048
+    @test supported.thinking.type == "adaptive"
+    @test Agentif.anthropic_normalize_thinking(
+        Dict("type" => "disabled"), opus5, 32000).thinking.type == "disabled"
+    @test Agentif.anthropic_normalize_thinking(
+        Dict("type" => "enabled", "budget_tokens" => 2048), haiku, 32000,
+    ).thinking.budget_tokens == 2048
+    minimum = @test_logs (:warn,) match_mode = :any Agentif.anthropic_normalize_thinking(
+        Dict("type" => "enabled", "budget_tokens" => 10), haiku, 32000,
+    )
+    @test minimum.thinking.budget_tokens == 1024
+    below_max = @test_logs (:warn,) match_mode = :any Agentif.anthropic_normalize_thinking(
+        Dict("type" => "enabled", "budget_tokens" => 64000), haiku, 32000,
+    )
+    @test below_max.thinking.budget_tokens < below_max.max_tokens
+    @test_throws ArgumentError Agentif.anthropic_normalize_thinking(
+        Dict("type" => "enabled", "budget_tokens" => "many"), haiku, 32000,
+    )
     @test Agentif.anthropic_normalize_thinking(nothing, opus5, 32000).thinking === nothing
 end
 
@@ -1728,6 +1796,7 @@ end
     @test Agentif.anthropic_cache_control("https://api.anthropic.com", "none") === nothing
     @test Agentif.anthropic_cache_control("https://api.anthropic.com", "short").ttl === nothing
     @test Agentif.anthropic_cache_control("https://api.anthropic.com", "long").ttl == "1h"
+    @test Agentif.anthropic_cache_control("https://api.anthropic.com.example.test", "long").ttl === nothing
     @test Agentif.anthropic_cache_control("http://127.0.0.1:8080", "long").ttl === nothing
 
     # a string user turn is promoted to a block array carrying the breakpoint
@@ -1768,11 +1837,13 @@ end
     @test all(b -> b.cache_control === nothing, Agentif.anthropic_oauth_system_blocks("You are helpful.", nothing))
 end
 
-@testset "anthropic request shaping: thinking, effort, cache_control, temperature guard" begin
+@testset "anthropic request shaping: thinking, effort, caching, and API guards" begin
     bodies = Vector{Any}()
+    beta_headers = String[]
 
     server = HTTP.serve!("127.0.0.1", 0) do req
         push!(bodies, JSON.parse(String(req.body)))
+        push!(beta_headers, something(HTTP.header(req, "anthropic-beta"), ""))
         sse = join([
             "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_s\",\"role\":\"assistant\",\"content\":[],\"usage\":{\"input_tokens\":5,\"output_tokens\":1}}}",
             "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}",
@@ -1787,8 +1858,12 @@ end
     try
         port = HTTP.Sockets.getsockname(server.listener.server)[2]
         base_url = "http://127.0.0.1:$port"
-        # temperature comes from model.kw; the sampling guard has to strip it
-        model = anthropic_test_model(baseUrl = base_url, maxTokens = 128000, kw = (; temperature = 0.7))
+        # Sampling controls come from model.kw; the newest-model guard strips all three.
+        model = anthropic_test_model(
+            baseUrl = base_url,
+            maxTokens = 128000,
+            kw = (; temperature = 0.7, top_p = 0.8, top_k = 20),
+        )
         agent = Agent(id = "anthropic-shape-test", prompt = "You are helpful.", model = model, apikey = "test-key", tools = AgentTool[])
 
         stream(ev -> ev, agent, AgentState(), "Say hello", Abort(); reasoning_effort = "xhigh")
@@ -1799,6 +1874,8 @@ end
         @test body["output_config"]["effort"] == "xhigh"
         # Claude Opus 5 rejects non-default sampling params outright
         @test !haskey(body, "temperature")
+        @test !haskey(body, "top_p")
+        @test !haskey(body, "top_k")
         # the effort kwarg is consumed, never forwarded as an unknown request field
         @test !haskey(body, "reasoning_effort")
         @test body["max_tokens"] == 128000
@@ -1814,18 +1891,29 @@ end
         @test !haskey(plain, "thinking")
         @test !haskey(plain, "output_config")
         @test !haskey(plain, "temperature")
+        @test !haskey(plain, "top_p")
+        @test !haskey(plain, "top_k")
 
-        # On older models temperature is only dropped while thinking is on
+        # Older models only reject temperature/top_k while thinking is on. Their
+        # top_p value must be in the 0.95–1.0 interval.
         legacy_agent = Agent(
             id = "anthropic-legacy-test", prompt = "You are helpful.",
-            model = anthropic_test_model(id = "claude-opus-4-6", baseUrl = base_url, kw = (; temperature = 0.7)),
+            model = anthropic_test_model(
+                id = "claude-opus-4-6",
+                baseUrl = base_url,
+                kw = (; temperature = 0.7, top_p = 0.8, top_k = 20),
+            ),
             apikey = "test-key", tools = AgentTool[],
         )
         stream(ev -> ev, legacy_agent, AgentState(), "Say hello", Abort())
         @test bodies[end]["temperature"] == 0.7
+        @test bodies[end]["top_p"] == 0.8
+        @test bodies[end]["top_k"] == 20
         stream(ev -> ev, legacy_agent, AgentState(), "Say hello", Abort(); reasoning_effort = "xhigh")
         legacy_thinking = bodies[end]
         @test !haskey(legacy_thinking, "temperature")
+        @test !haskey(legacy_thinking, "top_p")
+        @test !haskey(legacy_thinking, "top_k")
         @test legacy_thinking["thinking"]["type"] == "adaptive"
         # Opus 4.6 has max but not xhigh
         @test legacy_thinking["output_config"]["effort"] == "max"
@@ -1844,6 +1932,20 @@ end
         @test budget_body["max_tokens"] == 12288
         # Haiku 4.5 does not support the effort parameter
         @test !haskey(budget_body, "output_config")
+
+        valid_top_p_agent = Agent(
+            id = "anthropic-valid-top-p-test", prompt = "You are helpful.",
+            model = anthropic_test_model(
+                id = "claude-haiku-4-5-20251001",
+                maxTokens = 64000,
+                baseUrl = base_url,
+                kw = (; top_p = 0.97),
+            ),
+            apikey = "test-key", tools = AgentTool[],
+        )
+        stream(ev -> ev, valid_top_p_agent, AgentState(), "Say hello", Abort();
+            reasoning_effort = "medium", max_tokens = 4096)
+        @test bodies[end]["top_p"] == 0.97
 
         # cache_retention="none" drops every breakpoint
         stream(ev -> ev, agent, AgentState(), "Say hello", Abort(); cache_retention = "none")
@@ -1866,6 +1968,33 @@ end
         clamped = bodies[end]
         @test clamped["thinking"]["type"] == "adaptive"
         @test !haskey(clamped["thinking"], "budget_tokens")
+
+        # Opus 5 rejects disabled thinking with xhigh/max effort.
+        stream(ev -> ev, agent, AgentState(), "Say hello", Abort();
+            thinking = Dict("type" => "disabled"),
+            output_config = Dict("effort" => "max"))
+        effort_conflict = bodies[end]
+        @test effort_conflict["thinking"]["type"] == "adaptive"
+        @test effort_conflict["thinking"]["display"] == "summarized"
+
+        # Manual thinking rejects forced tool selection. Sonnet 4.6 still needs
+        # the interleaved-thinking beta when manual thinking is selected.
+        shape_tool = @tool "Echo text." anthropic_shape_echo(text::String) = text
+        manual_agent = Agent(
+            id = "anthropic-manual-tool-test", prompt = "You are helpful.",
+            model = anthropic_test_model(
+                id = "claude-sonnet-4-6",
+                maxTokens = 64000,
+                baseUrl = base_url,
+            ),
+            apikey = "test-key", tools = [shape_tool],
+        )
+        stream(ev -> ev, manual_agent, AgentState(), "Say hello", Abort();
+            thinking = Dict("type" => "enabled", "budget_tokens" => 2048),
+            tool_choice = Dict("type" => "tool", "name" => "anthropic_shape_echo"))
+        manual = bodies[end]
+        @test !haskey(manual, "tool_choice")
+        @test occursin("interleaved-thinking-2025-05-14", beta_headers[end])
 
         # OAuth keeps its two system breakpoints and still caches the conversation tail
         oauth_agent = Agent(
@@ -1994,6 +2123,157 @@ end
     end
 end
 
+@testset "anthropic pause_turn preserves raw server-tool state" begin
+    seen_events = Agentif.AgentEvent[]
+    bodies = Vector{Any}()
+    expected_server_tool = Dict{String, Any}(
+        "type" => "server_tool_use",
+        "id" => "srvtoolu_01",
+        "name" => "web_search",
+        "input" => Dict{String, Any}("query" => "Julia language"),
+    )
+    expected_server_result = Dict{String, Any}(
+        "type" => "web_search_tool_result",
+        "tool_use_id" => "srvtoolu_01",
+        "content" => Any[
+            Dict{String, Any}(
+                "type" => "web_search_result",
+                "url" => "https://julialang.org",
+                "title" => "The Julia Programming Language",
+                "encrypted_content" => "opaque-result",
+            ),
+        ],
+    )
+
+    server = HTTP.serve!("127.0.0.1", 0) do req
+        push!(bodies, JSON.parse(String(req.body)))
+        sse = if length(bodies) == 1
+            join([
+                "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_srv_1\",\"role\":\"assistant\",\"content\":[],\"usage\":{\"input_tokens\":20,\"output_tokens\":1}}}",
+                "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"server_tool_use\",\"id\":\"srvtoolu_01\",\"name\":\"web_search\",\"input\":{}}}",
+                "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"query\\\":\\\"Julia language\\\"}\"}}",
+                "data: {\"type\":\"content_block_stop\",\"index\":0}",
+                "data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"web_search_tool_result\",\"tool_use_id\":\"srvtoolu_01\",\"content\":[{\"type\":\"web_search_result\",\"url\":\"https://julialang.org\",\"title\":\"The Julia Programming Language\",\"encrypted_content\":\"opaque-result\"}]}}",
+                "data: {\"type\":\"content_block_stop\",\"index\":1}",
+                "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"pause_turn\"},\"usage\":{\"output_tokens\":8}}",
+                "data: {\"type\":\"message_stop\"}",
+            ], "\n\n") * "\n\n"
+        else
+            join([
+                "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_srv_2\",\"role\":\"assistant\",\"content\":[],\"usage\":{\"input_tokens\":30,\"output_tokens\":1}}}",
+                "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}",
+                "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Julia found.\"}}",
+                "data: {\"type\":\"content_block_stop\",\"index\":0}",
+                "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":3}}",
+                "data: {\"type\":\"message_stop\"}",
+            ], "\n\n") * "\n\n"
+        end
+        return HTTP.Response(200, ["Content-Type" => "text/event-stream"], sse)
+    end
+
+    try
+        port = HTTP.Sockets.getsockname(server.listener.server)[2]
+        model = anthropic_test_model(baseUrl = "http://127.0.0.1:$port")
+        agent = Agent(
+            id = "anthropic-server-pause-test",
+            prompt = "You are helpful.",
+            model = model,
+            apikey = "test-key",
+            tools = AgentTool[],
+        )
+
+        result = stream(
+            ev -> (push!(seen_events, ev); ev),
+            agent,
+            AgentState(),
+            "Search the web",
+            Abort(),
+        )
+        @test result.most_recent_stop_reason == :stop
+        @test length(bodies) == 2
+        @test !any(ev -> ev isa Agentif.AgentErrorEvent, seen_events)
+        resumed = bodies[2]["messages"][end]
+        @test resumed["role"] == "assistant"
+        @test resumed["content"] == Any[expected_server_tool, expected_server_result]
+        @test Agentif.message_text(result.messages[end]) == "Julia found."
+    finally
+        close(server)
+    end
+end
+
+@testset "anthropic non-streaming pause_turn preserves raw content" begin
+    bodies = Vector{Any}()
+    paused_content = Any[
+        Dict{String, Any}(
+            "type" => "server_tool_use",
+            "id" => "srvtoolu_nonstream",
+            "name" => "web_fetch",
+            "input" => Dict{String, Any}("url" => "https://julialang.org"),
+        ),
+        Dict{String, Any}(
+            "type" => "web_fetch_tool_result",
+            "tool_use_id" => "srvtoolu_nonstream",
+            "content" => Dict{String, Any}(
+                "type" => "web_fetch_result",
+                "url" => "https://julialang.org",
+                "content" => "opaque",
+            ),
+        ),
+    ]
+
+    server = HTTP.serve!("127.0.0.1", 0) do req
+        push!(bodies, JSON.parse(String(req.body)))
+        response = if length(bodies) == 1
+            Dict{String, Any}(
+                "id" => "msg_ns_1",
+                "model" => "claude-opus-5",
+                "role" => "assistant",
+                "content" => paused_content,
+                "stop_reason" => "pause_turn",
+                "usage" => Dict("input_tokens" => 4, "output_tokens" => 2),
+            )
+        else
+            Dict{String, Any}(
+                "id" => "msg_ns_2",
+                "model" => "claude-opus-5",
+                "role" => "assistant",
+                "content" => Any[Dict("type" => "text", "text" => "Done.")],
+                "stop_reason" => "end_turn",
+                "usage" => Dict("input_tokens" => 6, "output_tokens" => 1),
+            )
+        end
+        return HTTP.Response(
+            200,
+            ["Content-Type" => "application/json"],
+            JSON.json(response),
+        )
+    end
+
+    try
+        port = HTTP.Sockets.getsockname(server.listener.server)[2]
+        model = anthropic_test_model(baseUrl = "http://127.0.0.1:$port")
+        agent = Agent(
+            id = "anthropic-nonstream-pause-test",
+            prompt = "You are helpful.",
+            model = model,
+            apikey = "test-key",
+            tools = AgentTool[],
+        )
+        result = withenv("AGENTIF_DISABLE_STREAMING" => "1") do
+            stream(identity, agent, AgentState(), "Fetch the page", Abort())
+        end
+
+        @test length(bodies) == 2
+        @test bodies[2]["messages"][end]["content"] == paused_content
+        @test Agentif.message_text(result.messages[end]) == "Done."
+        @test result.most_recent_stop_reason == :stop
+        @test result.usage.input == 10
+        @test result.usage.output == 3
+    finally
+        close(server)
+    end
+end
+
 @testset "anthropic pause_turn resubmits are bounded" begin
     bodies = Vector{Any}()
 
@@ -2019,8 +2299,12 @@ end
         result = stream(ev -> (push!(seen_events, ev); ev), agent, AgentState(), "Loop forever", Abort())
         # one original request plus ANTHROPIC_MAX_PAUSE_TURN_RESUBMITS continuations
         @test length(bodies) == 1 + Agentif.ANTHROPIC_MAX_PAUSE_TURN_RESUBMITS
-        @test result.most_recent_stop_reason == :stop
+        @test result.most_recent_stop_reason == :length
         @test Agentif.message_text(result.messages[end]) == "xxxx"
+        @test all(body -> begin
+            replay = body["messages"][end]["content"]
+            length(replay) == 1 && replay[1]["text"] == "x"
+        end, bodies[2:end])
         @test count(ev -> ev isa Agentif.MessageEndEvent, seen_events) == 1
     finally
         close(server)

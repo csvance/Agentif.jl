@@ -273,6 +273,7 @@ end
     stream::Union{Nothing, Bool} = nothing
     temperature::Union{Nothing, Float64} = nothing
     top_p::Union{Nothing, Float64} = nothing
+    top_k::Union{Nothing, Int} = nothing
     stop_sequences::Union{Nothing, Vector{String}} = nothing
     # `Any` (like tool_choice) so callers can pass a raw Dict/NamedTuple through
     # `model.kw`/stream kwargs while the adapter builds the typed structs above.
