@@ -3,7 +3,7 @@ using JSON
 
 const OPENAI_RESPONSES_TOOL_CALL_PROVIDERS = Set(["openai", "openai-codex", "opencode"])
 
-function openai_responses_build_tools(tools::Vector{AgentTool})
+function openai_responses_build_tools(tools::Vector{<:AgentTool})
     isempty(tools) && return nothing
     provider_tools = OpenAIResponses.Tool[]
     for tool in tools
@@ -100,7 +100,7 @@ function openai_responses_normalize_tool_call_id(id::String, model::Model)
 end
 
 function openai_responses_transformed_messages(state::AgentState, input::AgentTurnInput, model::Model)
-    raw_messages = AgentMessage[]
+    raw_messages = StoredAgentMessage[]
     for msg in state.messages
         include_in_context(msg) || continue
         push!(raw_messages, msg)
@@ -252,7 +252,7 @@ function openai_responses_stop_reason(status::Union{Nothing, String}, tool_calls
 end
 
 function openai_responses_event_callback(
-        f::Function,
+        f::F,
         agent::Agent,
         assistant_message::AssistantMessage,
         started::Base.RefValue{Bool},
@@ -260,7 +260,7 @@ function openai_responses_event_callback(
         response_usage::Base.RefValue{Union{Nothing, OpenAIResponses.Usage}},
         response_status::Base.RefValue{Union{Nothing, String}},
         abort::Abort,
-    )
+    ) where {F <: Function}
     return function (stream, event)
         maybe_abort!(abort, stream)
         data = String(event.data)

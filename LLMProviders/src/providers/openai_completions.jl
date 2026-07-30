@@ -5,16 +5,16 @@ using StructUtils, JSON, JSONSchema
 
 schema(::Type{T}) where {T} = JSONSchema.schema(T; all_fields_required = false, additionalProperties = false)
 
-@omit_null @kwarg struct ToolFunction{T}
+@omit_null @kwarg struct ToolFunction
     name::String
     description::Union{Nothing, String} = nothing
-    parameters::JSONSchema.Schema{T}
+    parameters::JSONSchema.Schema
     strict::Union{Nothing, Bool} = nothing
 end
 
-@omit_null @kwarg struct FunctionTool{T}
+@omit_null @kwarg struct FunctionTool
     type::String = "function"
-    var"function"::ToolFunction{T}
+    var"function"::ToolFunction
 end
 
 const Tool = Union{FunctionTool}
@@ -150,6 +150,7 @@ end
     tool_choice::Union{Nothing, Any} = nothing
     store::Union{Nothing, Bool} = nothing
     stream_options::Union{Nothing, Any} = nothing
+    reasoning::Union{Nothing, Any} = nothing
     reasoning_effort::Union{Nothing, String} = nothing
     thinking::Union{Nothing, Any} = nothing
     reasoning_split::Union{Nothing, Bool} = nothing
@@ -159,6 +160,7 @@ end
     top_p::Union{Nothing, Float64} = nothing
     stop::Union{Nothing, Union{String, Vector{String}}} = nothing
     parallel_tool_calls::Union{Nothing, Bool} = nothing
+    provider::Union{Nothing, Any} = nothing
 end
 
 end # module OpenAICompletions

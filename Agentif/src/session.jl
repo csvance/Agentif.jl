@@ -4,7 +4,7 @@ abstract type SessionStore end
     id::String
     parent_id::Union{Nothing, String} = nothing
     created_at::Float64 = time()
-    messages::Vector{AgentMessage} = AgentMessage[]
+    messages::Vector{StoredAgentMessage} = StoredAgentMessage[]
     is_compaction::Bool = false
     first_kept_entry_id::Union{Nothing, String} = nothing
     is_deleted::Bool = false
@@ -67,7 +67,7 @@ function set_branch_leaf!(store::InMemorySessionStore, branch_id::String, entry_
     end
 end
 
-function lock_branch(f::Function, store::InMemorySessionStore, branch_id::String)
+function lock_branch(f::F, store::InMemorySessionStore, branch_id::String) where {F <: Function}
     branch_lock = lock(store.lock) do
         get!(store.branch_locks, branch_id) do
             ReentrantLock()

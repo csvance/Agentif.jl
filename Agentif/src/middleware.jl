@@ -7,7 +7,7 @@ function drain_channel!(channel::Channel{AgentTurnInput})
 end
 
 function steer_middleware(agent_handler::AgentHandler, steer_queue::Union{Nothing, Channel{AgentTurnInput}})
-    return function (f, agent::Agent, state::AgentState, current_input::AgentTurnInput, abort::Abort; kw...)
+    return function (f::F, agent::Agent, state::AgentState, current_input::AgentTurnInput, abort::Abort; kw...) where {F <: Function}
         steer_queue === nothing && return agent_handler(f, agent, state, current_input, abort; kw...)
         isready(steer_queue) || return agent_handler(f, agent, state, current_input, abort; kw...)
         steer_inputs = drain_channel!(steer_queue)
@@ -23,7 +23,7 @@ function steer_middleware(agent_handler::AgentHandler, steer_queue::Union{Nothin
 end
 
 function tool_call_middleware(agent_handler::AgentHandler)
-    return function (f, agent::Agent, state::AgentState, current_input::AgentTurnInput, abort::Abort; kw...)
+    return function (f::F, agent::Agent, state::AgentState, current_input::AgentTurnInput, abort::Abort; kw...) where {F <: Function}
         next_input = current_input
         current_state = state
         futures = Future{ToolResultMessage}[]
@@ -69,7 +69,7 @@ function tool_call_middleware(agent_handler::AgentHandler)
 end
 
 function queue_middleware(agent_handler::AgentHandler, message_queue::Union{Nothing, Channel{AgentTurnInput}})
-    return function (f, agent::Agent, state::AgentState, current_input::AgentTurnInput, abort::Abort; kw...)
+    return function (f::F, agent::Agent, state::AgentState, current_input::AgentTurnInput, abort::Abort; kw...) where {F <: Function}
         current_state = agent_handler(f, agent, state, current_input, abort; kw...)
         check_abort(abort)
         message_queue === nothing && return current_state
@@ -83,7 +83,7 @@ function queue_middleware(agent_handler::AgentHandler, message_queue::Union{Noth
 end
 
 function evaluate_middleware(agent_handler::AgentHandler)
-    return function (f, agent::Agent, state::AgentState, current_input::AgentTurnInput, abort::Abort; kw...)
+    return function (f::F, agent::Agent, state::AgentState, current_input::AgentTurnInput, abort::Abort; kw...) where {F <: Function}
         evaluate_id = UID8()
         @debug "Agent evaluate started" evaluate_id model = agent.model.id tool_count = length(agent.tools) input_type = string(typeof(current_input))
         f(AgentEvaluateStartEvent(evaluate_id))
@@ -182,7 +182,7 @@ end
 
 function session_middleware(agent_handler::AgentHandler, store::Union{Nothing, SessionStore}; channel::Union{Nothing, AbstractChannel} = nothing)
     search_tool = store === nothing ? nothing : _create_search_session_tool(store)
-    return function (f, agent::Agent, state::AgentState, current_input::AgentTurnInput, abort::Abort; kw...)
+    return function (f::F, agent::Agent, state::AgentState, current_input::AgentTurnInput, abort::Abort; kw...) where {F <: Function}
         store === nothing && return agent_handler(f, agent, state, current_input, abort; kw...)
         current_channel = channel === nothing ? CURRENT_CHANNEL[] : channel
         current_channel === nothing && return agent_handler(f, agent, state, current_input, abort; kw...)
@@ -283,7 +283,7 @@ function guardrail_input_text(input::AgentTurnInput)
 end
 
 function input_guardrail_middleware(agent_handler::AgentHandler, guardrail::Union{Nothing, Bool, Function})
-    return function (f, agent::Agent, state::AgentState, current_input::AgentTurnInput, abort::Abort; input_guardrail_model::Union{Nothing, Model} = nothing, input_guardrail_apikey::Union{Nothing, String} = nothing, kw...)
+    return function (f::F, agent::Agent, state::AgentState, current_input::AgentTurnInput, abort::Abort; input_guardrail_model::Union{Nothing, Model} = nothing, input_guardrail_apikey::Union{Nothing, String} = nothing, kw...) where {F <: Function}
         (guardrail === nothing || guardrail === false) && return agent_handler(f, agent, state, current_input, abort; kw...)
         text = guardrail_input_text(current_input)
         text === nothing && return agent_handler(f, agent, state, current_input, abort; kw...)
@@ -309,7 +309,7 @@ function input_guardrail_middleware(agent_handler::AgentHandler, guardrail::Unio
 end
 
 function skills_middleware(agent_handler::AgentHandler, registry::Union{Nothing, SkillRegistry}; include_location::Bool = true)
-    return function (f, agent::Agent, state::AgentState, current_input::AgentTurnInput, abort::Abort; kw...)
+    return function (f::F, agent::Agent, state::AgentState, current_input::AgentTurnInput, abort::Abort; kw...) where {F <: Function}
         registry === nothing && return agent_handler(f, agent, state, current_input, abort; kw...)
         isempty(registry.skills) && return agent_handler(f, agent, state, current_input, abort; kw...)
         prompt = append_available_skills(agent.prompt, values(registry.skills); include_location)
@@ -328,29 +328,32 @@ function build_default_handler(
         skill_registry::Union{Nothing, SkillRegistry} = nothing,
         channel::Union{Nothing, AbstractChannel} = nothing,
     )
-    handler = base_handler
-    if compaction_config !== nothing
-        handler = compaction_middleware(handler, compaction_config)
-    end
-    handler = steer_middleware(handler, steer_queue)
-    handler = channel_middleware(handler, channel)
-    handler = tool_call_middleware(handler)
+    compaction_handler = compaction_config === nothing ?
+        base_handler : compaction_middleware(base_handler, compaction_config)
+    steer_handler = steer_middleware(compaction_handler, steer_queue)
+    channel_handler = channel_middleware(steer_handler, channel)
+    tool_handler = tool_call_middleware(channel_handler)
     # Inject channel-specific tools (e.g. emoji reactions) outside the tool_call
     # loop so that findtool can resolve them when the model calls them.
-    if channel !== nothing
+    channel_tools_handler = if channel === nothing
+        tool_handler
+    else
         ch_tools = create_channel_tools(channel)
-        if !isempty(ch_tools)
-            inner_handler = handler
-            handler = (f, agent::Agent, state::AgentState, current_input::AgentTurnInput, abort::Abort; kw...) ->
-                inner_handler(f, with_tools(agent, vcat(agent.tools, ch_tools)), state, current_input, abort; kw...)
+        if isempty(ch_tools)
+            tool_handler
+        else
+            function (f::F, agent::Agent, state::AgentState, current_input::AgentTurnInput, abort::Abort; kw...) where {F <: Function}
+                return tool_handler(f, with_tools(agent, vcat(agent.tools, ch_tools)), state, current_input, abort; kw...)
+            end
         end
     end
-    handler = session_middleware(handler, session_store; channel)
-    handler = input_guardrail_middleware(handler, input_guardrail)
-    handler = skills_middleware(handler, skill_registry)
-    handler = evaluate_middleware(handler)
-    handler = queue_middleware(handler, message_queue)
-    return handler
+    session_handler = session_store === nothing ?
+        channel_tools_handler :
+        session_middleware(channel_tools_handler, session_store; channel)
+    guardrail_handler = input_guardrail_middleware(session_handler, input_guardrail)
+    skills_handler = skills_middleware(guardrail_handler, skill_registry)
+    evaluate_handler = evaluate_middleware(skills_handler)
+    return queue_middleware(evaluate_handler, message_queue)
 end
 
 evaluate(
@@ -362,7 +365,7 @@ evaluate(
 ) = evaluate(identity, agent, input; abort, level, kw...)
 
 function evaluate(
-        f::Function,
+        f::F,
         agent::Agent,
         input::AgentTurnInput;
         state::AgentState = AgentState(),
@@ -378,12 +381,10 @@ function evaluate(
         repeat_input::Bool = false,
         level::Union{Nothing, LogLevel, Int, Symbol, AbstractString} = nothing,
         kw...,
-    )
-    if repeat_input && input isa String
-        input = input * "\n\n" * input
-    end
+    ) where {F <: Function}
+    current_input = repeat_input && input isa String ? input * "\n\n" * input : input
     handler = build_default_handler(; base_handler, compaction_config, steer_queue, message_queue, session_store, input_guardrail, skill_registry, channel)
     return with_log_level(level) do
-        handler(f, agent, state, input, abort; kw...)
+        handler(f, agent, state, current_input, abort; kw...)
     end
 end

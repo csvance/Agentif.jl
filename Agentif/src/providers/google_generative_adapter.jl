@@ -1,4 +1,4 @@
-function google_generative_build_tools(tools::Vector{AgentTool})
+function google_generative_build_tools(tools::Vector{<:AgentTool})
     isempty(tools) && return nothing
     decls = GoogleGenerativeAI.FunctionDeclaration[]
     for tool in tools
@@ -12,7 +12,7 @@ function google_generative_build_tools(tools::Vector{AgentTool})
 end
 
 function google_generative_build_contents(agent::Agent, state::AgentState, input::AgentTurnInput, model::Model)
-    context = AgentMessage[]
+    context = StoredAgentMessage[]
     for msg in state.messages
         include_in_context(msg) || continue
         push!(context, msg)
@@ -162,7 +162,7 @@ function google_generative_stop_reason(reason::Union{Nothing, String}, tool_call
 end
 
 function google_generative_event_callback(
-        f::Function,
+        f::F,
         agent::Agent,
         assistant_message::AssistantMessage,
         started::Base.RefValue{Bool},
@@ -171,7 +171,7 @@ function google_generative_event_callback(
         latest_finish::Base.RefValue{Union{Nothing, String}},
         seen_call_ids::Set{String},
         abort::Abort,
-    )
+    ) where {F <: Function}
     return function (stream, event)
         maybe_abort!(abort, stream)
         data = String(event.data)

@@ -46,13 +46,11 @@ end
 
 new_call_id(prefix::String) = string(prefix, "-", string(UID8()))
 
-function parse_tool_arguments(arguments::String)
+function parse_tool_arguments(arguments::String)::ToolArguments
     try
-        parsed = JSON.parse(arguments)
-        parsed isa AbstractDict || return Dict{String, Any}()
-        return Dict{String, Any}(parsed)
+        return JSON.parse(arguments, ToolArguments)
     catch
-        return Dict{String, Any}()
+        return ToolArguments()
     end
 end
 
@@ -76,9 +74,33 @@ function normalize_mistral_tool_id(id::String)
     return normalized
 end
 
-function transform_messages(messages::Vector{AgentMessage}, model::Model; normalize_tool_call_id::Function = identity)
+function flush_pending_tool_results!(
+        normalized::Vector{StoredAgentMessage},
+        pending::Vector{ToolCallContent},
+        resolved::Set{String},
+    )
+    isempty(pending) && return
+    for call in pending
+        if !(call.id in resolved)
+            push!(normalized, ToolResultMessage(;
+                call_id = call.id,
+                name = call.name,
+                content = ToolResultContentBlock[TextContent("No result provided")],
+                is_error = true,
+            ))
+        end
+    end
+    empty!(pending)
+    empty!(resolved)
+    return
+end
+
+function transform_messages(
+        messages::Vector{StoredAgentMessage}, model::Model;
+        normalize_tool_call_id::F = identity,
+    )::Vector{StoredAgentMessage} where {F}
     tool_call_id_map = Dict{String, String}()
-    transformed = AgentMessage[]
+    transformed = StoredAgentMessage[]
     for msg in messages
         if msg isa CompactionSummaryMessage
             push!(transformed, msg)
@@ -125,30 +147,13 @@ function transform_messages(messages::Vector{AgentMessage}, model::Model; normal
         end
     end
 
-    normalized = AgentMessage[]
+    normalized = StoredAgentMessage[]
     pending = ToolCallContent[]
     resolved = Set{String}()
 
-    function flush_pending!()
-        isempty(pending) && return
-        for call in pending
-            if !(call.id in resolved)
-                push!(normalized, ToolResultMessage(;
-                    call_id = call.id,
-                    name = call.name,
-                    content = ToolResultContentBlock[TextContent("No result provided")],
-                    is_error = true,
-                ))
-            end
-        end
-        empty!(pending)
-        empty!(resolved)
-        return
-    end
-
     for msg in transformed
         if msg isa AssistantMessage
-            flush_pending!()
+            flush_pending_tool_results!(normalized, pending, resolved)
             push!(normalized, msg)
             empty!(pending)
             empty!(resolved)
@@ -159,11 +164,11 @@ function transform_messages(messages::Vector{AgentMessage}, model::Model; normal
             !isempty(pending) && push!(resolved, msg.call_id)
             push!(normalized, msg)
         else
-            flush_pending!()
+            flush_pending_tool_results!(normalized, pending, resolved)
             push!(normalized, msg)
         end
     end
-    flush_pending!()
+    flush_pending_tool_results!(normalized, pending, resolved)
     return normalized
 end
 
@@ -246,23 +251,37 @@ const OAUTH_BACKEND = Ref{AbstractOAuthBackend}(MissingOAuthBackend())
 get_codex_token(::AbstractOAuthBackend) = throw(ArgumentError("Codex OAuth token provider unavailable; load `LLMOAuth` and run `LLMOAuth.codex_login()` first, or pass an explicit `apikey`"))
 get_anthropic_token(::AbstractOAuthBackend) = throw(ArgumentError("Anthropic OAuth token provider unavailable; load `LLMOAuth` and run `LLMOAuth.anthropic_login()` first, or pass an explicit `apikey`"))
 
-function resolve_oauth_apikey(provider::Symbol, apikey::AbstractString; backend::AbstractOAuthBackend = OAUTH_BACKEND[])
-    apikey != "OAUTH" && return apikey
-    if provider == :codex
-        token = get_codex_token(backend)
-    elseif provider == :anthropic
-        token = get_anthropic_token(backend)
-    else
-        throw(ArgumentError("Unsupported OAuth provider: $(provider)"))
+if TRIMMED_BUILD
+    model_request_kw(::Model) = (;)
+else
+    model_request_kw(model::Model) = model.kw
+end
+
+if TRIMMED_BUILD
+    function resolve_oauth_apikey(provider::Symbol, apikey::AbstractString)
+        apikey != "OAUTH" && return apikey
+        throw(ArgumentError("OAuth token extensions are unavailable in a trimmed Agentif build for provider $(provider)."))
     end
-    token isa AbstractString && !isempty(token) || throw(ArgumentError("OAuth token provider for $(provider) must return a non-empty String token"))
-    return token
+else
+    function resolve_oauth_apikey(provider::Symbol, apikey::AbstractString; backend::AbstractOAuthBackend = OAUTH_BACKEND[])
+        apikey != "OAUTH" && return apikey
+        if provider == :codex
+            token = get_codex_token(backend)
+        elseif provider == :anthropic
+            token = get_anthropic_token(backend)
+        else
+            throw(ArgumentError("Unsupported OAuth provider: $(provider)"))
+        end
+        token isa AbstractString && !isempty(token) || throw(ArgumentError("OAuth token provider for $(provider) must return a non-empty String token"))
+        return token
+    end
 end
 
 function stream(
-        f::Function, agent::Agent, state::AgentState, input::AgentTurnInput, abort::Abort;
+        f::F, agent::Agent, state::AgentState, input::AgentTurnInput, abort::Abort;
         model::Union{Nothing, Model} = nothing, http_kw = (;), kw...
-    )
+    ) where {F <: Function}
+    api = model === nothing ? agent.api : Val(Symbol(model.api))
     model = model === nothing ? agent.model : model
     model === nothing && throw(ArgumentError("no model specified with which agent can evaluate input"))
 
@@ -280,7 +299,7 @@ function stream(
     end
     apikey = apikey_override === nothing ? agent.apikey : apikey_override
 
-    if model.api == "openai-responses"
+    if api isa Val{Symbol("openai-responses")}
         apikey isa AbstractString || throw(ArgumentError("apikey must be a String for provider $(model.provider)"))
         assistant_message = assistant_message_for_model(model; response_id = state.response_id)
         started = Ref(false)
@@ -337,7 +356,7 @@ function stream(
         prompt_cache_retention !== nothing && (body["prompt_cache_retention"] = prompt_cache_retention)
 
         # Pass through model.kw (temperature, max_output_tokens, etc.)
-        for (k, v) in pairs(model.kw)
+        for (k, v) in pairs(model_request_kw(model))
             k_str = string(k)
             # Skip fields we already set or that don't belong in the body
             k_str in ("api", "provider", "baseUrl", "reasoning", "input", "cost", "contextWindow", "maxTokens", "headers", "compat", "name", "id") && continue
@@ -422,7 +441,7 @@ function stream(
         stop_reason = openai_responses_stop_reason(response_status[], assistant_message.tool_calls)
         isaborted(abort) && (stop_reason = :aborted)
         return finalize_stream!(state, input, assistant_message, usage, stop_reason)
-    elseif model.api == "openai-completions"
+    elseif api isa Val{Symbol("openai-completions")}
         apikey isa AbstractString || throw(ArgumentError("apikey must be a String for provider $(model.provider)"))
         compat = openai_completions_resolve_compat(model)
         messages, has_tool_history = openai_completions_build_messages(agent, state, input, model)
@@ -442,10 +461,13 @@ function stream(
         end
         reasoning_effort_value = nothing
         if haskey(stream_kw, :reasoning)
-            reasoning_effort_value = stream_kw[:reasoning]
-            stream_kw = Base.structdiff(stream_kw, (; reasoning = nothing))
-            if !haskey(stream_kw, :reasoning_effort)
-                stream_kw = merge(stream_kw, (; reasoning_effort = reasoning_effort_value))
+            reasoning_value = stream_kw[:reasoning]
+            if reasoning_value isa AbstractString || reasoning_value isa Symbol
+                reasoning_effort_value = string(reasoning_value)
+                stream_kw = Base.structdiff(stream_kw, (; reasoning = nothing))
+                if !haskey(stream_kw, :reasoning_effort)
+                    stream_kw = merge(stream_kw, (; reasoning_effort = reasoning_effort_value))
+                end
             end
         end
         if haskey(stream_kw, :reasoning_effort)
@@ -503,7 +525,7 @@ function stream(
             ; model = model.id,
             messages,
             stream = use_stream,
-            model.kw...,
+            model_request_kw(model)...,
             request_kw...,
         )
         headers = Dict(
@@ -645,7 +667,7 @@ function stream(
         stop_reason = openai_completions_stop_reason(latest_finish[], assistant_message.tool_calls)
         isaborted(abort) && (stop_reason = :aborted)
         return finalize_stream!(state, input, assistant_message, usage, stop_reason)
-    elseif model.api == "anthropic-messages"
+    elseif api isa Val{Symbol("anthropic-messages")}
         apikey isa AbstractString || throw(ArgumentError("apikey must be a String for provider $(model.provider)"))
         apikey = resolve_oauth_apikey(:anthropic, apikey)
         is_oauth = startswith(apikey, "sk-ant-oat")
@@ -695,7 +717,7 @@ function stream(
             messages,
             max_tokens,
             stream = !disable_streaming,
-            model.kw...,
+            model_request_kw(model)...,
             request_kw...,
         )
         headers = Dict(
@@ -815,7 +837,7 @@ function stream(
             isaborted(abort) && (final_stop = :aborted)
             return finalize_stream!(state, input, assistant_message, usage, final_stop)
         end
-    elseif model.api == "google-generative-ai"
+    elseif api isa Val{Symbol("google-generative-ai")}
         apikey isa AbstractString || throw(ArgumentError("apikey must be a String for provider $(model.provider)"))
         tools = google_generative_build_tools(agent.tools)
         contents = google_generative_build_contents(agent, state, input, model)
@@ -832,7 +854,7 @@ function stream(
         request_kw = merge((; tools, systemInstruction = system_instruction), stream_kw)
         req = GoogleGenerativeAI.Request(
             ; contents,
-            model.kw...,
+            model_request_kw(model)...,
             request_kw...,
         )
         headers = Dict(
@@ -874,7 +896,7 @@ function stream(
         stop_reason = google_generative_stop_reason(latest_finish[], assistant_message.tool_calls)
         isaborted(abort) && (stop_reason = :aborted)
         return finalize_stream!(state, input, assistant_message, usage, stop_reason)
-    elseif model.api == "google-gemini-cli"
+    elseif api isa Val{Symbol("google-gemini-cli")}
         apikey isa AbstractString || throw(ArgumentError("apikey must be a String for provider $(model.provider)"))
         tools = google_gemini_cli_build_tools(agent.tools)
         contents = google_gemini_cli_build_contents(agent, state, input, model)
@@ -949,12 +971,19 @@ function stream(
         stop_reason = google_gemini_cli_stop_reason(latest_finish[], assistant_message.tool_calls)
         isaborted(abort) && (stop_reason = :aborted)
         return finalize_stream!(state, input, assistant_message, usage, stop_reason)
-    elseif model.api == "openai-codex-responses"
+    elseif api isa Val{Symbol("openai-codex-responses")}
         apikey isa AbstractString || throw(ArgumentError("apikey must be a String for provider $(model.provider)"))
         apikey = resolve_oauth_apikey(:codex, apikey)
-        account_id = get(() -> nothing, kw_nt, :account_id)
-        account_id === nothing && (account_id = get(() -> nothing, kw_nt, :accountId))
-        account_id = resolve_codex_account_id(account_id, String(apikey))
+        if TRIMMED_BUILD
+            codex_options = trimmed_codex_options(kw_nt)
+            account_id = resolve_codex_account_id(
+                codex_options.account_id, String(apikey))
+        else
+            account_id = get(() -> nothing, kw_nt, :account_id)
+            account_id === nothing &&
+                (account_id = get(() -> nothing, kw_nt, :accountId))
+            account_id = resolve_codex_account_id(account_id, String(apikey))
+        end
         account_id === nothing && throw(ArgumentError("Missing `account_id` for openai-codex provider and unable to infer it from access token"))
 
         assistant_message = assistant_message_for_model(model; response_id = state.response_id)
@@ -964,27 +993,44 @@ function stream(
         response_status = Ref{Union{Nothing, String}}(nothing)
         tool_call_accumulators = Dict{String, ToolCallAccumulator}()
 
-        codex_kw = Dict{Symbol, Any}(pairs(kw_nt))
-        haskey(codex_kw, :instructions) && delete!(codex_kw, :instructions)
-        haskey(codex_kw, :account_id) && delete!(codex_kw, :account_id)
-        haskey(codex_kw, :accountId) && delete!(codex_kw, :accountId)
+        if TRIMMED_BUILD
+            codex_kw = (;)
+            session_id = codex_options.session_id
+            reasoning_effort = codex_options.reasoning_effort
+            reasoning_summary = codex_options.reasoning_summary
+            text_verbosity = codex_options.text_verbosity
+            include_opt = codex_options.include_opt
+            max_tokens = codex_options.max_tokens
+            transport = codex_options.transport
+            retry_settings = codex_options.retry_settings
+        else
+            codex_kw = Dict{Symbol, Any}(pairs(kw_nt))
+            haskey(codex_kw, :instructions) && delete!(codex_kw, :instructions)
+            haskey(codex_kw, :account_id) && delete!(codex_kw, :account_id)
+            haskey(codex_kw, :accountId) && delete!(codex_kw, :accountId)
 
-        session_id = pop!(codex_kw, :session_id, nothing)
-        session_id === nothing && (session_id = pop!(codex_kw, :sessionId, nothing))
+            session_id = pop!(codex_kw, :session_id, nothing)
+            session_id === nothing &&
+                (session_id = pop!(codex_kw, :sessionId, nothing))
 
-        reasoning_effort = pop!(codex_kw, :reasoning_effort, nothing)
-        reasoning_effort === nothing && (reasoning_effort = pop!(codex_kw, :reasoningEffort, nothing))
-        if reasoning_effort === nothing && haskey(codex_kw, :reasoning)
-            reasoning_effort = pop!(codex_kw, :reasoning, nothing)
+            reasoning_effort = pop!(codex_kw, :reasoning_effort, nothing)
+            reasoning_effort === nothing &&
+                (reasoning_effort = pop!(codex_kw, :reasoningEffort, nothing))
+            if reasoning_effort === nothing && haskey(codex_kw, :reasoning)
+                reasoning_effort = pop!(codex_kw, :reasoning, nothing)
+            end
+            reasoning_summary = pop!(codex_kw, :reasoning_summary, nothing)
+            reasoning_summary === nothing &&
+                (reasoning_summary = pop!(codex_kw, :reasoningSummary, nothing))
+            text_verbosity = pop!(codex_kw, :textVerbosity, nothing)
+            text_verbosity === nothing &&
+                (text_verbosity = pop!(codex_kw, :text_verbosity, nothing))
+            include_opt = pop!(codex_kw, :include, nothing)
+            max_tokens = pop!(codex_kw, :maxTokens, nothing)
+            transport = normalize_codex_transport(codex_pop_option!(
+                codex_kw, :transport, :transportMode, :websocket, :websockets))
+            retry_settings = codex_retry_settings!(codex_kw)
         end
-        reasoning_summary = pop!(codex_kw, :reasoning_summary, nothing)
-        reasoning_summary === nothing && (reasoning_summary = pop!(codex_kw, :reasoningSummary, nothing))
-        text_verbosity = pop!(codex_kw, :textVerbosity, nothing)
-        text_verbosity === nothing && (text_verbosity = pop!(codex_kw, :text_verbosity, nothing))
-        include_opt = pop!(codex_kw, :include, nothing)
-        max_tokens = pop!(codex_kw, :maxTokens, nothing)
-        transport = normalize_codex_transport(codex_pop_option!(codex_kw, :transport, :transportMode, :websocket, :websockets))
-        retry_settings = codex_retry_settings!(codex_kw)
 
         tools = build_codex_tools(agent.tools)
         current_input = codex_build_input(agent, state, input, model)
@@ -1002,13 +1048,16 @@ function stream(
         session_id !== nothing && (request_body["prompt_cache_key"] = session_id)
         max_tokens !== nothing && (request_body["max_output_tokens"] = max_tokens)
 
-        if model.kw !== nothing
-            for (k, v) in pairs(model.kw)
+        provider_kw = model_request_kw(model)
+        if provider_kw !== nothing
+            for (k, v) in pairs(provider_kw)
                 request_body[string(k)] = v
             end
         end
-        for (k, v) in codex_kw
-            request_body[string(k)] = v
+        if !TRIMMED_BUILD
+            for (k, v) in codex_kw
+                request_body[string(k)] = v
+            end
         end
 
         transform_request_body!(
@@ -1120,7 +1169,7 @@ function stream(
             end
             log_codex_debug(
                 "codex response", Dict(
-                    "url" => resp.request.url,
+                    "url" => url,
                     "status" => resp.status,
                     "content_type" => HTTP.header(resp, "content-type"),
                     "cf_ray" => HTTP.header(resp, "cf-ray"),

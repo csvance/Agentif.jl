@@ -82,7 +82,7 @@ function estimate_message_tokens(msg::AgentMessage)
 end
 
 """
-    find_cut_point(messages::Vector{AgentMessage}, keep_recent_tokens::Int) -> Int
+    find_cut_point(messages::Vector{<:AgentMessage}, keep_recent_tokens::Int) -> Int
 
 Walk backwards from the end of messages, accumulating token estimates.
 Returns the index of the first message to KEEP (messages[1:idx-1] get compacted).
@@ -92,7 +92,7 @@ AssistantMessage that is not preceded by an unresolved tool call. This avoids
 splitting tool-call/result pairs while still allowing compaction in long
 tool-call loops that have no intermediate UserMessages.
 """
-function find_cut_point(messages::Vector{AgentMessage}, keep_recent_tokens::Int)
+function find_cut_point(messages::Vector{StoredAgentMessage}, keep_recent_tokens::Int)
     length(messages) <= 1 && return 0
 
     accumulated = 0
@@ -120,7 +120,9 @@ function find_cut_point(messages::Vector{AgentMessage}, keep_recent_tokens::Int)
             # Valid cut point if the previous message is NOT an AssistantMessage
             # with pending tool calls (i.e., we're not between a tool call and
             # its results).
-            if i == 1 || !(messages[i-1] isa AssistantMessage && !isempty(messages[i-1].tool_calls))
+            previous = i == 1 ? nothing : messages[i - 1]
+            if previous === nothing ||
+                    !(previous isa AssistantMessage && !isempty(previous.tool_calls))
                 return i
             end
         end
@@ -129,12 +131,15 @@ function find_cut_point(messages::Vector{AgentMessage}, keep_recent_tokens::Int)
     return 0  # no valid cut point found
 end
 
+find_cut_point(messages::Vector{AgentMessage}, keep_recent_tokens::Int) =
+    find_cut_point(stored_agent_messages(messages), keep_recent_tokens)
+
 """
-    format_messages_for_summary(messages::Vector{AgentMessage}) -> String
+    format_messages_for_summary(messages::Vector{<:AgentMessage}) -> String
 
 Format discarded messages as readable text for the summarization prompt.
 """
-function format_messages_for_summary(messages::Vector{AgentMessage})
+function format_messages_for_summary(messages::Vector{StoredAgentMessage})
     parts = String[]
     for msg in messages
         if msg isa UserMessage
@@ -159,13 +164,16 @@ function format_messages_for_summary(messages::Vector{AgentMessage})
     return join(parts, "\n\n")
 end
 
+format_messages_for_summary(messages::Vector{AgentMessage}) =
+    format_messages_for_summary(stored_agent_messages(messages))
+
 """
     generate_summary(agent, to_discard, existing_summary, config, model) -> String
 
 Use the agent's model to generate a structured summary of discarded messages.
 """
 function generate_summary(
-        agent::Agent, to_discard::Vector{AgentMessage},
+        agent::Agent, to_discard::Vector{StoredAgentMessage},
         existing_summary::Union{Nothing, CompactionSummaryMessage},
         config::CompactionConfig, model::Model,
     )
@@ -178,7 +186,14 @@ function generate_summary(
     conversation_text = format_messages_for_summary(to_discard)
     summary_input = "Summarize this conversation:\n\n$conversation_text"
 
-    summary_agent = Agent(; prompt, model, apikey = agent.apikey, tools = AgentTool[])
+    summary_agent = Agent(;
+        prompt,
+        model,
+        apikey = agent.apikey,
+        tools = empty_agent_tools(),
+        http_kw = agent.http_kw,
+        api = Val(Symbol(model.api)),
+    )
     result = stream(identity, summary_agent, AgentState(), summary_input, Abort())
     return message_text(last_assistant_message(result))
 end
@@ -212,7 +227,10 @@ function compact!(agent::Agent, state::AgentState, config::CompactionConfig, mod
         return
     end
 
-    tokens_before = sum(estimate_message_tokens(m) for m in to_discard)
+    tokens_before = 0
+    for message in to_discard
+        tokens_before += estimate_message_tokens(message)
+    end
     if existing_summary !== nothing
         tokens_before += existing_summary.tokens_before
     end
@@ -262,8 +280,8 @@ is needed. On the first call (no previous usage data), compaction is skipped.
 function compaction_middleware(agent_handler::AgentHandler, config::CompactionConfig)
     last_input_tokens = Ref(0)
 
-    return function (f, agent::Agent, state::AgentState, current_input::AgentTurnInput, abort::Abort;
-            model::Union{Nothing, Model} = nothing, kw...)
+    return function (f::F, agent::Agent, state::AgentState, current_input::AgentTurnInput, abort::Abort;
+            model::Union{Nothing, Model} = nothing, kw...) where {F <: Function}
         if !config.enabled
             return agent_handler(f, agent, state, current_input, abort; model, kw...)
         end

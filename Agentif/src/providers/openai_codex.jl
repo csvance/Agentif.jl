@@ -25,6 +25,10 @@ const CODEX_DEFAULT_RETRY_BASE_MS = 1000
 const CODEX_DEFAULT_RETRY_MAX_MS = 60000
 const CODEX_RETRYABLE_ERROR_REGEX = r"rate.?limit|overloaded|service.?unavailable|upstream.?connect|connection.?refused|connection.?reset|reset.?before.?headers|terminated|temporar"i
 
+@kwarg struct CodexAuthClaims
+    chatgpt_account_id::Union{Nothing, String} = nothing
+end
+
 function resolve_codex_url(base_url::AbstractString)
     raw = strip(String(base_url))
     raw = isempty(raw) ? CODEX_BASE_URL : raw
@@ -50,8 +54,14 @@ end
 function normalize_codex_transport(value)::Symbol
     value === nothing && return :sse
     value isa Bool && return value ? :websocket : :sse
-
-    text = lowercase(strip(string(value)))
+    text = if value isa Symbol
+        String(value)
+    elseif value isa AbstractString
+        String(value)
+    else
+        throw(ArgumentError("Unsupported codex transport value type: $(typeof(value))."))
+    end
+    text = lowercase(strip(text))
     text in ("", "sse") && return :sse
     text in ("ws", "websocket") && return :websocket
     text == "auto" && return :auto
@@ -104,7 +114,81 @@ function codex_retry_settings!(kw::Dict{Symbol, Any})
     return (; max_retries, retry_base_ms, retry_max_ms)
 end
 
-function build_codex_tools(tools::Vector{AgentTool})
+codex_optional_string(value)::Union{Nothing, String} =
+    value === nothing ? nothing : string(value)
+
+function trimmed_codex_options(kw::NamedTuple)
+    account_id = if hasproperty(kw, :account_id)
+        codex_optional_string(getproperty(kw, :account_id))
+    elseif hasproperty(kw, :accountId)
+        codex_optional_string(getproperty(kw, :accountId))
+    else
+        nothing
+    end
+    session_id = if hasproperty(kw, :session_id)
+        codex_optional_string(getproperty(kw, :session_id))
+    elseif hasproperty(kw, :sessionId)
+        codex_optional_string(getproperty(kw, :sessionId))
+    else
+        nothing
+    end
+    reasoning_effort = if hasproperty(kw, :reasoning_effort)
+        codex_optional_string(getproperty(kw, :reasoning_effort))
+    elseif hasproperty(kw, :reasoningEffort)
+        codex_optional_string(getproperty(kw, :reasoningEffort))
+    elseif hasproperty(kw, :reasoning)
+        codex_optional_string(getproperty(kw, :reasoning))
+    else
+        nothing
+    end
+    reasoning_summary = if hasproperty(kw, :reasoning_summary)
+        codex_optional_string(getproperty(kw, :reasoning_summary))
+    elseif hasproperty(kw, :reasoningSummary)
+        codex_optional_string(getproperty(kw, :reasoningSummary))
+    else
+        nothing
+    end
+    text_verbosity = if hasproperty(kw, :text_verbosity)
+        codex_optional_string(getproperty(kw, :text_verbosity))
+    elseif hasproperty(kw, :textVerbosity)
+        codex_optional_string(getproperty(kw, :textVerbosity))
+    else
+        nothing
+    end
+    transport_value = if hasproperty(kw, :transport)
+        getproperty(kw, :transport)
+    elseif hasproperty(kw, :transportMode)
+        getproperty(kw, :transportMode)
+    elseif hasproperty(kw, :websocket)
+        getproperty(kw, :websocket)
+    elseif hasproperty(kw, :websockets)
+        getproperty(kw, :websockets)
+    else
+        nothing
+    end
+    transport = normalize_codex_transport(transport_value)
+    retry_settings = (
+        max_retries = codex_env_int(
+            "AGENTIF_CODEX_MAX_RETRIES", CODEX_DEFAULT_MAX_RETRIES),
+        retry_base_ms = codex_env_int(
+            "AGENTIF_CODEX_RETRY_BASE_MS", CODEX_DEFAULT_RETRY_BASE_MS),
+        retry_max_ms = codex_env_int(
+            "AGENTIF_CODEX_RETRY_MAX_MS", CODEX_DEFAULT_RETRY_MAX_MS),
+    )
+    return (;
+        account_id,
+        session_id,
+        reasoning_effort,
+        reasoning_summary,
+        text_verbosity,
+        include_opt = nothing,
+        max_tokens = nothing,
+        transport,
+        retry_settings,
+    )
+end
+
+function build_codex_tools(tools::Vector{<:AgentTool})
     isempty(tools) && return nothing
     provider_tools = Vector{Dict{String, Any}}()
     for tool in tools
@@ -145,11 +229,15 @@ function codex_account_id_from_access_token(access_token::AbstractString)
     parts = split(String(access_token), ".")
     length(parts) == 3 || return nothing
     try
-        payload = JSON.parse(Vector{UInt8}(codeunits(decode_base64url(parts[2]))))
-        auth_claims = get(() -> nothing, payload, CODEX_JWT_CLAIM_PATH)
-        auth_claims isa AbstractDict || return nothing
-        account_id = get(() -> nothing, auth_claims, "chatgpt_account_id")
-        return (account_id isa AbstractString && !isempty(account_id)) ? String(account_id) : nothing
+        payload = JSON.parse(
+            Vector{UInt8}(codeunits(decode_base64url(parts[2]))),
+            Dict{String, JSON.JSONText},
+        )
+        auth_json = get(payload, CODEX_JWT_CLAIM_PATH, nothing)
+        auth_json === nothing && return nothing
+        auth_claims = JSON.parse(auth_json.value, CodexAuthClaims)
+        account_id = auth_claims.chatgpt_account_id
+        return (account_id !== nothing && !isempty(account_id)) ? account_id : nothing
     catch
         return nothing
     end
@@ -403,7 +491,7 @@ function codex_stop_reason(status::Union{Nothing, String}, tool_calls::Vector{Ag
 end
 
 function openai_codex_event_callback(
-        f::Function,
+        f::F,
         agent::Agent,
         assistant_message::AssistantMessage,
         started::Base.RefValue{Bool},
@@ -412,7 +500,7 @@ function openai_codex_event_callback(
         response_status::Base.RefValue{Union{Nothing, String}},
         tool_call_accumulators::Dict{String, ToolCallAccumulator},
         abort::Abort,
-    )
+    ) where {F <: Function}
     ensure_started() = begin
         if !started[]
             started[] = true
@@ -1037,6 +1125,21 @@ function codex_websocket_pool_key(ws_url::String, headers::Dict{String, String})
     return (ws_url, account, String(session_id))
 end
 
+function codex_websocket_open_kw(http_kw)
+    http_nt = http_kw isa NamedTuple ? http_kw : (; http_kw...)
+    ws_open_kw = Base.structdiff(
+        http_nt,
+        (; retry = nothing, retries = nothing, retry_non_idempotent = nothing),
+    )
+    if isdefined(HTTP.WebSockets, :server_addr) && haskey(ws_open_kw, :readtimeout)
+        readtimeout = ws_open_kw.readtimeout
+        ws_open_kw = Base.structdiff(ws_open_kw, (; readtimeout = nothing))
+        haskey(ws_open_kw, :read_idle_timeout) ||
+            (ws_open_kw = merge(ws_open_kw, (; read_idle_timeout = readtimeout)))
+    end
+    return ws_open_kw
+end
+
 function codex_stream_websocket!(
         callback::Function,
         ws_url::String,
@@ -1045,8 +1148,7 @@ function codex_stream_websocket!(
         abort::Abort;
         http_kw = (;),
     )
-    http_nt = http_kw isa NamedTuple ? http_kw : (; http_kw...)
-    ws_open_kw = merge(http_nt, (; retry = false))
+    ws_open_kw = codex_websocket_open_kw(http_kw)
     ws_headers = create_codex_websocket_headers(headers)
     start_request = copy(request_body)
     start_request["type"] = "response.create"

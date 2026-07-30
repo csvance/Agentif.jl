@@ -30,7 +30,7 @@ end
     type::String = "toolCall"
     id::String
     name::String
-    arguments::Dict{String, Any}
+    arguments::ToolArguments
     thoughtSignature::Union{Nothing, String} = nothing
 end
 
@@ -62,6 +62,24 @@ end
     summary::String
     tokens_before::Int
     compacted_at::Float64
+end
+
+const StoredAgentMessage = Union{
+    UserMessage,
+    AssistantMessage,
+    ToolResultMessage,
+    CompactionSummaryMessage,
+}
+
+function stored_agent_messages(messages::Vector{AgentMessage})
+    stored = StoredAgentMessage[]
+    sizehint!(stored, length(messages))
+    for message in messages
+        message isa StoredAgentMessage ||
+            throw(ArgumentError("Unsupported agent message type: $(typeof(message))."))
+        push!(stored, message)
+    end
+    return stored
 end
 
 const AGENT_MESSAGE_TYPE_USER = "user"
@@ -231,6 +249,14 @@ function StructUtils.make(st::StructUtils.StructStyle, ::Type{Union{TextContent,
     return StructUtils.make(st, ContentBlock, source)
 end
 
+function StructUtils.make(st::StructUtils.StructStyle, ::Type{StoredAgentMessage}, source, tags)
+    return StructUtils.make(st, AgentMessage, source, tags)
+end
+
+function StructUtils.make(st::StructUtils.StructStyle, ::Type{StoredAgentMessage}, source)
+    return StructUtils.make(st, AgentMessage, source)
+end
+
 const AgentTurnInput = Union{String, Vector{ToolResultMessage}, Vector{UserContentBlock}, UserMessage}
 
 function include_in_context(msg::AgentMessage)
@@ -255,7 +281,7 @@ function add_usage!(base::Usage, delta::Usage)
 end
 
 @kwarg mutable struct AgentState
-    messages::Vector{AgentMessage} = AgentMessage[]
+    messages::Vector{StoredAgentMessage} = StoredAgentMessage[]
     response_id::Union{Nothing, String} = nothing
     usage::Usage = Usage()
     pending_tool_calls::Vector{PendingToolCall} = PendingToolCall[]

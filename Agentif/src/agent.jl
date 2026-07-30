@@ -21,13 +21,14 @@ function _truncate_tool_result(output::String, max_bytes::Int)
     return truncated * "\n\n[Tool result truncated: showing first ~$(_format_byte_size(max_bytes)) of $(_format_byte_size(original_size)) total]"
 end
 
-@kwarg struct Agent
+@kwarg struct Agent{T<:AgentTool, H, A}
     id::Union{Nothing, String} = nothing
     prompt::String
     model::Model
     apikey::String
-    tools::Vector{AgentTool} = AgentTool[]
-    http_kw::Any = (;)  # HTTP.jl kwargs (retries, retry_delays, etc.)
+    tools::Vector{T} = empty_agent_tools()
+    http_kw::H = (;)  # HTTP.jl kwargs (retries, retry_delays, etc.)
+    api::Val{A} = Val(Symbol(model.api))
 end
 
 with_prompt(agent::Agent, prompt::String) = Agent(
@@ -38,9 +39,10 @@ with_prompt(agent::Agent, prompt::String) = Agent(
     apikey = agent.apikey,
     tools = agent.tools,
     http_kw = agent.http_kw,
+    api = agent.api,
 )
 
-with_tools(agent::Agent, tools::Vector{AgentTool}) = Agent(
+with_tools(agent::Agent, tools::Vector{T}) where {T<:AgentTool} = Agent(
     ;
     id = agent.id,
     prompt = agent.prompt,
@@ -48,6 +50,7 @@ with_tools(agent::Agent, tools::Vector{AgentTool}) = Agent(
     apikey = agent.apikey,
     tools,
     http_kw = agent.http_kw,
+    api = agent.api,
 )
 
 mutable struct Abort
@@ -129,16 +132,21 @@ function call_function_tool!(f, tool::AgentTool, tc::PendingToolCall)
         try
             args = parse_tool_arguments(tc.arguments, parameters(tool))
         catch e
-            parse_error = e
-            parse_bt = catch_backtrace()
+            parse_error = caught_exception(e, "Tool arguments are invalid.")
+            parse_bt = caught_backtrace()
         end
 
         if parse_error !== nothing
             is_error = true
             raw = tc.arguments
             raw_preview = length(raw) > 500 ? string(raw[1:500], "... (truncated, length=$(length(raw)))") : raw
-            parse_msg = sprint(showerror, parse_error)
-            @warn "Tool argument parsing failed" tool = tc.name call_id = tc.call_id exception = (parse_error, parse_bt)
+            parse_msg = caught_exception_message(
+                parse_error, "Tool arguments are invalid.")
+            if TRIMMED_BUILD
+                @warn "Tool argument parsing failed" tool = tc.name call_id = tc.call_id
+            else
+                @warn "Tool argument parsing failed" tool = tc.name call_id = tc.call_id exception = (parse_error, parse_bt)
+            end
             output = render_tool_error_json(
                 ;
                 error_kind = "tool_argument_parse_failed",
@@ -152,19 +160,26 @@ function call_function_tool!(f, tool::AgentTool, tc::PendingToolCall)
             )
         else
             try
-                output = string(tool.func(args...))
+                output = invoke_parsed_tool(tool, args)
             catch e
-                bt = catch_backtrace()
+                normalized_error =
+                    caught_exception(e, "The tool could not complete the request.")
+                bt = caught_backtrace()
                 is_error = true
-                error_msg = sprint(showerror, e)
-                @error "Tool execution failed" tool = tc.name call_id = tc.call_id exception = (e, bt)
+                error_msg = caught_exception_message(
+                    normalized_error, "The tool could not complete the request.")
+                if TRIMMED_BUILD
+                    @error "Tool execution failed" tool = tc.name call_id = tc.call_id
+                else
+                    @error "Tool execution failed" tool = tc.name call_id = tc.call_id exception = (normalized_error, bt)
+                end
                 output = render_tool_error_json(
                     ;
                     error_kind = "tool_execution_failed",
                     message = error_msg,
                     tool = tc.name,
                     call_id = tc.call_id,
-                    exception = e,
+                    exception = normalized_error,
                     backtrace = bt,
                     suggested_fix = "Inspect error_kind/message and call the tool again with corrected arguments or preconditions.",
                 )
@@ -183,39 +198,17 @@ function call_function_tool!(f, tool::AgentTool, tc::PendingToolCall)
     end
 end
 
-function coerce_tool_arg(value, typ)
-    typ === Any && return value
-    if typ isa Union
-        value === nothing && (Nothing <: typ) && return nothing
-        for candidate in Base.uniontypes(typ)
-            candidate === Nothing && continue
-            try
-                return convert(candidate, value)
-            catch
-            end
-        end
-        return value
-    end
-    return convert(typ, value)
+function invoke_parsed_tool(tool::AgentTool{F,T}, args)::String where {F,T<:NamedTuple}
+    return invoke_tool_function(tool, args::T)
 end
 
-function parse_tool_arguments(arguments::String, params_type::Type)
-    parsed = JSON.parse(arguments)
-    parsed isa AbstractDict || throw(ArgumentError("tool arguments must be a JSON object"))
-    names = fieldnames(params_type)
-    types = fieldtypes(params_type)
-    values = Vector{Any}(undef, length(names))
-    for (idx, (name, typ)) in enumerate(zip(names, types))
-        key = String(name)
-        if haskey(parsed, key)
-            values[idx] = coerce_tool_arg(get(() -> nothing, parsed, key), typ)
-        else
-            if Nothing <: typ
-                values[idx] = nothing
-            else
-                throw(ArgumentError("missing required tool argument: $(key)"))
-            end
-        end
-    end
-    return NamedTuple{names}(Tuple(values))
+@generated function invoke_tool_function(
+        tool::AgentTool{F,T}, args::T,
+    ) where {F,T<:NamedTuple}
+    call_args = [:(getfield(args, $idx)) for idx in 1:fieldcount(T)]
+    return :(string(getfield(tool, :func)($(call_args...))))
+end
+
+function parse_tool_arguments(arguments::String, ::Type{T})::T where {T<:NamedTuple}
+    return JSON.parse(arguments, T)
 end

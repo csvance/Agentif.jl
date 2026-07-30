@@ -1,4 +1,5 @@
-function anthropic_build_tools(tools::Vector{AgentTool}, tool_name_map::Dict{String, String})
+function anthropic_build_tools(
+        tools::Vector{<:AgentTool}, tool_name_map::Dict{String, String})
     isempty(tools) && return nothing
     provider_tools = AnthropicMessages.Tool[]
     for tool in tools
@@ -51,8 +52,8 @@ function anthropic_tool_result_block(result::ToolResultMessage)
     )
 end
 
-function anthropic_insert_missing_tool_results(messages::Vector{AgentMessage})
-    normalized = AgentMessage[]
+function anthropic_insert_missing_tool_results(messages::Vector{StoredAgentMessage})
+    normalized = StoredAgentMessage[]
     pending = ToolCallContent[]
     resolved = Set{String}()
     function flush_pending!()
@@ -92,7 +93,7 @@ function anthropic_insert_missing_tool_results(messages::Vector{AgentMessage})
     return normalized
 end
 
-function anthropic_tool_name_maps(tools::Vector{AgentTool}, is_oauth::Bool)
+function anthropic_tool_name_maps(tools::Vector{<:AgentTool}, is_oauth::Bool)
     tool_name_map = Dict{String, String}()
     tool_name_reverse_map = Dict{String, String}()
     is_oauth || return tool_name_map, tool_name_reverse_map
@@ -181,7 +182,7 @@ function anthropic_message_from_agent(msg::AgentMessage, tool_name_map::Dict{Str
 end
 
 function anthropic_build_messages(agent::Agent, state::AgentState, input::AgentTurnInput, tool_name_map::Dict{String, String}, model::Model)
-    context = AgentMessage[]
+    context = StoredAgentMessage[]
     for msg in state.messages
         include_in_context(msg) || continue
         push!(context, msg)
@@ -244,7 +245,7 @@ function anthropic_stop_reason(reason::Union{Nothing, String}, tool_calls::Vecto
 end
 
 function anthropic_event_callback(
-        f::Function,
+        f::F,
         agent::Agent,
         assistant_message::AssistantMessage,
         started::Base.RefValue{Bool},
@@ -255,7 +256,7 @@ function anthropic_event_callback(
         partial_json_by_index::Dict{Int, String},
         tool_name_reverse_map::Dict{String, String},
         abort::Abort,
-    )
+    ) where {F <: Function}
     stop_on_tool_call = get(ENV, "AGENTIF_STOP_ON_TOOL_CALL", "") != ""
     return function (stream, event)
         maybe_abort!(abort, stream)

@@ -42,7 +42,7 @@ end
     type::String = "tool_use"
     id::String
     name::String
-    input::Any
+    input::Dict{String, Any}
 end
 
 const ToolResultContentBlock = Union{TextBlock, ImageBlock}
@@ -78,10 +78,10 @@ end
     content::Union{String, Vector{ContentBlock}} & (json = (choosetype = x -> x[] isa String ? String : Vector{ContentBlock},),)
 end
 
-@omit_null @kwarg struct Tool{T}
+@omit_null @kwarg struct Tool
     name::String
     description::Union{Nothing, String} = nothing
-    input_schema::JSONSchema.Schema{T}
+    input_schema::JSONSchema.Schema
 end
 
 
@@ -173,7 +173,7 @@ end
 
 @omit_null @kwarg struct StreamMessageDeltaEvent
     type::String = "message_delta"
-    delta::Any = nothing
+    delta::Union{Nothing, Dict{String, Any}} = nothing
     usage::Union{Nothing, Usage} = nothing
 end
 
@@ -183,7 +183,7 @@ end
 
 @omit_null @kwarg struct StreamErrorEvent
     type::String = "error"
-    error::Any = nothing
+    error::Union{Nothing, Dict{String, Any}} = nothing
 end
 
 const StreamEvent = Union{

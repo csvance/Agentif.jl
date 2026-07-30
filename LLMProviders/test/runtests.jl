@@ -1,6 +1,7 @@
 using Test
 using HTTP
 using JSON
+using JSONSchema
 using Sockets
 using LLMProviders
 
@@ -47,6 +48,18 @@ end
     )
     parsed = JSON.parse(JSON.json(chunk), OpenAICompletions.StreamChunk)
     @test parsed.choices[1].delta.tool_calls[1].var"function".name == "read"
+
+    req = OpenAICompletions.Request(
+        ; model = "openrouter-test",
+        messages = [OpenAICompletions.Message(; role = "user", content = "hello")],
+        stream = true,
+        provider = Dict("zdr" => true, "data_collection" => "deny"),
+        reasoning = Dict("exclude" => true),
+    )
+    req_json = JSON.parse(JSON.json(req))
+    @test req_json["provider"]["zdr"] == true
+    @test req_json["provider"]["data_collection"] == "deny"
+    @test req_json["reasoning"]["exclude"] == true
 
     usage_chunk = JSON.parse(
         """
@@ -97,8 +110,14 @@ end
     unknown_event = JSON.parse("{\"type\":\"response.unrecognized\",\"foo\":123}", OpenAIResponses.StreamEvent)
     @test unknown_event isa OpenAIResponses.UnknownStreamEvent
 
-    params_schema = OpenAIResponses.schema(@NamedTuple{required::String, optional::Union{Nothing, String}})
-    required_fields = haskey(params_schema.spec, "required") ? Set(String.(params_schema.spec["required"])) : Set{String}()
+    params_schema = OpenAIResponses.schema(
+        @NamedTuple{required::String, optional::Union{Nothing,String}},
+    )
+    params_schema_data = JSONSchema.spec(params_schema)
+    required_fields =
+        haskey(params_schema_data, "required") ?
+        Set(String.(params_schema_data["required"])) :
+        Set{String}()
     @test "required" in required_fields
     @test !("optional" in required_fields)
 end

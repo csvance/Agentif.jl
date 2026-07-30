@@ -16,7 +16,7 @@ function resolve_log_level(level::Union{Nothing, LogLevel, Int, Symbol, Abstract
     return parsed
 end
 
-function with_log_level(f::Function, level::Union{Nothing, LogLevel, Int, Symbol, AbstractString} = nothing)
+function with_log_level(f::F, level::Union{Nothing, LogLevel, Int, Symbol, AbstractString} = nothing) where {F <: Function}
     resolved = resolve_log_level(level)
     resolved === nothing && return f()
     return LoggingExtras.withlevel(f, resolved)
@@ -51,6 +51,17 @@ function render_tool_error_json(
         raw_arguments::Union{Nothing, String} = nothing,
         extra = Dict{String, Any}(),
     )
+    if TRIMMED_BUILD
+        return JSON.json((
+            ok = false,
+            error_kind,
+            message,
+            tool,
+            call_id,
+            suggested_fix,
+            raw_arguments,
+        ))
+    end
     payload = JSON.Object(
         "ok" => false,
         "error_kind" => error_kind,
@@ -74,6 +85,15 @@ end
 function provider_tool_result_output(result::ToolResultMessage)
     output = message_text(result)
     result.is_error || return output
+    if TRIMMED_BUILD
+        return JSON.json((
+            ok = false,
+            tool_error = true,
+            tool = result.name,
+            call_id = result.call_id,
+            message = output,
+        ))
+    end
     parsed_output = try
         JSON.parse(output)
     catch

@@ -32,27 +32,33 @@ function openai_completions_detect_compat(model::Model)
     )
 end
 
+function openai_completions_compat_value(compat::Dict{String, Any}, key::String, default::T)::T where {T}
+    value = get(compat, key, default)
+    value isa T || throw(ArgumentError("OpenAI compatibility option `$key` must be a $(T)."))
+    return value
+end
+
 function openai_completions_resolve_compat(model::Model)
     detected = openai_completions_detect_compat(model)
     compat = model.compat
     compat === nothing && return detected
     return (;
-        supportsStore = get(() -> detected.supportsStore, compat, "supportsStore"),
-        supportsDeveloperRole = get(() -> detected.supportsDeveloperRole, compat, "supportsDeveloperRole"),
-        supportsReasoningEffort = get(() -> detected.supportsReasoningEffort, compat, "supportsReasoningEffort"),
-        supportsTools = get(() -> detected.supportsTools, compat, "supportsTools"),
-        supportsUsageInStreaming = get(() -> detected.supportsUsageInStreaming, compat, "supportsUsageInStreaming"),
-        maxTokensField = get(() -> detected.maxTokensField, compat, "maxTokensField"),
-        requiresToolResultName = get(() -> detected.requiresToolResultName, compat, "requiresToolResultName"),
-        requiresAssistantAfterToolResult = get(() -> detected.requiresAssistantAfterToolResult, compat, "requiresAssistantAfterToolResult"),
-        requiresThinkingAsText = get(() -> detected.requiresThinkingAsText, compat, "requiresThinkingAsText"),
-        requiresMistralToolIds = get(() -> detected.requiresMistralToolIds, compat, "requiresMistralToolIds"),
-        thinkingFormat = get(() -> detected.thinkingFormat, compat, "thinkingFormat"),
-        stripThinkTags = get(() -> detected.stripThinkTags, compat, "stripThinkTags"),
+        supportsStore = openai_completions_compat_value(compat, "supportsStore", detected.supportsStore),
+        supportsDeveloperRole = openai_completions_compat_value(compat, "supportsDeveloperRole", detected.supportsDeveloperRole),
+        supportsReasoningEffort = openai_completions_compat_value(compat, "supportsReasoningEffort", detected.supportsReasoningEffort),
+        supportsTools = openai_completions_compat_value(compat, "supportsTools", detected.supportsTools),
+        supportsUsageInStreaming = openai_completions_compat_value(compat, "supportsUsageInStreaming", detected.supportsUsageInStreaming),
+        maxTokensField = openai_completions_compat_value(compat, "maxTokensField", detected.maxTokensField),
+        requiresToolResultName = openai_completions_compat_value(compat, "requiresToolResultName", detected.requiresToolResultName),
+        requiresAssistantAfterToolResult = openai_completions_compat_value(compat, "requiresAssistantAfterToolResult", detected.requiresAssistantAfterToolResult),
+        requiresThinkingAsText = openai_completions_compat_value(compat, "requiresThinkingAsText", detected.requiresThinkingAsText),
+        requiresMistralToolIds = openai_completions_compat_value(compat, "requiresMistralToolIds", detected.requiresMistralToolIds),
+        thinkingFormat = openai_completions_compat_value(compat, "thinkingFormat", detected.thinkingFormat),
+        stripThinkTags = openai_completions_compat_value(compat, "stripThinkTags", detected.stripThinkTags),
     )
 end
 
-function openai_completions_has_tool_history(messages::Vector{AgentMessage})
+function openai_completions_has_tool_history(messages::Vector{StoredAgentMessage})
     for msg in messages
         if msg isa ToolResultMessage
             return true
@@ -133,7 +139,8 @@ function openai_completions_append_thinking_with_details!(assistant_message::Ass
     return
 end
 
-function openai_completions_build_tools(tools::Vector{AgentTool}; force_empty::Bool = false)
+function openai_completions_build_tools(
+        tools::Vector{<:AgentTool}; force_empty::Bool = false)
     isempty(tools) && return force_empty ? OpenAICompletions.Tool[] : nothing
     provider_tools = OpenAICompletions.Tool[]
     for tool in tools
@@ -163,7 +170,7 @@ end
 
 function openai_completions_build_messages(agent::Agent, state::AgentState, input::AgentTurnInput, model::Model)
     compat = openai_completions_resolve_compat(model)
-    raw_messages = AgentMessage[]
+    raw_messages = StoredAgentMessage[]
     for msg in state.messages
         include_in_context(msg) || continue
         push!(raw_messages, msg)
@@ -339,14 +346,18 @@ function openai_completions_build_messages(agent::Agent, state::AgentState, inpu
                 if compat.requiresAssistantAfterToolResult
                     push!(messages, OpenAICompletions.Message(; role = "assistant", content = "I have processed the tool results."))
                 end
+                content = OpenAICompletions.ContentPart[
+                    OpenAICompletions.ContentPart(;
+                        type = "text",
+                        text = "Attached image(s) from tool result:",
+                    ),
+                ]
+                append!(content, image_blocks)
                 push!(
                     messages,
                     OpenAICompletions.Message(;
                         role = "user",
-                        content = OpenAICompletions.ContentPart[
-                            OpenAICompletions.ContentPart(; type = "text", text = "Attached image(s) from tool result:"),
-                            image_blocks...,
-                        ],
+                        content,
                     ),
                 )
                 last_role = "user"
@@ -517,7 +528,7 @@ function flush_think_tag_state(tts::ThinkTagStreamState)
 end
 
 function openai_completions_event_callback(
-        f::Function,
+        f::F,
         assistant_message::AssistantMessage,
         started::Base.RefValue{Bool},
         ended::Base.RefValue{Bool},
@@ -526,7 +537,7 @@ function openai_completions_event_callback(
         tool_call_accumulators::Dict{Int, ToolCallAccumulator},
         abort::Abort;
         think_tag_state::Union{Nothing, ThinkTagStreamState} = nothing,
-    )
+    ) where {F <: Function}
     reasoning_buffer = ""
     leading_whitespace = ""
     saw_text = false
