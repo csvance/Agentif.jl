@@ -274,6 +274,58 @@ end
     @test cost["cacheRead"] == 0.0
     @test cost["cacheWrite"] == 0.0
     @test cost["total"] == 0.005
+
+    # Keep the public pre-tier positional constructor working.
+    positional = LLMProviders.Model(
+        model.id,
+        model.name,
+        model.api,
+        model.provider,
+        model.baseUrl,
+        model.reasoning,
+        model.input,
+        model.cost,
+        model.contextWindow,
+        model.maxTokens,
+        model.headers,
+        model.compat,
+        model.kw,
+    )
+    @test isempty(positional.costTiers)
+    @test positional.thinkingLevelMap === nothing
+
+    tiered = LLMProviders.Model(;
+        id = "tiered",
+        name = "Tiered",
+        api = "openai-responses",
+        provider,
+        baseUrl = "https://example.com/v1",
+        reasoning = true,
+        input = ["text"],
+        cost = Dict("input" => 1.0, "output" => 2.0, "cacheRead" => 0.1, "cacheWrite" => 1.25),
+        contextWindow = 1000,
+        maxTokens = 100,
+        costTiers = [
+            LLMProviders.ModelCostTier(;
+                inputTokensAbove = 100,
+                input = 10.0,
+                output = 20.0,
+                cacheRead = 1.0,
+                cacheWrite = 12.5,
+            ),
+            LLMProviders.ModelCostTier(;
+                inputTokensAbove = 200,
+                input = 100.0,
+                output = 200.0,
+                cacheRead = 10.0,
+                cacheWrite = 125.0,
+            ),
+        ],
+    )
+    # The threshold is strict and includes input, cache-read, and cache-write tokens.
+    @test LLMProviders.calculateCost(tiered, DummyUsage(50, 10, 50, 0))["input"] ≈ 0.00005
+    @test LLMProviders.calculateCost(tiered, DummyUsage(50, 10, 50, 1))["input"] ≈ 0.0005
+    @test LLMProviders.calculateCost(tiered, DummyUsage(100, 10, 100, 1))["input"] ≈ 0.01
 end
 
 @testset "discover_models!" begin
@@ -333,3 +385,138 @@ end
     @test v54 !== nothing
     @test v54.id == "gpt-5.4"
 end
+
+@testset "Generated model registry" begin
+    # Roster shipped by models_generated.json plus models_custom.jl. Keep this
+    # explicit so providers registered by earlier testsets do not enter the sweep.
+    registry_providers = [
+        "amazon-bedrock", "ant-ling", "anthropic", "azure-openai-responses",
+        "cerebras", "cloudflare-ai-gateway", "cloudflare-workers-ai", "deepseek",
+        "fireworks", "github-copilot", "google", "google-gemini-cli",
+        "google-vertex", "groq", "huggingface", "kimi-coding", "minimax",
+        "minimax-cn", "mistral", "moonshotai", "moonshotai-cn", "nvidia",
+        "openai", "openai-codex", "opencode", "opencode-go", "openrouter",
+        "qwen-token-plan", "qwen-token-plan-cn", "together",
+        "vercel-ai-gateway", "xai", "xiaomi", "xiaomi-token-plan-ams",
+        "xiaomi-token-plan-cn", "xiaomi-token-plan-sgp", "zai", "zai-coding-cn",
+    ]
+    @test issubset(registry_providers, LLMProviders.getProviders())
+    all_models = [m for p in registry_providers for m in LLMProviders.getModels(p)]
+    @test length(all_models) >= 1168
+
+    # Current upstream examples, including the active Sonnet 5 introductory rate.
+    for (provider, id, input, output) in [
+            ("anthropic", "claude-sonnet-5", 2.0, 10.0),
+            ("anthropic", "claude-opus-5", 5.0, 25.0),
+            ("anthropic", "claude-fable-5", 10.0, 50.0),
+            ("openai", "gpt-5.4", 2.5, 15.0),
+            ("google", "gemini-3.1-pro-preview", 2.0, 12.0),
+            ("zai", "glm-5.2", 0.0, 0.0),
+        ]
+        model = LLMProviders.getModel(provider, id)
+        @test model !== nothing
+        if model !== nothing
+            @test model.id == id
+            @test model.provider == provider
+            @test model.cost["input"] == input
+            @test model.cost["output"] == output
+            @test model.contextWindow > 0
+            @test model.maxTokens > 0
+        end
+    end
+
+    for provider in [
+            "ant-ling", "cloudflare-ai-gateway", "cloudflare-workers-ai",
+            "deepseek", "fireworks", "moonshotai", "nvidia", "qwen-token-plan",
+            "together", "xiaomi",
+        ]
+        @test !isempty(LLMProviders.getModels(provider))
+    end
+
+    # OpenRouter has two documented dynamic-pricing sentinels.
+    negative_cost_sentinels = Set([
+        ("openrouter", "openrouter/auto"),
+        ("openrouter", "openrouter/auto-beta"),
+    ])
+    for model in all_models
+        key = (model.provider, model.id)
+        if key in negative_cost_sentinels
+            @test model.cost["input"] == -1.0e6
+        else
+            @test all(>=(0.0), values(model.cost))
+        end
+        @test model.contextWindow > 0
+        @test model.maxTokens > 0
+        @test !isempty(model.id)
+        @test !isempty(model.api)
+        @test !isempty(model.input)
+        @test all(tier -> tier.inputTokensAbove >= 0, model.costTiers)
+        @test all(
+            tier -> all(>=(0.0), (tier.input, tier.output, tier.cacheRead, tier.cacheWrite)),
+            model.costTiers,
+        )
+    end
+    @test all(m -> issetequal(keys(m.cost), ["input", "output", "cacheRead", "cacheWrite"]), all_models)
+
+    # Tier and thinking metadata survive the JSON loader.
+    sol = LLMProviders.getModel("openai", "gpt-5.6-sol")
+    @test sol !== nothing
+    @test sol !== nothing && length(sol.costTiers) == 1
+    @test sol !== nothing && sol.costTiers[1].inputTokensAbove == 272000
+    @test sol !== nothing && sol.costTiers[1].output == 45.0
+    @test sol !== nothing && sol.thinkingLevelMap["xhigh"] == "xhigh"
+
+    # models_custom.jl remains an overlay.
+    spark = LLMProviders.getModel("openai-codex", "gpt-5.3-codex-spark")
+    @test spark !== nothing && spark.maxTokens == 32000
+    for id in ["gpt-5.1", "gpt-5.2", "gpt-5.3-codex", "gpt-5.4"]
+        model = LLMProviders.getModel("openai-codex", id)
+        @test model !== nothing
+        @test model !== nothing && all(==(0.0), values(model.cost))
+    end
+    @test LLMProviders.getModel("openai-codex", "gpt-codex-5.3") !== nothing
+
+    @test LLMProviders.getModel("minimax", "MiniMax-M2.7") !== nothing
+    m21 = LLMProviders.getModel("minimax", "minimax/minimax-m2.1")
+    @test m21 !== nothing
+    @test m21 !== nothing && m21.baseUrl == "https://api.minimax.io/v1"
+    @test m21 !== nothing && m21.id == "MiniMax-M2.1"
+
+    for model in LLMProviders.getModels("google-gemini-cli")
+        @test model.api == "google-gemini-cli"
+        @test model.baseUrl == "https://cloudcode-pa.googleapis.com"
+        @test all(==(0.0), values(model.cost))
+    end
+end
+
+@testset "Generated frontier Anthropic models" begin
+    expected = Dict(
+        "claude-fable-5"  => (10.0, 50.0),
+        "claude-opus-5"   => (5.0, 25.0),
+        "claude-sonnet-5" => (2.0, 10.0),
+        "claude-opus-4-8" => (5.0, 25.0),
+        "claude-opus-4-7" => (5.0, 25.0),
+    )
+    for (id, (input_cost, output_cost)) in expected
+        model = LLMProviders.getModel("anthropic", id)
+        @test model !== nothing
+        model === nothing && continue
+        @test model.api == "anthropic-messages"
+        @test model.provider == "anthropic"
+        @test model.cost["input"] == input_cost
+        @test model.cost["output"] == output_cost
+        @test model.cost["cacheRead"] == input_cost * 0.1
+        @test model.cost["cacheWrite"] == input_cost * 1.25
+        @test model.contextWindow == 1000000
+        @test model.maxTokens == 128000
+        @test model.reasoning
+        @test model.thinkingLevelMap !== nothing
+    end
+
+    haiku = LLMProviders.getModel("anthropic", "claude-haiku-4-5")
+    @test haiku !== nothing
+    @test haiku.cost["input"] == 1
+    @test haiku.contextWindow == 200000
+end
+
+include("generator_test.jl")
