@@ -811,11 +811,25 @@ function stream(
         blocks_by_index = Dict{Int, AssistantContentBlock}()
         partial_json_by_index = Dict{Int, String}()
 
-        max_tokens = haskey(kw_nt, :max_tokens) ? kw_nt[:max_tokens] : model.maxTokens
+        base_max_tokens = haskey(kw_nt, :max_tokens) ? kw_nt[:max_tokens] : model.maxTokens
         stream_kw = haskey(kw_nt, :max_tokens) ? Base.structdiff(kw_nt, (; max_tokens = 0)) : kw_nt
         stream_kw = haskey(stream_kw, :system) ? Base.structdiff(stream_kw, (; system = nothing)) : stream_kw
+
+        # Reasoning effort uses the same kwarg surface as the openai/codex branches.
+        reasoning_effort = get(() -> nothing, stream_kw, :reasoning_effort)
+        reasoning_effort === nothing && (reasoning_effort = get(() -> nothing, stream_kw, :reasoningEffort))
+        reasoning_effort === nothing && (reasoning_effort = get(() -> nothing, stream_kw, :reasoning))
+        stream_kw = Base.structdiff(stream_kw, (; reasoning_effort = nothing, reasoningEffort = nothing, reasoning = nothing))
+
+        cache_retention = get(() -> nothing, stream_kw, :cache_retention)
+        cache_retention === nothing && (cache_retention = get(() -> nothing, stream_kw, :cacheRetention))
+        stream_kw = Base.structdiff(stream_kw, (; cache_retention = nothing, cacheRetention = nothing))
+        cache_control = anthropic_cache_control(model.baseUrl, cache_retention)
+        anthropic_apply_cache_control!(messages, cache_control)
+
         system_prompt = agent_system_prompt(agent)
-        system_value = is_oauth ? anthropic_oauth_system_blocks(system_prompt) : system_prompt
+        system_value = is_oauth ? anthropic_oauth_system_blocks(system_prompt, cache_control) :
+            anthropic_system_blocks(system_prompt, cache_control)
         if haskey(stream_kw, :tool_choice)
             tool_choice = stream_kw[:tool_choice]
             if tool_choice isa AbstractDict
@@ -840,8 +854,65 @@ function stream(
             stream_kw = merge(Base.structdiff(stream_kw, (; tool_choice = nothing)), (; tool_choice))
         end
         request_kw = merge((; tools, system = system_value), stream_kw)
+
+        # Thinking: a caller-supplied `thinking` kwarg wins, but is still clamped to what
+        # the model supports; otherwise derive the config from the reasoning-effort level.
+        max_tokens = base_max_tokens
+        thinking_enabled = false
+        if haskey(stream_kw, :thinking)
+            normalized = anthropic_normalize_thinking(stream_kw[:thinking], model, base_max_tokens)
+            max_tokens = normalized.max_tokens
+            thinking_enabled = anthropic_thinking_is_enabled(normalized.thinking)
+            request_kw = merge(request_kw, (; thinking = normalized.thinking))
+        else
+            thinking_request = anthropic_thinking_request(model, reasoning_effort, base_max_tokens)
+            thinking_enabled = thinking_request.thinking !== nothing
+            if thinking_enabled
+                max_tokens = thinking_request.max_tokens
+                request_kw = merge(request_kw, (; thinking = thinking_request.thinking))
+                if thinking_request.output_config !== nothing && !haskey(stream_kw, :output_config)
+                    request_kw = merge(request_kw, (; output_config = thinking_request.output_config))
+                end
+            end
+        end
+
+        thinking_value = get(() -> nothing, request_kw, :thinking)
+        output_config = get(() -> nothing, request_kw, :output_config)
+        if anthropic_disabled_effort_conflict(model, thinking_value, output_config)
+            @warn "Anthropic rejects xhigh/max effort with thinking disabled; enabling adaptive thinking" model = model.id
+            thinking_value = AnthropicMessages.ThinkingConfig(; type = "adaptive", display = "summarized")
+            thinking_enabled = true
+            request_kw = merge(request_kw, (; thinking = thinking_value))
+        end
+
+        # Manual extended thinking rejects forced tool selection. Keep the tools,
+        # but let Anthropic select them with its default `auto` behavior.
+        tool_choice = get(() -> nothing, request_kw, :tool_choice)
+        tool_choice_type = anthropic_tool_choice_type(tool_choice)
+        if anthropic_thinking_type(thinking_value) == "enabled" &&
+                tool_choice_type !== nothing &&
+                lowercase(String(tool_choice_type)) in ("any", "tool")
+            @warn "Anthropic extended thinking does not support forced tool choice; using auto" model = model.id
+            request_kw = merge(request_kw, (; tool_choice = nothing))
+        end
+
+        # The newest models reject all sampling controls. Older models reject
+        # temperature and top_k while thinking is enabled. Their top_p value, when
+        # supplied, must stay in the documented 0.95–1.0 interval.
+        if anthropic_rejects_sampling_params(model)
+            request_kw = merge(request_kw, (; temperature = nothing, top_p = nothing, top_k = nothing))
+        elseif thinking_enabled
+            request_kw = merge(request_kw, (; temperature = nothing, top_k = nothing))
+            model_kw = model_request_kw(model)
+            top_p = get(() -> get(() -> nothing, model_kw, :top_p), request_kw, :top_p)
+            if top_p !== nothing && (!(top_p isa Real) || !(0.95 <= top_p <= 1.0))
+                @warn "Anthropic thinking requires top_p between 0.95 and 1.0; omitting top_p" requested = top_p
+                request_kw = merge(request_kw, (; top_p = nothing))
+            end
+        end
+
         disable_streaming = get(ENV, "AGENTIF_DISABLE_STREAMING", "") != ""
-        req = AnthropicMessages.Request(
+        typed_request = AnthropicMessages.Request(
             ; model = model.id,
             messages,
             max_tokens,
@@ -849,6 +920,16 @@ function stream(
             model_request_kw(model)...,
             request_kw...,
         )
+        # A raw request template is required for `pause_turn`. Server-tool blocks
+        # are intentionally unknown to the typed public content model, but Anthropic
+        # requires every response field to be sent back unchanged.
+        request_template = JSON.parse(JSON.json(typed_request))
+        original_request_messages = deepcopy(request_template["messages"])
+        function anthropic_request(msgs)
+            req = deepcopy(request_template)
+            req["messages"] = deepcopy(msgs)
+            return req
+        end
         headers = Dict(
             "anthropic-version" => "2023-06-01",
             "Content-Type" => "application/json",
@@ -857,6 +938,12 @@ function stream(
         )
         # Add beta features for tool streaming
         beta_features = ["fine-grained-tool-streaming-2025-05-14"]
+        # Interleaved thinking only does anything when the model reasons between tool
+        # calls, and it is automatic (no header) under adaptive thinking.
+        if thinking_enabled && !isempty(agent.tools) &&
+                anthropic_needs_interleaved_thinking_beta(model, thinking_value)
+            push!(beta_features, "interleaved-thinking-2025-05-14")
+        end
 
         if is_oauth
             headers["Authorization"] = "Bearer $apikey"
@@ -868,40 +955,73 @@ function stream(
         model.headers !== nothing && merge!(headers, model.headers)
         url = joinpath(model.baseUrl, "v1", "messages")
         if disable_streaming
-            response = JSON.parse(HTTP.post(url, headers; body = JSON.json(req), merged_http_kw...).body, AnthropicMessages.Response)
-            response.id !== nothing && (assistant_message.response_id = response.id)
-            response.stop_reason !== nothing && (stop_reason[] = response.stop_reason)
+            request_messages = original_request_messages
+            total_usage = Usage()
+            attempt = 0
+            while true
+                attempt += 1
+                stop_reason[] = nothing
+                req = anthropic_request(request_messages)
+                response_body = String(HTTP.post(
+                    url,
+                    headers;
+                    body = JSON.json(req),
+                    merged_http_kw...,
+                ).body)
+                wire_response = JSON.parse(response_body)
+                response = JSON.parse(response_body, AnthropicMessages.Response)
+                response.id !== nothing && (assistant_message.response_id = response.id)
+                response.stop_reason !== nothing && (stop_reason[] = response.stop_reason)
 
-            for block in response.content
-                if block isa AnthropicMessages.TextBlock
-                    append_text!(assistant_message, block.text)
-                elseif block isa AnthropicMessages.ThinkingBlock
-                    thinking = ThinkingContent(;
-                        thinking = block.thinking,
-                        thinkingSignature = block.signature,
-                    )
-                    push!(assistant_message.content, thinking)
-                elseif block isa AnthropicMessages.RedactedThinkingBlock
-                    push!(assistant_message.content, ThinkingContent(;
-                        thinking = "",
-                        thinkingSignature = block.data,
-                        redacted = true,
-                    ))
-                elseif block isa AnthropicMessages.ToolUseBlock
-                    tool_name = anthropic_internal_tool_name(tool_name_reverse_map, block.name)
-                    args = block.input isa AbstractDict ? Dict{String, Any}(block.input) : Dict{String, Any}()
-                    tool_block = ToolCallContent(;
-                        id = block.id,
-                        name = tool_name,
-                        arguments = args,
-                    )
-                    push!(assistant_message.content, tool_block)
-                    call = AgentToolCall(; call_id = block.id, name = tool_name, arguments = JSON.json(args))
-                    push!(assistant_message.tool_calls, call)
-                    findtool(agent.tools, call.name)
-                    ptc = PendingToolCall(; call_id = call.call_id, name = call.name, arguments = call.arguments)
-                    f(ToolCallRequestEvent(ptc))
+                for block in response.content
+                    if block isa AnthropicMessages.TextBlock
+                        append_text!(assistant_message, block.text)
+                    elseif block isa AnthropicMessages.ThinkingBlock
+                        thinking = ThinkingContent(;
+                            thinking = block.thinking,
+                            thinkingSignature = block.signature,
+                        )
+                        push!(assistant_message.content, thinking)
+                    elseif block isa AnthropicMessages.RedactedThinkingBlock
+                        push!(assistant_message.content, ThinkingContent(;
+                            thinking = "",
+                            thinkingSignature = block.data,
+                            redacted = true,
+                        ))
+                    elseif block isa AnthropicMessages.ToolUseBlock
+                        tool_name = anthropic_internal_tool_name(tool_name_reverse_map, block.name)
+                        args = block.input isa AbstractDict ? Dict{String, Any}(block.input) : Dict{String, Any}()
+                        tool_block = ToolCallContent(;
+                            id = block.id,
+                            name = tool_name,
+                            arguments = args,
+                        )
+                        push!(assistant_message.content, tool_block)
+                        call = AgentToolCall(; call_id = block.id, name = tool_name, arguments = JSON.json(args))
+                        push!(assistant_message.tool_calls, call)
+                        findtool(agent.tools, call.name)
+                        ptc = PendingToolCall(; call_id = call.call_id, name = call.name, arguments = call.arguments)
+                        f(ToolCallRequestEvent(ptc))
+                    end
                 end
+
+                latest_usage[] = response.usage
+                add_usage!(total_usage, anthropic_usage_from_response(response.usage))
+                anthropic_should_resubmit_paused(stop_reason[], attempt, assistant_message) || break
+                wire_content = get(() -> nothing, wire_response, "content")
+                if !(wire_content isa AbstractVector) || isempty(wire_content)
+                    @warn "Cannot safely replay an Anthropic pause_turn response without raw content"
+                    break
+                end
+                # Docs: on every continuation, replace the message list with the
+                # original turns plus the current paused response.
+                request_messages = vcat(
+                    deepcopy(original_request_messages),
+                    Any[Dict{String, Any}(
+                        "role" => "assistant",
+                        "content" => deepcopy(wire_content),
+                    )],
+                )
             end
 
             text = message_text(assistant_message)
@@ -911,67 +1031,110 @@ function stream(
                 f(MessageEndEvent(:assistant, assistant_message))
             end
 
-            latest_usage[] = response.usage
-            usage = anthropic_usage_from_response(latest_usage[])
             final_stop = anthropic_stop_reason(stop_reason[], assistant_message.tool_calls)
-            return finalize_stream!(state, input, assistant_message, usage, final_stop)
+            return finalize_stream!(state, input, assistant_message, total_usage, final_stop)
         else
             events_seen = Ref(false)
             stream_failed = Ref(false)
-            sse_cb = sse_tracking_callback(
-                anthropic_event_callback(
-                    f,
-                    agent,
-                    assistant_message,
-                    started,
-                    ended,
-                    stop_reason,
-                    latest_usage,
-                    blocks_by_index,
-                    partial_json_by_index,
-                    tool_name_reverse_map,
-                    abort,
-                ),
-                events_seen,
-            )
             request_http_kw = merge(merged_http_kw, (; retry = false))
-            try
-                sse_request_with_retry(events_seen, abort; max_attempts = sse_retry_attempts(merged_http_kw)) do
-                    HTTP.post(
-                        url,
-                        headers;
-                        body = JSON.json(req),
-                        sse_callback = sse_cb,
-                        request_http_kw...,
-                    )
+            request_messages = original_request_messages
+            wire_blocks_by_index = Dict{Int, Dict{String, Any}}()
+            wire_partial_json_by_index = Dict{Int, String}()
+            wire_replay_safe = Ref(true)
+            total_usage = Usage()
+            attempt = 0
+            while true
+                attempt += 1
+                # Fresh accumulator state per attempt (stream indices restart at 0), while
+                # `assistant_message` and the started/ended refs persist so a resumed turn
+                # keeps appending to the same message and emits one start/end pair.
+                stop_reason[] = nothing
+                latest_usage[] = nothing
+                empty!(blocks_by_index)
+                empty!(partial_json_by_index)
+                empty!(wire_blocks_by_index)
+                empty!(wire_partial_json_by_index)
+                wire_replay_safe[] = true
+                events_seen[] = false
+                sse_cb = sse_tracking_callback(
+                    anthropic_event_callback(
+                        f,
+                        agent,
+                        assistant_message,
+                        started,
+                        ended,
+                        stop_reason,
+                        latest_usage,
+                        blocks_by_index,
+                        partial_json_by_index,
+                        wire_blocks_by_index,
+                        wire_partial_json_by_index,
+                        wire_replay_safe,
+                        tool_name_reverse_map,
+                        abort,
+                    ),
+                    events_seen,
+                )
+                req = anthropic_request(request_messages)
+                try
+                    sse_request_with_retry(events_seen, abort; max_attempts = sse_retry_attempts(merged_http_kw)) do
+                        HTTP.post(
+                            url,
+                            headers;
+                            body = JSON.json(req),
+                            sse_callback = sse_cb,
+                            request_http_kw...,
+                        )
+                    end
+                catch e
+                    if e isa StopStreaming
+                    elseif e isa HTTP.StatusError
+                        if !started[]
+                            started[] = true
+                            f(MessageStartEvent(:assistant, assistant_message))
+                        end
+                        if !ended[]
+                            ended[] = true
+                            f(MessageEndEvent(:assistant, assistant_message))
+                        end
+                        error_body = String(e.response.body)
+                        error_msg = try
+                            err_json = JSON.parse(error_body)
+                            err_obj = get(() -> Dict(), err_json, "error")
+                            get(() -> "HTTP $(e.status)", err_obj, "message")
+                        catch
+                            "HTTP $(e.status): $error_body"
+                        end
+                        f(AgentErrorEvent(ErrorException(error_msg)))
+                        stop_reason[] = "error"
+                    elseif events_seen[] && sse_recoverable_connection_error(e)
+                        sse_emit_stream_interrupted!(f, assistant_message, started, ended, e)
+                        stream_failed[] = true
+                    else
+                        rethrow()
+                    end
                 end
-            catch e
-                if e isa StopStreaming
-                elseif e isa HTTP.StatusError
-                    if !started[]
-                        started[] = true
-                        f(MessageStartEvent(:assistant, assistant_message))
-                    end
-                    if !ended[]
-                        ended[] = true
-                        f(MessageEndEvent(:assistant, assistant_message))
-                    end
-                    error_body = String(e.response.body)
-                    error_msg = try
-                        err_json = JSON.parse(error_body)
-                        err_obj = get(() -> Dict(), err_json, "error")
-                        get(() -> "HTTP $(e.status)", err_obj, "message")
-                    catch
-                        "HTTP $(e.status): $error_body"
-                    end
-                    f(AgentErrorEvent(ErrorException(error_msg)))
-                    stop_reason[] = "error"
-                elseif events_seen[] && sse_recoverable_connection_error(e)
-                    sse_emit_stream_interrupted!(f, assistant_message, started, ended, e)
-                    stream_failed[] = true
-                else
-                    rethrow()
+
+                add_usage!(total_usage, anthropic_usage_from_response(latest_usage[]))
+                (stream_failed[] || isaborted(abort)) && break
+                anthropic_should_resubmit_paused(stop_reason[], attempt, assistant_message) || break
+                attempt_wire_content = [
+                    deepcopy(wire_blocks_by_index[index])
+                    for index in sort!(collect(keys(wire_blocks_by_index)))
+                ]
+                if !wire_replay_safe[] || isempty(attempt_wire_content)
+                    @warn "Cannot safely replay an Anthropic pause_turn stream with incomplete raw content"
+                    break
                 end
+                # Docs: on every continuation, replace the message list with the
+                # original turns plus the current paused response.
+                request_messages = vcat(
+                    deepcopy(original_request_messages),
+                    Any[Dict{String, Any}(
+                        "role" => "assistant",
+                        "content" => attempt_wire_content,
+                    )],
+                )
             end
 
             if started[] && !ended[]
@@ -979,11 +1142,10 @@ function stream(
                 f(MessageEndEvent(:assistant, assistant_message))
             end
 
-            usage = anthropic_usage_from_response(latest_usage[])
             final_stop = anthropic_stop_reason(stop_reason[], assistant_message.tool_calls)
             stream_failed[] && (final_stop = :error)
             isaborted(abort) && (final_stop = :aborted)
-            return finalize_stream!(state, input, assistant_message, usage, final_stop)
+            return finalize_stream!(state, input, assistant_message, total_usage, final_stop)
         end
     elseif api isa Val{Symbol("google-generative-ai")}
         apikey isa AbstractString || throw(ArgumentError("apikey must be a String for provider $(model.provider)"))
