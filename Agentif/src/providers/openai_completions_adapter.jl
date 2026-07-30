@@ -190,7 +190,7 @@ function openai_completions_build_messages(agent::Agent, state::AgentState, inpu
             return normalize_mistral_tool_id(id)
         end
         if model.provider == "openai"
-            return length(id) > 40 ? id[1:40] : id
+            return length(id) > 40 ? first(id, 40) : id
         end
         if model.provider == "github-copilot" && occursin("claude", lowercase(model.id))
             normalized = replace(id, r"[^A-Za-z0-9_-]" => "_")

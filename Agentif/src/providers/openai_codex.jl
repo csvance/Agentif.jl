@@ -359,7 +359,10 @@ function _split_compound_id(id::AbstractString)
     if idx === nothing
         return (String(id), nothing)
     end
-    return (String(id[1:idx-1]), String(id[idx+1:end]))
+    return (
+        String(id[1:prevind(id, idx)]),
+        String(id[nextind(id, idx):end]),
+    )
 end
 
 function codex_input_from_message(msg::AgentMessage, model::Model)
@@ -934,19 +937,52 @@ function codex_retryable_message(message::AbstractString)
     return occursin(CODEX_RETRYABLE_ERROR_REGEX, lowercase(message))
 end
 
+if TRIMMED_BUILD
+    codex_nested_retryable_exception(::Exception) = false
+else
+    function codex_nested_retryable_exception(err::Exception)
+        if err isa TaskFailedException
+            task = getfield(err, :task)
+            for (nested, _) in Base.current_exceptions(task)
+                nested isa Exception && codex_retryable_exception(nested) && return true
+            end
+        elseif err isa CompositeException
+            for nested in getfield(err, :exceptions)
+                nested isa Exception && codex_retryable_exception(nested) && return true
+            end
+        end
+        return false
+    end
+end
+
 function codex_retryable_exception(err::Exception)
     if err isa HTTP.ConnectError
         return true
-    elseif err isa HTTP.RequestError
-        inner = err.error
+    elseif isdefined(HTTP, :RequestError) && err isa getfield(HTTP, :RequestError)
+        inner = getproperty(err, :error)
+        inner isa Exception && return codex_retryable_exception(inner)
+        return codex_retryable_message(string(inner))
+    elseif isdefined(HTTP, :RequestRetryError) && err isa getfield(HTTP, :RequestRetryError)
+        inner = getproperty(err, :err)
         inner isa Exception && return codex_retryable_exception(inner)
         return codex_retryable_message(string(inner))
     elseif err isa InterruptException
         return false
-    elseif err isa EOFError || err isa Base.IOError
+    elseif err isa EOFError || err isa Base.IOError || err isa HTTP.ParseError
         return true
     end
+    codex_nested_retryable_exception(err) && return true
     return codex_retryable_message(sprint(showerror, err))
+end
+
+function http_recoverable_error(err::Exception)
+    if isdefined(HTTP, :isrecoverable)
+        return getfield(HTTP, :isrecoverable)(err)
+    elseif isdefined(HTTP, :RetryRequest)
+        retry_module = getfield(HTTP, :RetryRequest)
+        return getfield(retry_module, :isrecoverable)(err)
+    end
+    return false
 end
 
 function codex_retry_after_seconds(resp::HTTP.Response)

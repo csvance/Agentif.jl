@@ -238,7 +238,9 @@ function unquote(value::AbstractString)
         first_char = stripped[1]
         last_char = stripped[end]
         if (first_char == '"' && last_char == '"') || (first_char == '\'' && last_char == '\'')
-            return stripped[2:(end - 1)]
+            content_start = nextind(stripped, firstindex(stripped))
+            content_end = prevind(stripped, lastindex(stripped))
+            return stripped[content_start:content_end]
         end
     end
     return stripped

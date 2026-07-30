@@ -18,8 +18,10 @@ function ensure_agentif_dir()
     dir = agentif_dir()
     if !isdir(dir)
         mkpath(dir)
-        chmod(dir, 0o700)
     end
+    # Existing installations may have been created with a process umask that
+    # left this credential directory readable by other users.
+    chmod(dir, 0o700)
     return dir
 end
 
@@ -307,17 +309,19 @@ end
 Classify a token-endpoint response as a permanently-rejected refresh token, so the
 stored credentials can be cleared instead of failing the same way forever.
 
-A 401 from the token endpoint means the refresh token itself was rejected — retrying
-it can never succeed — so it is always terminal. Observed in the wild when another
-client (e.g. the `codex` CLI) rotates the token out from under us: HTTP 401 with
-`"type": "invalid_request_error"` and "Your refresh token has already been used",
-which carries no `invalid_grant` string. A 400 is terminal only when the body
-identifies a grant/refresh-token problem (per RFC 6749, `invalid_grant`).
+Observed in the wild when another client (e.g. the `codex` CLI) rotates the token
+out from under us: HTTP 401 with `"type": "invalid_request_error"` and "Your
+refresh token has already been used", which carries no `invalid_grant` string.
+Both 400 and 401 are terminal only when the body identifies a grant or refresh
+token problem. A 401 can also mean `invalid_client`; clearing a valid refresh
+token in that case does not fix the client configuration failure.
 """
 function codex_is_invalid_grant(status::Integer, body::AbstractString)
-    status == 401 && return true
-    return status == 400 &&
-        (occursin("invalid_grant", body) || occursin("refresh token", lowercase(body)))
+    status in (400, 401) || return false
+    normalized = lowercase(body)
+    return occursin("invalid_grant", normalized) ||
+        occursin("refresh token", normalized) ||
+        occursin("refresh_token", normalized)
 end
 
 function codex_refresh_failure(status::Integer, body::AbstractString)
@@ -369,15 +373,18 @@ function codex_save_credentials(creds::CodexCredentials)
         "expires_at" => Dates.format(creds.expires_at, Dates.ISODateTimeFormat),
         "account_id" => creds.account_id,
     )
-    tmp = tempname(dir)
+    # mktemp creates the file with mode 0600. This closes the window where
+    # `open(tempname(...), "w")` could expose token content under a loose umask
+    # before the later chmod.
+    tmp, io = mktemp(dir; cleanup = false)
     try
-        open(tmp, "w") do io
-            write(io, JSON.json(data))
-        end
         chmod(tmp, 0o600)
+        write(io, JSON.json(data))
+        close(io)
         mv(tmp, path; force = true)
         chmod(path, 0o600)
     finally
+        isopen(io) && close(io)
         ispath(tmp) && tmp != path && rm(tmp; force = true)
     end
     return nothing

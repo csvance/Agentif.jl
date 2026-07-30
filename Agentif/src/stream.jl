@@ -56,7 +56,7 @@ sse_retryable_status(status::Integer) = Int(status) in SSE_RETRYABLE_STATUSES
 function sse_recoverable_connection_error(err)
     (err isa InterruptException || err isa StopStreaming || err isa HTTP.StatusError) && return false
     err isa Exception || return false
-    return codex_retryable_exception(err) || HTTP.RetryRequest.isrecoverable(err)
+    return codex_retryable_exception(err) || http_recoverable_error(err)
 end
 
 function sse_retryable_error(err)

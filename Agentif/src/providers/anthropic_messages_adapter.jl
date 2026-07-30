@@ -401,7 +401,12 @@ function anthropic_event_callback(
                 f(MessageEndEvent(:assistant, assistant_message))
             end
         elseif parsed isa AnthropicMessages.StreamErrorEvent
-            if started[] && !ended[]
+            stop_reason[] = "error"
+            if !started[]
+                started[] = true
+                f(MessageStartEvent(:assistant, assistant_message))
+            end
+            if !ended[]
                 ended[] = true
                 f(MessageEndEvent(:assistant, assistant_message))
             end

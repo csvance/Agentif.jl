@@ -58,6 +58,36 @@ function test_websocket_request(ws)
     return hasproperty(ws, :handshake_request) ? ws.handshake_request : ws.request
 end
 
+function test_status_error(status::Integer)
+    response = HTTP.Response(status)
+    if applicable(HTTP.StatusError, status, "POST", "/x", response)
+        return HTTP.StatusError(status, "POST", "/x", response)
+    end
+    return HTTP.StatusError(response)
+end
+
+function test_parse_error(message::AbstractString)
+    if applicable(HTTP.ParseError, message)
+        return HTTP.ParseError(message)
+    end
+    return HTTP.ParseError(:INVALID_STATUS_LINE, message)
+end
+
+function test_force_close_stream(http)
+    if hasproperty(http, :tracked)
+        tracked = http.tracked
+        if tracked !== nothing && hasproperty(tracked, :conn)
+            close(tracked.conn)
+            return
+        end
+    end
+    if hasproperty(http, :stream) && hasproperty(http.stream, :io)
+        close(http.stream.io)
+        return
+    end
+    error("Unable to find the test server stream transport")
+end
+
 function fake_jwt(payload::AbstractDict)
     encoded = Base64.base64encode(JSON.json(payload))
     encoded = replace(encoded, '+' => '-', '/' => '_')
@@ -1115,6 +1145,11 @@ end
         @test get(() -> nothing, parsed_output, "tool_error") == true
     end
 
+    @test Agentif._responses_split_compound_id("café|élément") == ("café", "élément")
+    @test Agentif._split_compound_id("appel-é|élément") == ("appel-é", "élément")
+    @test Agentif._responses_split_compound_id("|élément") == ("", "élément")
+    @test Agentif._split_compound_id("appel|") == ("appel", "")
+
     let
         prior = AssistantMessage(
             provider = "openai-codex",
@@ -1158,6 +1193,12 @@ end
         @test get(() -> nothing, content[1], "type") == "output_text"
         @test get(() -> nothing, content[1], "text") == "cross-provider reasoning"
     end
+end
+
+@testset "skill metadata unquoting is UTF-8 safe" begin
+    @test Agentif.unquote("\"café\"") == "café"
+    @test Agentif.unquote("'😀'") == "😀"
+    @test Agentif.unquote("\"\"") == ""
 end
 
 @testset "openai request shaping and usage parity" begin
@@ -1302,8 +1343,7 @@ end
     end
 
     try
-        sock = HTTP.Sockets.getsockname(server.listener.server)
-        port = sock[2]
+        port = test_server_port(server)
         model = Model(
             id = "gpt-5.2",
             name = "gpt-5.2",
@@ -1340,6 +1380,49 @@ end
     end
 end
 
+@testset "anthropic stream error event maps to error" begin
+    seen_events = Agentif.AgentEvent[]
+
+    server = HTTP.serve!("127.0.0.1", 0) do req
+        sse = join([
+            "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_e\",\"role\":\"assistant\",\"content\":[],\"usage\":{\"input_tokens\":5,\"output_tokens\":0}}}",
+            "data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}",
+        ], "\n\n") * "\n\n"
+        return HTTP.Response(200, ["Content-Type" => "text/event-stream"], sse)
+    end
+
+    try
+        port = test_server_port(server)
+        model = Model(
+            id = "claude-test",
+            name = "claude-test",
+            api = "anthropic-messages",
+            provider = "anthropic",
+            baseUrl = "http://127.0.0.1:$port",
+            reasoning = false,
+            input = ["text"],
+            cost = Dict("input" => 0.0, "output" => 0.0, "cacheRead" => 0.0, "cacheWrite" => 0.0),
+            contextWindow = 200000,
+            maxTokens = 8192,
+        )
+        agent = Agent(
+            id = "anthropic-error-test",
+            prompt = "You are helpful.",
+            model = model,
+            apikey = "test-key",
+            tools = AgentTool[],
+        )
+
+        result = stream(ev -> (push!(seen_events, ev); ev), agent, AgentState(), "Hello", Abort())
+        @test result.most_recent_stop_reason == :error
+        @test count(ev -> ev isa Agentif.AgentErrorEvent, seen_events) == 1
+        @test count(ev -> ev isa Agentif.MessageStartEvent, seen_events) == 1
+        @test count(ev -> ev isa Agentif.MessageEndEvent, seen_events) == 1
+    finally
+        close(server)
+    end
+end
+
 @testset "anthropic stream redacted thinking, unknown blocks, and usage merge" begin
     seen_events = Agentif.AgentEvent[]
 
@@ -1362,8 +1445,7 @@ end
     end
 
     try
-        sock = HTTP.Sockets.getsockname(server.listener.server)
-        port = sock[2]
+        port = test_server_port(server)
         model = Model(
             id = "claude-test",
             name = "claude-test",
@@ -1443,8 +1525,7 @@ end
     end
 
     try
-        sock = HTTP.Sockets.getsockname(server.listener.server)
-        port = sock[2]
+        port = test_server_port(server)
         model = Model(
             id = "claude-test",
             name = "claude-test",
@@ -1703,12 +1784,30 @@ end
     @test !Agentif.sse_recoverable_connection_error(InterruptException())
     @test !Agentif.sse_recoverable_connection_error(Agentif.StopStreaming())
     @test !Agentif.sse_recoverable_connection_error(ArgumentError("bad input"))
+    failed_task = @async throw(EOFError())
+    task_error = try
+        wait(failed_task)
+        nothing
+    catch err
+        err
+    end
+    @test task_error isa TaskFailedException
+    @test Agentif.sse_recoverable_connection_error(task_error)
+    failed_parse_task = @async throw(test_parse_error("unexpected EOF while reading HTTP data"))
+    parse_task_error = try
+        wait(failed_parse_task)
+        nothing
+    catch err
+        err
+    end
+    @test parse_task_error isa TaskFailedException
+    @test Agentif.sse_recoverable_connection_error(parse_task_error)
 
     # HTTP.StatusError routes through status-based retryability, not connection recovery
-    status_err = HTTP.StatusError(503, "POST", "/x", HTTP.Response(503))
+    status_err = test_status_error(503)
     @test !Agentif.sse_recoverable_connection_error(status_err)
     @test Agentif.sse_retryable_error(status_err)
-    @test !Agentif.sse_retryable_error(HTTP.StatusError(400, "POST", "/x", HTTP.Response(400)))
+    @test !Agentif.sse_retryable_error(test_status_error(400))
 
     # http_kw overrides are respected
     @test Agentif.sse_retry_attempts(Agentif.DEFAULT_HTTP_KW) == 6
@@ -1775,8 +1874,7 @@ end
     end
 
     try
-        sock = HTTP.Sockets.getsockname(server.listener.server)
-        port = sock[2]
+        port = test_server_port(server)
         model = Model(
             id = "gpt-4.1",
             name = "gpt-4.1",
@@ -1812,7 +1910,7 @@ end
     request_count = Ref(0)
     seen_events = Agentif.AgentEvent[]
 
-    server = HTTP.serve!("127.0.0.1", 0; stream = true) do http
+    server = HTTP.listen!("127.0.0.1", 0) do http
         request_count[] += 1
         read(http)
         sse = join([
@@ -1821,18 +1919,15 @@ end
         ], "\n\n") * "\n\n"
         HTTP.setstatus(http, 200)
         HTTP.setheader(http, "Content-Type" => "text/event-stream")
-        # Declare more bytes than we send so the closed socket is a hard error
-        HTTP.setheader(http, "Content-Length" => string(sizeof(sse) + 4096))
         HTTP.startwrite(http)
         write(http, sse)
         flush(http)
         sleep(0.2)
-        close(http.stream.io)  # drop the connection mid-stream
+        test_force_close_stream(http)  # drop before the terminating chunk/end-stream
     end
 
     try
-        sock = HTTP.Sockets.getsockname(server.listener.server)
-        port = sock[2]
+        port = test_server_port(server)
         model = Model(
             id = "gpt-4.1",
             name = "gpt-4.1",
@@ -1872,7 +1967,7 @@ end
     request_count = Ref(0)
     seen_events = Agentif.AgentEvent[]
 
-    server = HTTP.serve!("127.0.0.1", 0; stream = true) do http
+    server = HTTP.listen!("127.0.0.1", 0) do http
         request_count[] += 1
         read(http)
         sse = join([
@@ -1881,17 +1976,15 @@ end
         ], "\n\n") * "\n\n"
         HTTP.setstatus(http, 200)
         HTTP.setheader(http, "Content-Type" => "text/event-stream")
-        HTTP.setheader(http, "Content-Length" => string(sizeof(sse) + 4096))
         HTTP.startwrite(http)
         write(http, sse)
         flush(http)
         sleep(0.2)
-        close(http.stream.io)  # drop the connection mid-stream
+        test_force_close_stream(http)  # drop before the terminating chunk/end-stream
     end
 
     try
-        sock = HTTP.Sockets.getsockname(server.listener.server)
-        port = sock[2]
+        port = test_server_port(server)
         model = Model(
             id = "gpt-5.3-codex",
             name = "gpt-5.3-codex",
@@ -1950,8 +2043,7 @@ end
     end
 
     try
-        sock = HTTP.Sockets.getsockname(server.listener.server)
-        port = sock[2]
+        port = test_server_port(server)
         model = Model(
             id = "gemini-2.5-flash",
             name = "gemini-2.5-flash",

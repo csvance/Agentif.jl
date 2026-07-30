@@ -76,7 +76,10 @@ function _responses_split_compound_id(id::AbstractString)
     if idx === nothing
         return (String(id), nothing)
     end
-    return (String(id[1:idx-1]), String(id[idx+1:end]))
+    return (
+        String(id[1:prevind(id, idx)]),
+        String(id[nextind(id, idx):end]),
+    )
 end
 
 function openai_responses_normalize_tool_call_id(id::String, model::Model)
