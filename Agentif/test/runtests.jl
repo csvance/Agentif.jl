@@ -58,6 +58,36 @@ function test_websocket_request(ws)
     return hasproperty(ws, :handshake_request) ? ws.handshake_request : ws.request
 end
 
+function test_status_error(status::Integer)
+    response = HTTP.Response(status)
+    if applicable(HTTP.StatusError, status, "POST", "/x", response)
+        return HTTP.StatusError(status, "POST", "/x", response)
+    end
+    return HTTP.StatusError(response)
+end
+
+function test_parse_error(message::AbstractString)
+    if applicable(HTTP.ParseError, message)
+        return HTTP.ParseError(message)
+    end
+    return HTTP.ParseError(:INVALID_STATUS_LINE, message)
+end
+
+function test_force_close_stream(http)
+    if hasproperty(http, :tracked)
+        tracked = http.tracked
+        if tracked !== nothing && hasproperty(tracked, :conn)
+            close(tracked.conn)
+            return
+        end
+    end
+    if hasproperty(http, :stream) && hasproperty(http.stream, :io)
+        close(http.stream.io)
+        return
+    end
+    error("Unable to find the test server stream transport")
+end
+
 function fake_jwt(payload::AbstractDict)
     encoded = Base64.base64encode(JSON.json(payload))
     encoded = replace(encoded, '+' => '-', '/' => '_')
@@ -1115,6 +1145,11 @@ end
         @test get(() -> nothing, parsed_output, "tool_error") == true
     end
 
+    @test Agentif._responses_split_compound_id("café|élément") == ("café", "élément")
+    @test Agentif._split_compound_id("appel-é|élément") == ("appel-é", "élément")
+    @test Agentif._responses_split_compound_id("|élément") == ("", "élément")
+    @test Agentif._split_compound_id("appel|") == ("appel", "")
+
     let
         prior = AssistantMessage(
             provider = "openai-codex",
@@ -1160,6 +1195,12 @@ end
     end
 end
 
+@testset "skill metadata unquoting is UTF-8 safe" begin
+    @test Agentif.unquote("\"café\"") == "café"
+    @test Agentif.unquote("'😀'") == "😀"
+    @test Agentif.unquote("\"\"") == ""
+end
+
 @testset "openai request shaping and usage parity" begin
     @test Agentif.resolve_openai_cache_retention("none") == "none"
     @test Agentif.resolve_openai_cache_retention("long") == "long"
@@ -1192,6 +1233,42 @@ end
     @test completions_usage.cacheRead == 3
     @test completions_usage.output == 6
     @test completions_usage.total == 16
+end
+
+@testset "completions message builder terminates on empty messages" begin
+    model = Model(
+        id = "test-model", name = "test-model", api = "openai-completions",
+        provider = "test", baseUrl = "http://localhost", reasoning = false,
+        input = ["text"],
+        cost = Dict("input" => 0.0, "output" => 0.0, "cacheRead" => 0.0, "cacheWrite" => 0.0),
+        contextWindow = 100000, maxTokens = 4096,
+    )
+    agent = Agent(; id = "a", prompt = "p", model, apikey = "k")
+    state = AgentState()
+    # Empty assistant message (routinely produced by an errored/aborted turn) and
+    # an image-only user message to a text-only model: both used to `continue`
+    # without advancing the loop index, hanging the builder forever.
+    push!(state.messages, AssistantMessage(; provider = "test", api = "openai-completions", model = "test-model"))
+    push!(state.messages, UserMessage(Agentif.UserContentBlock[Agentif.ImageContent("aGk=", "image/png")]))
+    result = Ref{Any}(nothing)
+    t = @async (result[] = Agentif.openai_completions_build_messages(agent, state, "hi", model))
+    timedwait(() -> istaskdone(t), 30.0)
+    @test istaskdone(t)
+    if istaskdone(t)
+        msgs, _ = result[]
+        @test !any(m -> m.role == "assistant", msgs)
+        @test count(m -> m.role == "user", msgs) == 1
+    end
+end
+
+@testset "utf8-safe truncation previews" begin
+    s = repeat("é", 400)  # 2-byte chars: byte-index slicing throws StringIndexError
+    p = Agentif.toolcall_preview(s; limit = 300)
+    @test endswith(p, "...(truncated)")
+    @test startswith(p, repeat("é", 300))
+    t = Agentif.truncate_text(repeat("🐳", 50), 10)  # 4-byte chars
+    @test startswith(t, repeat("🐳", 10))
+    @test occursin("[truncated 40]", t)
 end
 
 @testset "openai_responses stream shapes GPT-5 requests and keeps incomplete as length" begin
@@ -1243,6 +1320,235 @@ end
         dev_content = get(() -> Any[], input_items[1], "content")
         @test dev_content isa AbstractVector
         @test get(() -> nothing, dev_content[1], "text") == "# Juice: 0 !important"
+    finally
+        close(server)
+    end
+end
+
+@testset "openai_responses stream ends message once on response.completed" begin
+    seen_events = Agentif.AgentEvent[]
+
+    server = HTTP.serve!("127.0.0.1", 0) do req
+        sse = join([
+            "data: {\"type\":\"response.reasoning_summary_text.delta\",\"delta\":\"Think\",\"item_id\":\"rs_1\"}",
+            # Arrives before the message item begins; must NOT end the message.
+            "data: {\"type\":\"response.reasoning_summary_text.done\",\"text\":\"Think\",\"item_id\":\"rs_1\"}",
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"Hello\",\"item_id\":\"msg_1\"}",
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\" world\",\"item_id\":\"msg_1\"}",
+            "data: {\"type\":\"response.output_text.done\",\"text\":\"Hello world\",\"item_id\":\"msg_1\"}",
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"model\":\"gpt-5.2\",\"status\":\"completed\",\"usage\":{\"input_tokens\":10,\"output_tokens\":4,\"total_tokens\":14}}}",
+            "data: [DONE]",
+        ], "\n\n") * "\n\n"
+        return HTTP.Response(200, ["Content-Type" => "text/event-stream"], sse)
+    end
+
+    try
+        port = test_server_port(server)
+        model = Model(
+            id = "gpt-5.2",
+            name = "gpt-5.2",
+            api = "openai-responses",
+            provider = "openai",
+            baseUrl = "http://127.0.0.1:$port",
+            reasoning = true,
+            input = ["text"],
+            cost = Dict("input" => 0.0, "output" => 0.0, "cacheRead" => 0.0, "cacheWrite" => 0.0),
+            contextWindow = 128000,
+            maxTokens = 32000,
+        )
+        agent = Agent(
+            id = "responses-end-once-test",
+            prompt = "You are helpful.",
+            model = model,
+            apikey = "test-key",
+            tools = AgentTool[],
+        )
+
+        result = stream(ev -> (push!(seen_events, ev); ev), agent, AgentState(), "Say hello", Abort())
+        @test result.most_recent_stop_reason == :stop
+        @test !any(ev -> ev isa Agentif.AgentErrorEvent, seen_events)
+        end_indices = findall(ev -> ev isa Agentif.MessageEndEvent, seen_events)
+        @test length(end_indices) == 1
+        last_update = findlast(ev -> ev isa Agentif.MessageUpdateEvent, seen_events)
+        @test last_update !== nothing && end_indices[1] > last_update
+        assistant = result.messages[end]
+        @test assistant isa AssistantMessage
+        @test Agentif.message_text(assistant) == "Hello world"
+        @test Agentif.message_thinking(assistant) == "Think"
+    finally
+        close(server)
+    end
+end
+
+@testset "anthropic stream error event maps to error" begin
+    seen_events = Agentif.AgentEvent[]
+
+    server = HTTP.serve!("127.0.0.1", 0) do req
+        sse = join([
+            "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_e\",\"role\":\"assistant\",\"content\":[],\"usage\":{\"input_tokens\":5,\"output_tokens\":0}}}",
+            "data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}",
+        ], "\n\n") * "\n\n"
+        return HTTP.Response(200, ["Content-Type" => "text/event-stream"], sse)
+    end
+
+    try
+        port = test_server_port(server)
+        model = Model(
+            id = "claude-test",
+            name = "claude-test",
+            api = "anthropic-messages",
+            provider = "anthropic",
+            baseUrl = "http://127.0.0.1:$port",
+            reasoning = false,
+            input = ["text"],
+            cost = Dict("input" => 0.0, "output" => 0.0, "cacheRead" => 0.0, "cacheWrite" => 0.0),
+            contextWindow = 200000,
+            maxTokens = 8192,
+        )
+        agent = Agent(
+            id = "anthropic-error-test",
+            prompt = "You are helpful.",
+            model = model,
+            apikey = "test-key",
+            tools = AgentTool[],
+        )
+
+        result = stream(ev -> (push!(seen_events, ev); ev), agent, AgentState(), "Hello", Abort())
+        @test result.most_recent_stop_reason == :error
+        @test count(ev -> ev isa Agentif.AgentErrorEvent, seen_events) == 1
+        @test count(ev -> ev isa Agentif.MessageStartEvent, seen_events) == 1
+        @test count(ev -> ev isa Agentif.MessageEndEvent, seen_events) == 1
+    finally
+        close(server)
+    end
+end
+
+@testset "anthropic stream redacted thinking, unknown blocks, and usage merge" begin
+    seen_events = Agentif.AgentEvent[]
+
+    server = HTTP.serve!("127.0.0.1", 0) do req
+        sse = join([
+            "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_a\",\"role\":\"assistant\",\"content\":[],\"usage\":{\"input_tokens\":100,\"output_tokens\":1,\"cache_read_input_tokens\":40,\"cache_creation_input_tokens\":7}}}",
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"redacted_thinking\",\"data\":\"opaque-blob\"}}",
+            "data: {\"type\":\"content_block_stop\",\"index\":0}",
+            "data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"server_tool_use\",\"id\":\"srvtoolu_1\",\"name\":\"web_search\",\"input\":{}}}",
+            "data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"citations_delta\",\"citation\":{\"url\":\"https://example.com\"}}}",
+            "data: {\"type\":\"content_block_stop\",\"index\":1}",
+            "data: {\"type\":\"content_block_start\",\"index\":2,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}",
+            "data: {\"type\":\"content_block_delta\",\"index\":2,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hello\"}}",
+            "data: {\"type\":\"content_block_stop\",\"index\":2}",
+            # Delta usage only carries output_tokens; input/cache from message_start must survive.
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":9}}",
+            "data: {\"type\":\"message_stop\"}",
+        ], "\n\n") * "\n\n"
+        return HTTP.Response(200, ["Content-Type" => "text/event-stream"], sse)
+    end
+
+    try
+        port = test_server_port(server)
+        model = Model(
+            id = "claude-test",
+            name = "claude-test",
+            api = "anthropic-messages",
+            provider = "anthropic",
+            baseUrl = "http://127.0.0.1:$port",
+            reasoning = true,
+            input = ["text"],
+            cost = Dict("input" => 0.0, "output" => 0.0, "cacheRead" => 0.0, "cacheWrite" => 0.0),
+            contextWindow = 200000,
+            maxTokens = 8192,
+        )
+        agent = Agent(
+            id = "anthropic-redacted-test",
+            prompt = "You are helpful.",
+            model = model,
+            apikey = "test-key",
+            tools = AgentTool[],
+        )
+
+        result = stream(ev -> (push!(seen_events, ev); ev), agent, AgentState(), "Say hello", Abort())
+        @test result.most_recent_stop_reason == :stop
+        @test !any(ev -> ev isa Agentif.AgentErrorEvent, seen_events)
+
+        assistant = result.messages[end]
+        @test assistant isa AssistantMessage
+        thinking_blocks = [b for b in assistant.content if b isa Agentif.ThinkingContent]
+        @test length(thinking_blocks) == 1
+        @test thinking_blocks[1].redacted
+        @test thinking_blocks[1].thinking == ""
+        @test thinking_blocks[1].thinkingSignature == "opaque-blob"
+        @test Agentif.message_text(assistant) == "Hello"
+
+        # Usage from message_start survives a delta that only carries output_tokens.
+        @test result.usage.input == 100
+        @test result.usage.output == 9
+        @test result.usage.cacheRead == 40
+        @test result.usage.cacheWrite == 7
+
+        # Replay: redacted thinking converts back to a redacted_thinking wire block.
+        replayed = Agentif.anthropic_message_from_agent(assistant, Dict{String, String}(), model)
+        @test replayed !== nothing
+        lowered = JSON.parse(JSON.json(replayed))
+        content = lowered["content"]
+        @test content[1]["type"] == "redacted_thinking"
+        @test content[1]["data"] == "opaque-blob"
+        @test content[end]["type"] == "text"
+        @test content[end]["text"] == "Hello"
+
+        # Session persistence round-trip keeps the redacted flag; legacy JSON
+        # without the field still loads with redacted = false.
+        roundtrip = JSON.parse(JSON.json(assistant), Agentif.AgentMessage)
+        @test roundtrip isa AssistantMessage
+        rt_thinking = [b for b in roundtrip.content if b isa Agentif.ThinkingContent]
+        @test length(rt_thinking) == 1 && rt_thinking[1].redacted
+        legacy = JSON.parse("{\"type\":\"thinking\",\"thinking\":\"t\",\"thinkingSignature\":null}", Agentif.ContentBlock)
+        @test legacy isa Agentif.ThinkingContent
+        @test legacy.redacted == false
+    finally
+        close(server)
+    end
+end
+
+@testset "anthropic stream maps refusal to error stop reason" begin
+    seen_events = Agentif.AgentEvent[]
+
+    server = HTTP.serve!("127.0.0.1", 0) do req
+        sse = join([
+            "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_r\",\"role\":\"assistant\",\"content\":[],\"usage\":{\"input_tokens\":5,\"output_tokens\":1}}}",
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"I can't help with that.\"}}",
+            "data: {\"type\":\"content_block_stop\",\"index\":0}",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"refusal\"},\"usage\":{\"output_tokens\":6}}",
+            "data: {\"type\":\"message_stop\"}",
+        ], "\n\n") * "\n\n"
+        return HTTP.Response(200, ["Content-Type" => "text/event-stream"], sse)
+    end
+
+    try
+        port = test_server_port(server)
+        model = Model(
+            id = "claude-test",
+            name = "claude-test",
+            api = "anthropic-messages",
+            provider = "anthropic",
+            baseUrl = "http://127.0.0.1:$port",
+            reasoning = false,
+            input = ["text"],
+            cost = Dict("input" => 0.0, "output" => 0.0, "cacheRead" => 0.0, "cacheWrite" => 0.0),
+            contextWindow = 200000,
+            maxTokens = 8192,
+        )
+        agent = Agent(
+            id = "anthropic-refusal-test",
+            prompt = "You are helpful.",
+            model = model,
+            apikey = "test-key",
+            tools = AgentTool[],
+        )
+
+        result = stream(ev -> (push!(seen_events, ev); ev), agent, AgentState(), "Do the thing", Abort())
+        @test result.most_recent_stop_reason == :error
+        @test !any(ev -> ev isa Agentif.AgentErrorEvent, seen_events)
     finally
         close(server)
     end
@@ -1461,6 +1767,312 @@ end
         @test result isa AgentState
         @test result.messages[end] isa AssistantMessage
         @test Agentif.message_text(result.messages[end]) == "Hello from body"
+    finally
+        close(server)
+    end
+end
+
+@testset "sse retry helpers" begin
+    @test Agentif.sse_retryable_status(503)
+    @test Agentif.sse_retryable_status(429)
+    @test !Agentif.sse_retryable_status(400)
+    @test !Agentif.sse_retryable_status(401)
+
+    @test Agentif.sse_recoverable_connection_error(EOFError())
+    @test Agentif.sse_recoverable_connection_error(Base.IOError("connection reset", -104))
+    @test Agentif.sse_recoverable_connection_error(HTTP.ConnectError("http://x", EOFError()))
+    @test !Agentif.sse_recoverable_connection_error(InterruptException())
+    @test !Agentif.sse_recoverable_connection_error(Agentif.StopStreaming())
+    @test !Agentif.sse_recoverable_connection_error(ArgumentError("bad input"))
+    failed_task = @async throw(EOFError())
+    task_error = try
+        wait(failed_task)
+        nothing
+    catch err
+        err
+    end
+    @test task_error isa TaskFailedException
+    @test Agentif.sse_recoverable_connection_error(task_error)
+    failed_parse_task = @async throw(test_parse_error("unexpected EOF while reading HTTP data"))
+    parse_task_error = try
+        wait(failed_parse_task)
+        nothing
+    catch err
+        err
+    end
+    @test parse_task_error isa TaskFailedException
+    @test Agentif.sse_recoverable_connection_error(parse_task_error)
+
+    # HTTP.StatusError routes through status-based retryability, not connection recovery
+    status_err = test_status_error(503)
+    @test !Agentif.sse_recoverable_connection_error(status_err)
+    @test Agentif.sse_retryable_error(status_err)
+    @test !Agentif.sse_retryable_error(test_status_error(400))
+
+    # http_kw overrides are respected
+    @test Agentif.sse_retry_attempts(Agentif.DEFAULT_HTTP_KW) == 6
+    @test Agentif.sse_retry_attempts((; retry = false, retries = 5)) == 1
+    @test Agentif.sse_retry_attempts((; retry = true, retries = 2)) == 3
+    @test Agentif.sse_retry_attempts((; retry = true, retries = 0)) == 1
+
+    # Retry-After honored and capped by max_delay_ms
+    retry_after_resp = HTTP.Response(429, ["Retry-After" => "3"], "")
+    @test Agentif.codex_retry_delay_seconds(1, 1000, 60000; response = retry_after_resp) == 3.0
+    capped_resp = HTTP.Response(503, ["Retry-After" => "500"], "")
+    @test Agentif.codex_retry_delay_seconds(1, 1000, 60000; response = capped_resp) == 60.0
+
+    # Retries transient failures while no SSE event has been delivered
+    events_seen = Ref(false)
+    calls = Ref(0)
+    result = Agentif.sse_request_with_retry(events_seen, Abort(); max_attempts = 3, base_delay_ms = 1, max_delay_ms = 2) do
+        calls[] += 1
+        calls[] < 3 && throw(EOFError())
+        return :ok
+    end
+    @test result == :ok
+    @test calls[] == 3
+
+    # Never retries once an event has been delivered
+    events_seen[] = true
+    calls[] = 0
+    @test_throws EOFError Agentif.sse_request_with_retry(events_seen, Abort(); max_attempts = 3, base_delay_ms = 1, max_delay_ms = 2) do
+        calls[] += 1
+        throw(EOFError())
+    end
+    @test calls[] == 1
+
+    # Never retries non-transient errors
+    events_seen[] = false
+    calls[] = 0
+    @test_throws ArgumentError Agentif.sse_request_with_retry(events_seen, Abort(); max_attempts = 3, base_delay_ms = 1, max_delay_ms = 2) do
+        calls[] += 1
+        throw(ArgumentError("nope"))
+    end
+    @test calls[] == 1
+end
+
+@testset "openai_responses stream retries pre-stream 503 then succeeds" begin
+    request_count = Ref(0)
+    seen_events = Agentif.AgentEvent[]
+
+    server = HTTP.serve!("127.0.0.1", 0) do req
+        request_count[] += 1
+        if request_count[] == 1
+            return HTTP.Response(
+                503,
+                ["Content-Type" => "application/json", "Retry-After" => "0"],
+                "{\"error\":{\"message\":\"temporary outage\"}}",
+            )
+        end
+        sse = join([
+            "data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"message\",\"id\":\"msg_1\",\"role\":\"assistant\",\"content\":[]}}",
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"Hello\"}",
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"model\":\"gpt-4.1\",\"status\":\"completed\",\"usage\":{\"input_tokens\":1,\"input_tokens_details\":{\"cached_tokens\":0},\"output_tokens\":1,\"total_tokens\":2}}}",
+            "data: [DONE]",
+        ], "\n\n") * "\n\n"
+        return HTTP.Response(200, ["Content-Type" => "text/event-stream"], sse)
+    end
+
+    try
+        port = test_server_port(server)
+        model = Model(
+            id = "gpt-4.1",
+            name = "gpt-4.1",
+            api = "openai-responses",
+            provider = "openai",
+            baseUrl = "http://127.0.0.1:$port",
+            reasoning = false,
+            input = ["text"],
+            cost = Dict("input" => 0.0, "output" => 0.0, "cacheRead" => 0.0, "cacheWrite" => 0.0),
+            contextWindow = 128000,
+            maxTokens = 32000,
+        )
+        agent = Agent(
+            id = "responses-503-retry-test",
+            prompt = "You are helpful.",
+            model = model,
+            apikey = "test-key",
+            tools = AgentTool[],
+        )
+
+        result = stream(ev -> (push!(seen_events, ev); ev), agent, AgentState(), "Say hello", Abort())
+        @test request_count[] == 2
+        @test !any(ev -> ev isa Agentif.AgentErrorEvent, seen_events)
+        @test result.most_recent_stop_reason == :stop
+        @test result.messages[end] isa AssistantMessage
+        @test Agentif.message_text(result.messages[end]) == "Hello"
+    finally
+        close(server)
+    end
+end
+
+@testset "openai_responses stream surfaces mid-stream disconnect without duplicating deltas" begin
+    request_count = Ref(0)
+    seen_events = Agentif.AgentEvent[]
+
+    server = HTTP.listen!("127.0.0.1", 0) do http
+        request_count[] += 1
+        read(http)
+        sse = join([
+            "data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"message\",\"id\":\"msg_1\",\"role\":\"assistant\",\"content\":[]}}",
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"MARKER_ONCE\"}",
+        ], "\n\n") * "\n\n"
+        HTTP.setstatus(http, 200)
+        HTTP.setheader(http, "Content-Type" => "text/event-stream")
+        HTTP.startwrite(http)
+        write(http, sse)
+        flush(http)
+        sleep(0.2)
+        test_force_close_stream(http)  # drop before the terminating chunk/end-stream
+    end
+
+    try
+        port = test_server_port(server)
+        model = Model(
+            id = "gpt-4.1",
+            name = "gpt-4.1",
+            api = "openai-responses",
+            provider = "openai",
+            baseUrl = "http://127.0.0.1:$port",
+            reasoning = false,
+            input = ["text"],
+            cost = Dict("input" => 0.0, "output" => 0.0, "cacheRead" => 0.0, "cacheWrite" => 0.0),
+            contextWindow = 128000,
+            maxTokens = 32000,
+        )
+        agent = Agent(
+            id = "responses-disconnect-test",
+            prompt = "You are helpful.",
+            model = model,
+            apikey = "test-key",
+            tools = AgentTool[],
+        )
+
+        result = stream(ev -> (push!(seen_events, ev); ev), agent, AgentState(), "Say hello", Abort())
+        # Events already flowed, so the request must NOT be replayed
+        @test request_count[] == 1
+        @test result.most_recent_stop_reason == :error
+        @test any(ev -> ev isa Agentif.AgentErrorEvent, seen_events)
+        @test result.messages[end] isa AssistantMessage
+        delivered = Agentif.message_text(result.messages[end])
+        @test length(collect(eachmatch(r"MARKER_ONCE", delivered))) == 1
+        @test count(ev -> ev isa Agentif.MessageUpdateEvent && occursin("MARKER_ONCE", ev.delta), seen_events) == 1
+        @test count(ev -> ev isa Agentif.MessageEndEvent, seen_events) == 1
+    finally
+        close(server)
+    end
+end
+
+@testset "openai_codex stream does not re-POST after mid-stream disconnect" begin
+    request_count = Ref(0)
+    seen_events = Agentif.AgentEvent[]
+
+    server = HTTP.listen!("127.0.0.1", 0) do http
+        request_count[] += 1
+        read(http)
+        sse = join([
+            "data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"message\",\"id\":\"msg_1\",\"role\":\"assistant\",\"content\":[]}}",
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"CODEX_MARKER\"}",
+        ], "\n\n") * "\n\n"
+        HTTP.setstatus(http, 200)
+        HTTP.setheader(http, "Content-Type" => "text/event-stream")
+        HTTP.startwrite(http)
+        write(http, sse)
+        flush(http)
+        sleep(0.2)
+        test_force_close_stream(http)  # drop before the terminating chunk/end-stream
+    end
+
+    try
+        port = test_server_port(server)
+        model = Model(
+            id = "gpt-5.3-codex",
+            name = "gpt-5.3-codex",
+            api = "openai-codex-responses",
+            provider = "openai-codex",
+            baseUrl = "http://127.0.0.1:$port",
+            reasoning = true,
+            input = ["text"],
+            cost = Dict("input" => 0.0, "output" => 0.0, "cacheRead" => 0.0, "cacheWrite" => 0.0),
+            contextWindow = 128000,
+            maxTokens = 32000,
+        )
+        token = fake_jwt(Dict("https://api.openai.com/auth" => Dict("chatgpt_account_id" => "acct-jwt-disconnect")))
+        agent = Agent(
+            id = "codex-disconnect-test",
+            prompt = "You are helpful.",
+            model = model,
+            apikey = token,
+            tools = AgentTool[],
+        )
+
+        err = try
+            stream(
+                ev -> (push!(seen_events, ev); ev),
+                agent,
+                AgentState(),
+                "Say hello",
+                Abort();
+                max_retries = 3,
+                retry_base_ms = 1,
+                retry_max_ms = 5,
+            )
+            nothing
+        catch e
+            e
+        end
+        @test err isa Exception
+        @test !(err isa Agentif.StopStreaming)
+        # The delivered events must not be replayed by a re-POST
+        @test request_count[] == 1
+        @test count(ev -> ev isa Agentif.MessageUpdateEvent && occursin("CODEX_MARKER", ev.delta), seen_events) == 1
+    finally
+        close(server)
+    end
+end
+
+@testset "google_generative stream surfaces HTTP status errors" begin
+    seen_events = Agentif.AgentEvent[]
+
+    server = HTTP.serve!("127.0.0.1", 0) do req
+        return HTTP.Response(
+            400,
+            ["Content-Type" => "application/json"],
+            "{\"error\":{\"code\":400,\"message\":\"Invalid request\",\"status\":\"INVALID_ARGUMENT\"}}",
+        )
+    end
+
+    try
+        port = test_server_port(server)
+        model = Model(
+            id = "gemini-2.5-flash",
+            name = "gemini-2.5-flash",
+            api = "google-generative-ai",
+            provider = "google",
+            baseUrl = "http://127.0.0.1:$port",
+            reasoning = false,
+            input = ["text"],
+            cost = Dict("input" => 0.0, "output" => 0.0, "cacheRead" => 0.0, "cacheWrite" => 0.0),
+            contextWindow = 128000,
+            maxTokens = 32000,
+        )
+        agent = Agent(
+            id = "google-status-error-test",
+            prompt = "You are helpful.",
+            model = model,
+            apikey = "test-key",
+            tools = AgentTool[],
+        )
+
+        result = stream(ev -> (push!(seen_events, ev); ev), agent, AgentState(), "Say hello", Abort())
+        @test result.most_recent_stop_reason == :error
+        error_events = filter(ev -> ev isa Agentif.AgentErrorEvent, seen_events)
+        @test length(error_events) == 1
+        @test occursin("Invalid request", sprint(showerror, error_events[1].error))
+        # The assistant message is still started/finalized like the openai branches
+        @test count(ev -> ev isa Agentif.MessageStartEvent, seen_events) == 1
+        @test count(ev -> ev isa Agentif.MessageEndEvent, seen_events) == 1
+        @test result.messages[end] isa AssistantMessage
     finally
         close(server)
     end

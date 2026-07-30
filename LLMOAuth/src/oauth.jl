@@ -7,7 +7,7 @@ const ANTHROPIC_REDIRECT_URI = "https://console.anthropic.com/oauth/code/callbac
 const ANTHROPIC_SCOPES = "org:create_api_key user:profile user:inference"
 
 function agentif_dir()
-    return joinpath(homedir(), ".agentif")
+    return get(ENV, "AGENTIF_DIR", joinpath(homedir(), ".agentif"))
 end
 
 function anthropic_auth_path()
@@ -16,8 +16,19 @@ end
 
 function ensure_agentif_dir()
     dir = agentif_dir()
-    isdir(dir) || mkpath(dir)
+    if !isdir(dir)
+        mkpath(dir)
+    end
+    # Existing installations may have been created with a process umask that
+    # left this credential directory readable by other users.
+    chmod(dir, 0o700)
     return dir
+end
+
+function response_body_snippet(body::AbstractString; max_length::Integer = 200)
+    snippet = strip(body)
+    isempty(snippet) && return "<empty response body>"
+    return length(snippet) <= max_length ? String(snippet) : first(snippet, max_length) * "..."
 end
 
 function anthropic_client_config()
@@ -64,9 +75,10 @@ function anthropic_exchange_code(code::AbstractString, state::AbstractString, ve
     resp = HTTP.post(
         ANTHROPIC_TOKEN_URL,
         ["Content-Type" => "application/json"],
-        JSON.json(payload),
+        JSON.json(payload);
+        status_exception = false,
     )
-    resp.status in 200:299 || throw(ErrorException("Anthropic token exchange failed: $(String(resp.body))"))
+    resp.status in 200:299 || throw(ErrorException("Anthropic token exchange failed (status $(resp.status)): $(response_body_snippet(String(resp.body)))"))
     data = JSON.parse(resp.body)
     token = OAuth.TokenResponse(data; issued_at = Dates.now(Dates.UTC))
     return token
@@ -282,12 +294,45 @@ function codex_exchange_code(code::AbstractString, verifier::OAuth.PKCEVerifier)
                 "code_verifier" => verifier.verifier,
                 "redirect_uri" => CODEX_REDIRECT_URI,
             )
-        ),
+        );
+        status_exception = false,
     )
-    resp.status in 200:299 || throw(ErrorException("Codex token exchange failed: $(String(resp.body))"))
+    resp.status in 200:299 || throw(ErrorException("Codex token exchange failed (status $(resp.status)): $(response_body_snippet(String(resp.body)))"))
     data = JSON.parse(resp.body)
     token = OAuth.TokenResponse(data; issued_at = Dates.now(Dates.UTC))
     return token
+end
+
+"""
+    codex_is_invalid_grant(status, body) -> Bool
+
+Classify a token-endpoint response as a permanently-rejected refresh token, so the
+stored credentials can be cleared instead of failing the same way forever.
+
+Observed in the wild when another client (e.g. the `codex` CLI) rotates the token
+out from under us: HTTP 401 with `"type": "invalid_request_error"` and "Your
+refresh token has already been used", which carries no `invalid_grant` string.
+Both 400 and 401 are terminal only when the body identifies a grant or refresh
+token problem. A 401 can also mean `invalid_client`; clearing a valid refresh
+token in that case does not fix the client configuration failure.
+"""
+function codex_is_invalid_grant(status::Integer, body::AbstractString)
+    status in (400, 401) || return false
+    normalized = lowercase(body)
+    return occursin("invalid_grant", normalized) ||
+        occursin("refresh token", normalized) ||
+        occursin("refresh_token", normalized)
+end
+
+function codex_refresh_failure(status::Integer, body::AbstractString)
+    if codex_is_invalid_grant(status, body)
+        # Callers refresh under the codex refresh-token lock, so it is safe to
+        # clear the stored credentials here; leaving a revoked refresh token in
+        # place would make every future refresh fail the same way.
+        rm(codex_auth_path(); force = true)
+        return ErrorException("Stored Codex credentials were rejected (status $(status)): $(response_body_snippet(body)). They have been cleared; re-run codex_login() to authenticate again")
+    end
+    return ErrorException("Codex token refresh failed (status $(status)): $(response_body_snippet(body))")
 end
 
 function codex_refresh_token(refresh_token::String)
@@ -300,9 +345,10 @@ function codex_refresh_token(refresh_token::String)
                 "refresh_token" => refresh_token,
                 "client_id" => CODEX_CLIENT_ID,
             )
-        ),
+        );
+        status_exception = false,
     )
-    resp.status in 200:299 || throw(ErrorException("Codex token refresh failed: $(String(resp.body))"))
+    resp.status in 200:299 || throw(codex_refresh_failure(resp.status, String(resp.body)))
     data = JSON.parse(resp.body)
     token = OAuth.TokenResponse(data; issued_at = Dates.now(Dates.UTC))
     return token
@@ -312,18 +358,36 @@ end
     codex_save_credentials(creds::CodexCredentials)
 
 Save Codex credentials to the auth file, including the account ID.
+
+The file contains access and refresh tokens, so it is written owner-read/write
+only (0o600) and atomically: the JSON is written to a temp file in the same
+directory, chmodded, then moved over the destination so readers never observe
+a partial file.
 """
 function codex_save_credentials(creds::CodexCredentials)
-    ensure_agentif_dir()
+    dir = ensure_agentif_dir()
+    path = codex_auth_path()
     data = Dict(
         "access_token" => creds.access_token,
         "refresh_token" => creds.refresh_token,
         "expires_at" => Dates.format(creds.expires_at, Dates.ISODateTimeFormat),
         "account_id" => creds.account_id,
     )
-    return open(codex_auth_path(), "w") do io
+    # mktemp creates the file with mode 0600. This closes the window where
+    # `open(tempname(...), "w")` could expose token content under a loose umask
+    # before the later chmod.
+    tmp, io = mktemp(dir; cleanup = false)
+    try
+        chmod(tmp, 0o600)
         write(io, JSON.json(data))
+        close(io)
+        mv(tmp, path; force = true)
+        chmod(path, 0o600)
+    finally
+        isopen(io) && close(io)
+        ispath(tmp) && tmp != path && rm(tmp; force = true)
     end
+    return nothing
 end
 
 """
@@ -343,6 +407,17 @@ function codex_load_credentials()
         expires_at,
         data["account_id"],
     )
+end
+
+# Run `f` while holding the codex refresh-token file lock so credential reads,
+# refreshes, and saves cannot interleave across processes.
+function with_codex_refresh_lock(f::Function)
+    config = codex_client_config()
+    store = config.refresh_token_store
+    if store isa OAuth.FileBasedRefreshTokenStore
+        return OAuth.with_refresh_token_lock(f, store, config.verbose)
+    end
+    return f()
 end
 
 """
@@ -429,7 +504,9 @@ function codex_login(; open_browser::Bool = true, timeout::Real = 180)
         # Exchange the code for tokens
         token = codex_exchange_code(code, verifier)
         creds = codex_credentials_from_token(token)
-        codex_save_credentials(creds)
+        with_codex_refresh_lock() do
+            codex_save_credentials(creds)
+        end
 
         println("Successfully authenticated with Codex!")
         return (creds.access_token, creds.account_id)
@@ -447,14 +524,9 @@ Get valid Codex credentials, refreshing the token if necessary.
 Throws an error if no stored credentials exist or refresh fails.
 """
 function codex_credentials(; skew_seconds::Integer = 60)
-    config = codex_client_config()
-    store = config.refresh_token_store
-    if store isa OAuth.FileBasedRefreshTokenStore
-        return OAuth.with_refresh_token_lock(store, config.verbose) do
-            _codex_credentials_unlocked(skew_seconds)
-        end
+    return with_codex_refresh_lock() do
+        _codex_credentials_unlocked(skew_seconds)
     end
-    return _codex_credentials_unlocked(skew_seconds)
 end
 
 function _codex_credentials_unlocked(skew_seconds::Integer)

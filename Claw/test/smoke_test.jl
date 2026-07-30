@@ -169,6 +169,30 @@ end
     println("  ✓ Phase 2 passed")
 end
 
+@testset "Claw worker timeout cleanup" begin
+    a = make_test_assistant()
+    Claw.CURRENT_ASSISTANT[] = a
+    es = Claw.LLMToolsEventSource(a.config)
+    funcs = Dict(tool.name => tool.func for tool in Claw.get_tools(es))
+
+    started = funcs["start_worker"]("timeout-worker", "x = 1", nothing, false, 10)
+    @test occursin("started asynchronously", started)
+    @test timedwait(
+        () -> lock(es.lock) do
+            session = get(es.sessions, "timeout-worker", nothing)
+            session !== nothing && session.status == "completed"
+        end,
+        15.0,
+    ) == :ok
+
+    session = Claw._get_session(es, "timeout-worker", :worker)
+    @test_throws Claw.LLMTools.WorkerEvalTimeout funcs["eval_worker"](
+        "timeout-worker", "while true end", true, 1)
+    @test session.status == "error"
+    @test Claw.LLMTools.get_session(
+        Claw.LLMTools.WORKER_REGISTRY, session.registry_id) === nothing
+end
+
 # ============================================================================
 # SQLite schema & constructor
 # ============================================================================
@@ -618,6 +642,13 @@ end
     @test Claw.get_name(ev) == "repl_input"
     @test Claw.get_channel(ev) === ch
     @test Claw.event_content(ev) == "hello world"
+
+    # close_channel must notify completion so a"..." never hangs when an
+    # evaluation errors out before finish_streaming runs.
+    ch2 = Claw.ReplChannel()
+    Agentif.close_channel(ch2)
+    waiter = @async wait(ch2.completion)
+    @test timedwait(() -> istaskdone(waiter), 5.0) == :ok
 
     println("  ✓ REPL EventSource passed")
 end

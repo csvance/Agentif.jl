@@ -76,7 +76,10 @@ function _responses_split_compound_id(id::AbstractString)
     if idx === nothing
         return (String(id), nothing)
     end
-    return (String(id[1:idx-1]), String(id[idx+1:end]))
+    return (
+        String(id[1:prevind(id, idx)]),
+        String(id[nextind(id, idx):end]),
+    )
 end
 
 function openai_responses_normalize_tool_call_id(id::String, model::Model)
@@ -414,6 +417,10 @@ function openai_responses_event_callback(
             if response_id !== nothing
                 assistant_message.response_id = response_id
             end
+            if started[] && !ended[]
+                ended[] = true
+                f(MessageEndEvent(:assistant, assistant_message))
+            end
         elseif parsed isa OpenAIResponses.StreamResponseFailedEvent
             response_status[] = parsed.response.status
             response_usage[] = parsed.response.usage
@@ -435,11 +442,6 @@ function openai_responses_event_callback(
         elseif parsed isa OpenAIResponses.StreamResponseIncompleteEvent
             response_status[] = parsed.response.status
             response_usage[] = parsed.response.usage
-            if started[] && !ended[]
-                ended[] = true
-                f(MessageEndEvent(:assistant, assistant_message))
-            end
-        elseif parsed isa OpenAIResponses.StreamOutputDoneEvent || parsed isa OpenAIResponses.StreamDoneEvent
             if started[] && !ended[]
                 ended[] = true
                 f(MessageEndEvent(:assistant, assistant_message))

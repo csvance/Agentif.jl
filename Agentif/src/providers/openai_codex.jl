@@ -296,7 +296,7 @@ function transform_request_body!(
                         string(output)
                     end
                     if length(text) > 16000
-                        text = string(text[1:16000], "\n...[truncated]")
+                        text = string(first(text, 16000), "\n...[truncated]")
                     end
                     push!(
                         mapped, Dict(
@@ -359,7 +359,10 @@ function _split_compound_id(id::AbstractString)
     if idx === nothing
         return (String(id), nothing)
     end
-    return (String(id[1:idx-1]), String(id[idx+1:end]))
+    return (
+        String(id[1:prevind(id, idx)]),
+        String(id[nextind(id, idx):end]),
+    )
 end
 
 function codex_input_from_message(msg::AgentMessage, model::Model)
@@ -479,7 +482,7 @@ function codex_usage_from_response(u)
     if details isa AbstractDict
         cached_tokens = get(() -> 0, details, "cached_tokens")
     end
-    return Usage(; input = input_tokens - cached_tokens, output = output_tokens, cacheRead = cached_tokens, cacheWrite = 0, total = total_tokens)
+    return Usage(; input = max(0, input_tokens - cached_tokens), output = output_tokens, cacheRead = cached_tokens, cacheWrite = 0, total = total_tokens)
 end
 
 function codex_stop_reason(status::Union{Nothing, String}, tool_calls::Vector{AgentToolCall})
@@ -801,7 +804,7 @@ end
 
 function truncate_text(text::String, limit::Int)
     length(text) <= limit && return text
-    return string(text[1:limit], "...[truncated $(length(text) - limit)]")
+    return string(first(text, limit), "...[truncated $(length(text) - limit)]")
 end
 
 function format_codex_failure(raw_event::AbstractDict{String, Any})
@@ -934,17 +937,52 @@ function codex_retryable_message(message::AbstractString)
     return occursin(CODEX_RETRYABLE_ERROR_REGEX, lowercase(message))
 end
 
+if TRIMMED_BUILD
+    codex_nested_retryable_exception(::Exception) = false
+else
+    function codex_nested_retryable_exception(err::Exception)
+        if err isa TaskFailedException
+            task = getfield(err, :task)
+            for (nested, _) in Base.current_exceptions(task)
+                nested isa Exception && codex_retryable_exception(nested) && return true
+            end
+        elseif err isa CompositeException
+            for nested in getfield(err, :exceptions)
+                nested isa Exception && codex_retryable_exception(nested) && return true
+            end
+        end
+        return false
+    end
+end
+
 function codex_retryable_exception(err::Exception)
     if err isa HTTP.ConnectError
         return true
-    elseif err isa HTTP.RequestError
-        inner = err.error
+    elseif isdefined(HTTP, :RequestError) && err isa getfield(HTTP, :RequestError)
+        inner = getproperty(err, :error)
         inner isa Exception && return codex_retryable_exception(inner)
         return codex_retryable_message(string(inner))
-    elseif err isa EOFError || err isa Base.IOError || err isa InterruptException
+    elseif isdefined(HTTP, :RequestRetryError) && err isa getfield(HTTP, :RequestRetryError)
+        inner = getproperty(err, :err)
+        inner isa Exception && return codex_retryable_exception(inner)
+        return codex_retryable_message(string(inner))
+    elseif err isa InterruptException
+        return false
+    elseif err isa EOFError || err isa Base.IOError || err isa HTTP.ParseError
         return true
     end
+    codex_nested_retryable_exception(err) && return true
     return codex_retryable_message(sprint(showerror, err))
+end
+
+function http_recoverable_error(err::Exception)
+    if isdefined(HTTP, :isrecoverable)
+        return getfield(HTTP, :isrecoverable)(err)
+    elseif isdefined(HTTP, :RetryRequest)
+        retry_module = getfield(HTTP, :RetryRequest)
+        return getfield(retry_module, :isrecoverable)(err)
+    end
+    return false
 end
 
 function codex_retry_after_seconds(resp::HTTP.Response)
@@ -993,6 +1031,10 @@ function codex_stream_sse_with_retry!(
     request_http_kw = merge(http_nt, (; retry = false, status_exception = false))
     payload = JSON.json(request_body)
     attempt = 0
+    # Once any SSE event has been delivered into the (stateful) callback,
+    # re-POSTing would replay the whole response and duplicate its content.
+    events_seen = Ref(false)
+    tracked_callback = sse_tracking_callback(callback, events_seen)
 
     while true
         isaborted(abort) && throw(StopStreaming("aborted"))
@@ -1003,12 +1045,12 @@ function codex_stream_sse_with_retry!(
                 url,
                 headers;
                 body = payload,
-                sse_callback = callback,
+                sse_callback = tracked_callback,
                 request_http_kw...,
             )
         catch err
             err isa StopStreaming && rethrow()
-            if attempt < max_retries && codex_retryable_exception(err)
+            if attempt < max_retries && !events_seen[] && codex_retryable_exception(err)
                 attempt += 1
                 delay_s = codex_retry_delay_seconds(attempt, retry_base_ms, retry_max_ms)
                 log_codex_debug(
@@ -1033,7 +1075,7 @@ function codex_stream_sse_with_retry!(
         info = parse_codex_error(resp)
         info_msg = String(get(() -> "", info, :message))
         retryable = codex_retryable_status(resp.status) || codex_retryable_message(info_msg)
-        if attempt < max_retries && retryable
+        if attempt < max_retries && !events_seen[] && retryable
             attempt += 1
             delay_s = codex_retry_delay_seconds(attempt, retry_base_ms, retry_max_ms; response = resp)
             log_codex_debug(

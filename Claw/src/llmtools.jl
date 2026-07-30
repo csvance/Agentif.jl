@@ -624,6 +624,7 @@ Arguments:
 - code (String, required): Julia code to evaluate. Runs in a fresh worker process. Output includes both the return value and any stdout/stderr.
 - prompt (String, optional): Notification context prepended to the async completion event. Use to label what this worker is computing — e.g. "CSV parsing results". Ignored when run_sync=true.
 - run_sync (Bool, optional): If true, blocks until execution completes and returns the output. Default: false (async).
+- timeout_s (Int, optional): Timeout in seconds for the initial evaluation. On timeout the worker process is terminated and a timeout error is reported. Default: no timeout.
 
 Examples:
 - start_worker("data-proc", "using CSV, DataFrames; df = CSV.read(\\"data.csv\\", DataFrame); describe(df)", "Data summary")
@@ -633,6 +634,7 @@ Examples:
             code::String,
             prompt::Union{Nothing, String} = nothing,
             run_sync::Union{Nothing, Bool} = nothing,
+            timeout_s::Union{Nothing, Int} = nothing,
         ) = begin
             sync = run_sync === nothing ? false : run_sync
             _validate_name(es, name)
@@ -655,7 +657,7 @@ Examples:
 
             if sync
                 try
-                    combined, _ = LLMTools.eval_on_worker(worker_meta, code)
+                    combined, _ = LLMTools.eval_on_worker(worker_meta, code; timeout_s)
                     return LLMTools.truncate_tool_output(combined; label = "Worker output")
                 catch e
                     LLMTools.remove_session!(LLMTools.WORKER_REGISTRY, registry_id;
@@ -670,7 +672,7 @@ Examples:
                 registry_id = registry_id)
             session.task = Threads.@spawn begin
                 try
-                    combined, _ = LLMTools.eval_on_worker(worker_meta, code)
+                    combined, _ = LLMTools.eval_on_worker(worker_meta, code; timeout_s)
                     lock(es.lock) do
                         s = get(es.sessions, name, nothing)
                         if s !== nothing
@@ -681,6 +683,10 @@ Examples:
                     put!(a.event_queue, WorkerOutputEvent(event_type, name, combined))
                 catch e
                     bt = catch_backtrace()
+                    if e isa LLMTools.WorkerEvalTimeout
+                        LLMTools.remove_session!(LLMTools.WORKER_REGISTRY, registry_id;
+                            mark_status = LLMTools.SESSION_STATUS_ERROR)
+                    end
                     lock(es.lock) do
                         s = get(es.sessions, name, nothing)
                         s !== nothing && (s.status = "error")
@@ -714,6 +720,7 @@ Arguments:
 - name (String, required): The name of an existing worker session (as given to start_worker).
 - code (String, required): Julia code to evaluate. Can reference variables/functions from prior calls.
 - run_sync (Bool, optional): If true, blocks until execution completes. Default: false (async).
+- timeout_s (Int, optional): Timeout in seconds for the evaluation. On timeout the worker process is terminated (all its state is lost) and a timeout error is reported. Default: no timeout.
 
 Example:
 - eval_worker("data-proc", "filter(row -> row.age > 30, df) |> nrow", run_sync=true)""",
@@ -721,6 +728,7 @@ Example:
             name::String,
             code::String,
             run_sync::Union{Nothing, Bool} = nothing,
+            timeout_s::Union{Nothing, Int} = nothing,
         ) = begin
             sync = run_sync === nothing ? false : run_sync
             session = _get_session(es, name, :worker)
@@ -730,11 +738,24 @@ Example:
             worker_meta === nothing && error("Worker session '$name' no longer exists in registry")
 
             if sync
-                combined, _ = LLMTools.eval_on_worker(worker_meta, code)
-                lock(es.lock) do
-                    session.last_used = time()
+                try
+                    combined, _ = LLMTools.eval_on_worker(worker_meta, code; timeout_s)
+                    lock(es.lock) do
+                        session.last_used = time()
+                        session.status = "completed"
+                    end
+                    return LLMTools.truncate_tool_output(combined; label = "Worker output")
+                catch e
+                    if e isa LLMTools.WorkerEvalTimeout
+                        LLMTools.remove_session!(LLMTools.WORKER_REGISTRY, session.registry_id;
+                            mark_status = LLMTools.SESSION_STATUS_ERROR)
+                    end
+                    lock(es.lock) do
+                        session.last_used = time()
+                        session.status = "error"
+                    end
+                    rethrow()
                 end
-                return LLMTools.truncate_tool_output(combined; label = "Worker output")
             end
 
             event_type = session.event_type
@@ -744,7 +765,7 @@ Example:
             end
             session.task = Threads.@spawn begin
                 try
-                    combined, _ = LLMTools.eval_on_worker(worker_meta, code)
+                    combined, _ = LLMTools.eval_on_worker(worker_meta, code; timeout_s = timeout_s)
                     lock(es.lock) do
                         s = get(es.sessions, name, nothing)
                         if s !== nothing
@@ -755,6 +776,10 @@ Example:
                     put!(a.event_queue, WorkerOutputEvent(event_type, name, combined))
                 catch e
                     bt = catch_backtrace()
+                    if e isa LLMTools.WorkerEvalTimeout
+                        LLMTools.remove_session!(LLMTools.WORKER_REGISTRY, session.registry_id;
+                            mark_status = LLMTools.SESSION_STATUS_ERROR)
+                    end
                     lock(es.lock) do
                         s = get(es.sessions, name, nothing)
                         s !== nothing && (s.status = "error")

@@ -190,7 +190,7 @@ function openai_completions_build_messages(agent::Agent, state::AgentState, inpu
             return normalize_mistral_tool_id(id)
         end
         if model.provider == "openai"
-            return length(id) > 40 ? id[1:40] : id
+            return length(id) > 40 ? first(id, 40) : id
         end
         if model.provider == "github-copilot" && occursin("claude", lowercase(model.id))
             normalized = replace(id, r"[^A-Za-z0-9_-]" => "_")
@@ -234,7 +234,10 @@ function openai_completions_build_messages(agent::Agent, state::AgentState, inpu
             if !("image" in model.input)
                 parts = OpenAICompletions.ContentPart[part for part in parts if part.type != "image_url"]
             end
-            isempty(parts) && continue
+            if isempty(parts)
+                i += 1
+                continue
+            end
             push!(messages, OpenAICompletions.Message(; role = "user", content = parts))
             last_role = "user"
         elseif msg isa AssistantMessage
@@ -306,6 +309,7 @@ function openai_completions_build_messages(agent::Agent, state::AgentState, inpu
             has_extra = assistant_msg.extra !== nothing && !isempty(assistant_msg.extra)
             has_reasoning = assistant_msg.reasoning_details !== nothing
             if !has_content && assistant_msg.tool_calls === nothing && !has_extra && !has_reasoning
+                i += 1
                 continue
             end
             push!(messages, assistant_msg)
@@ -428,8 +432,10 @@ function strip_think_tags(text::AbstractString)
     # Implicit-open: everything before first </think> is thinking
     idx = findfirst("</think>", text)
     if idx !== nothing
-        thinking = text[1:first(idx)-1]
-        content = lstrip(text[last(idx)+1:end])
+        # prevind/nextind keep slices on char boundaries: `first(idx)-1` is a
+        # continuation byte when the char right before the tag is multi-byte
+        thinking = text[1:prevind(text, first(idx))]
+        content = lstrip(text[nextind(text, last(idx)):end])
         return thinking, content
     end
     return "", text
@@ -461,6 +467,9 @@ function process_think_tag_chunk(tts::ThinkTagStreamState, chunk::AbstractString
     buf = tts.buffer
     tts.buffer = ""
 
+    # NOTE: all slicing below must stay on char boundaries — the char right
+    # before/after an ASCII tag can be multi-byte, so raw index arithmetic
+    # (`first(idx)-1`, `end-8`) would land on continuation bytes and throw.
     while !isempty(buf)
         if tts.in_think
             # Skip explicit <think> open tag if present
@@ -468,21 +477,22 @@ function process_think_tag_chunk(tts::ThinkTagStreamState, chunk::AbstractString
                 idx = findfirst("<think>", buf)
                 if idx !== nothing && first(idx) == 1
                     tts.saw_explicit_open = true
-                    buf = buf[last(idx)+1:end]
+                    buf = buf[nextind(buf, last(idx)):end]
                     continue
                 end
             end
             # Look for closing </think>
             idx = findfirst("</think>", buf)
             if idx !== nothing
-                write(thinking, buf[1:first(idx)-1])
-                buf = buf[last(idx)+1:end]
+                write(thinking, buf[1:prevind(buf, first(idx))])
+                buf = buf[nextind(buf, last(idx)):end]
                 tts.in_think = false
             else
                 # Buffer last 8 chars in case </think> spans chunks
-                if length(buf) >= 8
-                    write(thinking, buf[1:end-8])
-                    tts.buffer = buf[end-7:end]
+                n = length(buf)
+                if n >= 8
+                    write(thinking, first(buf, n - 8))
+                    tts.buffer = last(buf, 8)
                 else
                     tts.buffer = buf
                 end
@@ -492,15 +502,16 @@ function process_think_tag_chunk(tts::ThinkTagStreamState, chunk::AbstractString
             # Look for opening <think>
             idx = findfirst("<think>", buf)
             if idx !== nothing
-                write(content, buf[1:first(idx)-1])
-                buf = buf[last(idx)+1:end]
+                write(content, buf[1:prevind(buf, first(idx))])
+                buf = buf[nextind(buf, last(idx)):end]
                 tts.in_think = true
                 tts.saw_explicit_open = true
             else
                 # Buffer last 7 chars in case <think> spans chunks
-                if length(buf) >= 7
-                    write(content, buf[1:end-7])
-                    tts.buffer = buf[end-6:end]
+                n = length(buf)
+                if n >= 7
+                    write(content, first(buf, n - 7))
+                    tts.buffer = last(buf, 7)
                 else
                     tts.buffer = buf
                 end
@@ -655,8 +666,10 @@ function openai_completions_event_callback(
                     if isempty(reasoning_buffer)
                         push!(new_text_parts, text_str)
                     else
-                        start_idx = lastindex(reasoning_buffer) + 1
-                        start_idx <= lastindex(text_str) && push!(new_text_parts, text_str[start_idx:end])
+                        # startswith guarantees the prefix bytes match, so the byte
+                        # after the prefix is a valid char boundary in text_str.
+                        start_idx = ncodeunits(reasoning_buffer) + 1
+                        start_idx <= ncodeunits(text_str) && push!(new_text_parts, text_str[start_idx:end])
                     end
                 else
                     push!(new_text_parts, text_str)
@@ -729,12 +742,12 @@ function openai_completions_event_callback(
                     )
                     f(MessageUpdateEvent(:assistant, assistant_message, :tool_arguments, tool_delta.function.arguments, acc.id))
                     if get(ENV, "AGENTIF_STOP_ON_TOOL_CALL", "") != "" && acc.name !== nothing && !isempty(acc.arguments)
-                        try
-                            parsed = JSON.parse(acc.arguments)
-                            parsed isa AbstractDict || throw(ArgumentError("tool arguments not object"))
-                            throw(StopStreaming("tool call arguments complete"))
+                        complete = try
+                            JSON.parse(acc.arguments) isa AbstractDict
                         catch
+                            false
                         end
+                        complete && throw(StopStreaming("tool call arguments complete"))
                     end
                 end
             end
