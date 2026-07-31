@@ -409,11 +409,37 @@ function _pty_exit_code(session)
     end
 end
 
-function _start_pty_capture(session)
+function _pty_shell_command(shell::AbstractString, cmd::AbstractString)
+    command = LLMTools.subprocess_shell_command(shell, cmd)
+    Sys.iswindows() && return (command, nothing)
+
+    # PtySessions starts the child before its constructor returns. A command such
+    # as `printf x; exit` can therefore finish before Claw can start its reader,
+    # and macOS can discard those unread master-side bytes when the slave closes.
+    # The outer non-login shell waits for one silent input line. The capture task
+    # sends that line only after the PTY is fully constructed.
+    gate = "IFS= read -r -s _; exec \"\$@\""
+    gated = Cmd(vcat(
+        String[String(shell), "-c", gate, "claw-pty-gate"],
+        String[String(arg) for arg in command.exec],
+    ))
+    return (gated, "\n")
+end
+
+function _start_pty_capture(session; release::Union{Nothing, String} = nothing)
     buffer = IOBuffer()
     buffer_lock = ReentrantLock()
     stop = Threads.Atomic{Bool}(false)
+    started = Channel{Any}(1)
     task = errormonitor(Threads.@spawn begin
+        try
+            release === nothing || LLMTools.PtySessions.write(session, release)
+            put!(started, nothing)
+        catch e
+            put!(started, e)
+            return
+        end
+        inactive_empty_polls = 0
         while !stop[]
             output = try
                 LLMTools.PtySessions.readavailable(session)
@@ -430,15 +456,29 @@ function _start_pty_capture(session)
             catch
                 false
             end
-            active || break
+            if active
+                inactive_empty_polls = 0
+            elseif isempty(output)
+                # Process exit and PTY EOF are separate events. A fast child can
+                # exit before the kernel exposes its final master-side bytes.
+                # PtySessions currently reports both EAGAIN and EOF as "", so
+                # require a short quiescent drain window instead of treating the
+                # first inactive poll as completion.
+                inactive_empty_polls += 1
+                inactive_empty_polls >= 3 && break
+            else
+                inactive_empty_polls = 0
+            end
             # Drain much faster than the model-facing notification cadence. On
             # macOS, unread PTY bytes can disappear when the slave closes.
             sleep(0.01)
         end
     end)
-    # Give the reader one turn before registration performs any database work.
-    # This closes the launch-to-first-read race for very short commands.
-    yield()
+    start_error = take!(started)
+    start_error === nothing || begin
+        wait(task)
+        throw(start_error)
+    end
     return buffer, buffer_lock, stop, task
 end
 
@@ -686,7 +726,7 @@ Runs ASYNC by default: returns immediately, you receive coalesced notification e
 
 Arguments:
 - name (String, required): Unique session identifier. MUST be kebab-case matching ^[a-z0-9]+(-[a-z0-9]+)*\$ — e.g. "test-run", "dev-server", "build1". No uppercase, spaces, or underscores.
-- cmd (String, required): The shell command to execute (run via bash -l -c on Unix, powershell on Windows).
+- cmd (String, required): The shell command to execute (run via a non-login bash shell on Unix, or PowerShell with profiles disabled on Windows).
 - prompt (String, optional): Notification context prepended to async output events. Use to label what this terminal is doing — e.g. "Test suite output". Ignored when run_sync=true.
 - workdir (String, optional): Working directory for the command. Defaults to the agent's configured base_dir.
 - run_sync (Bool, optional): If true, blocks ~0.5s and returns initial output. Default: false (async).
@@ -711,13 +751,21 @@ Examples:
             @info "Starting PTY session" name cmd work_dir sync
 
             shell_cmd = Sys.iswindows() ? "powershell" : "bash"
-            full_cmd = Sys.iswindows() ? Cmd([shell_cmd, "-Command", cmd]) : Cmd([shell_cmd, "-l", "-c", cmd])
+            full_cmd, release = _pty_shell_command(shell_cmd, cmd)
 
             LLMTools.ensure_cleanup_task_running!(LLMTools.PTY_REGISTRY)
             LLMTools.cleanup_exited_sessions!(LLMTools.PTY_REGISTRY)
             registry_id = LLMTools.next_session_id!(LLMTools.PTY_REGISTRY)
-            pty_session = LLMTools.PtySessions.PtySession(full_cmd; dir = work_dir)
-            capture_buffer, capture_lock, capture_stop, capture_task = _start_pty_capture(pty_session)
+            # Allowlisted environment only (§2.4): this PTY is reachable from an
+            # inbound message, so it must not carry the assistant's own API keys.
+            pty_session = LLMTools.PtySessions.PtySession(full_cmd; dir = work_dir,
+                env = LLMTools.subprocess_env())
+            capture_buffer, capture_lock, capture_stop, capture_task = try
+                _start_pty_capture(pty_session; release)
+            catch
+                try; close(pty_session); catch; end
+                rethrow()
+            end
 
             if sync
                 # Start draining before the process can exit. On macOS, unread

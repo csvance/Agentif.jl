@@ -1484,7 +1484,7 @@ function stream(
             abort,
         )
 
-        request_http_kw = merge(merged_http_kw, (; retry = false, readtimeout = 300))
+        request_http_kw = merge(merged_http_kw, (; retry = false, read_idle_timeout = 300))
         resp = nothing
         used_websocket = false
 

@@ -1,6 +1,6 @@
 # This file is machine-generated - editing it directly is not advised
 
-julia_version = "1.12.5"
+julia_version = "1.12.6"
 manifest_format = "2.0"
 project_hash = "978c3dca275e54013b43a5e729c6441d8e653806"
 
@@ -27,18 +27,13 @@ version = "1.11.0"
 uuid = "2a0f44e3-6c83-55bd-87e4-b1978d98bd5f"
 version = "1.11.0"
 
-[[deps.BitFlags]]
-git-tree-sha1 = "0691e34b3bb8be9307330f88d1a3c3f25466c24d"
-uuid = "d1d4a3ce-64b1-5f1a-9ba4-7e7e69966f35"
-version = "0.1.9"
-
 [[deps.CEnum]]
 git-tree-sha1 = "389ad5c84de1ae7cf0e28e381131c98ea87d54fc"
 uuid = "fa961155-64e5-5f13-b03f-caf6b980ea82"
 version = "0.5.0"
 
 [[deps.Claw]]
-deps = ["Agentif", "Dates", "HTTP", "JSON", "LLMTools", "LocalSearch", "Logging", "LoggingExtras", "Mattermost", "SQLite", "ScopedValues", "Tempus", "TimeZones"]
+deps = ["Agentif", "Base64", "Dates", "HTTP", "JSON", "LLMTools", "LocalSearch", "Logging", "LoggingExtras", "Mattermost", "SHA", "SQLite", "ScopedValues", "Sockets", "Tempus", "TimeZones"]
 path = "Claw"
 uuid = "46916a23-5c37-4b23-b62b-45b422578c04"
 version = "0.1.0"
@@ -120,16 +115,14 @@ version = "1.7.0"
 [[deps.Encid]]
 deps = ["Random"]
 git-tree-sha1 = "a5dfcde0acdde4bd3f9d0d89c11db42484c56f2e"
-repo-rev = "main"
 repo-url = "https://github.com/JuliaServices/Encid.jl.git"
 uuid = "22e113d6-bca1-46f4-8715-c46169ad70b7"
 version = "1.0.0"
 
-[[deps.ExceptionUnwrapping]]
-deps = ["Test"]
-git-tree-sha1 = "d36f682e590a83d63d1c7dbd287573764682d12a"
-uuid = "460bff9d-24e4-43bc-9d9f-a8973cb893f4"
-version = "0.1.11"
+[[deps.EnumX]]
+git-tree-sha1 = "c49898e8438c828577f04b92fc9368c388ac783c"
+uuid = "4e289a0a-7415-4d19-859d-a7e5c4648b56"
+version = "1.0.7"
 
 [[deps.ExprTools]]
 git-tree-sha1 = "27415f162e6028e81c72b82ef756bf321213b6ec"
@@ -142,17 +135,17 @@ version = "1.11.0"
 
 [[deps.GitHub]]
 deps = ["Base64", "Dates", "HTTP", "JSON", "MbedTLS", "Sockets", "SodiumSeal", "URIs"]
-git-tree-sha1 = "ef535d4e8cb96c4fb6753212744ee737fad1bc50"
+git-tree-sha1 = "33de1bc5665494f0a9669fd6027e28180709d874"
 uuid = "bc5e4493-9b4d-5f90-b8aa-2b2bcaad7a26"
-version = "5.12.0"
+version = "5.13.0"
 
 [[deps.HTTP]]
-deps = ["Base64", "CodecZlib", "ConcurrentUtilities", "Dates", "ExceptionUnwrapping", "Logging", "LoggingExtras", "MbedTLS", "NetworkOptions", "OpenSSL", "PrecompileTools", "Random", "SimpleBufferStream", "Sockets", "URIs", "UUIDs"]
-git-tree-sha1 = "51059d23c8bb67911a2e6fd5130229113735fc7e"
+deps = ["Base64", "CodecZlib", "Dates", "EnumX", "PrecompileTools", "Random", "Reseau", "SHA", "URIs", "UUIDs", "Zlib_jll"]
+git-tree-sha1 = "4d0328448fc7cddb2a4460b898ff5a48f340b5d3"
 repo-rev = "master"
 repo-url = "https://github.com/JuliaWeb/HTTP.jl.git"
 uuid = "cd3eb016-35fb-5094-929b-558a96fad6f3"
-version = "1.11.0"
+version = "2.6.0"
 
 [[deps.HashArrayMappedTries]]
 git-tree-sha1 = "2eaa69a7cab70a52b9687c8bf950a5a93ec895ae"
@@ -238,7 +231,7 @@ uuid = "e1f4c4b3-4b8a-4e8c-9b4f-7b8e4e6e5b2a"
 version = "1.0.0"
 
 [[deps.LLMTools]]
-deps = ["Agentif", "Base64", "ConcurrentUtilities", "Dates", "HTTP", "JSON", "LLMProviders", "Logging", "LoggingExtras", "PtySessions", "UUIDs"]
+deps = ["Agentif", "Base64", "ConcurrentUtilities", "Dates", "HTTP", "JSON", "LLMProviders", "Logging", "LoggingExtras", "PtySessions", "ScopedValues", "Sockets", "UUIDs"]
 path = "LLMTools"
 uuid = "d2f4c4b3-4b8a-4e8c-9b4f-7b8e4e6e5b2c"
 version = "1.0.0"
@@ -277,7 +270,6 @@ version = "1.11.0"
 [[deps.LocalSearch]]
 deps = ["Dates", "Downloads", "Libdl", "SHA", "SQLite", "llama_cpp_jll", "sqlite_vec_jll"]
 git-tree-sha1 = "d82d515cc679ffe4d291c7d0f20a9bedc948715f"
-repo-rev = "main"
 repo-url = "https://github.com/quinnj/LocalSearch.jl.git"
 uuid = "3edf9609-13f2-4288-b0a3-8bd6d521158e"
 version = "0.1.0"
@@ -294,8 +286,7 @@ version = "1.2.0"
 
 [[deps.MSTeams]]
 deps = ["Dates", "HTTP", "JSON", "Logging", "ZipFile"]
-git-tree-sha1 = "bbc63960211cb66661fa1a88236764b989a50f76"
-repo-rev = "main"
+git-tree-sha1 = "ff0eaa9ea9ef66a663a5d44bd659cd8abc9d093e"
 repo-url = "https://github.com/quinnj/MSTeams.jl.git"
 uuid = "730ab40b-c28c-4fcb-83ce-ff189233d76d"
 version = "0.1.0"
@@ -307,8 +298,7 @@ version = "1.11.0"
 
 [[deps.Mattermost]]
 deps = ["HTTP", "JSON", "Logging", "ScopedValues"]
-git-tree-sha1 = "5c5899e6922575e836359c187fb41114e33672cf"
-repo-rev = "main"
+git-tree-sha1 = "a393e6065bdf755871445f249e0663ca0cdc20e6"
 repo-url = "https://github.com/quinnj/Mattermost.jl.git"
 uuid = "c9a394b0-b131-4b99-aeb4-b011b7b7f934"
 version = "0.1.0"
@@ -353,12 +343,6 @@ version = "1.0.0"
     [deps.OAuth.weakdeps]
     Postgres = "8f23287e-300e-4f50-bc2b-9f1dfe95da84"
 
-[[deps.OpenSSL]]
-deps = ["BitFlags", "Dates", "MozillaCACerts_jll", "NetworkOptions", "OpenSSL_jll", "Sockets"]
-git-tree-sha1 = "1d1aaa7d449b58415f97d2839c318b70ffb525a0"
-uuid = "4d8831e6-92b7-49fb-bdf8-b643e874388c"
-version = "1.6.1"
-
 [[deps.OpenSSL_jll]]
 deps = ["Artifacts", "Libdl"]
 uuid = "458c3c95-2e84-50aa-8efc-19380b2a3a95"
@@ -393,8 +377,7 @@ uuid = "de0858da-6303-5e67-8744-51eddeeeb8d7"
 version = "1.11.0"
 
 [[deps.PtySessions]]
-git-tree-sha1 = "9264935566173a1df608c668917a9dd1ecc25f96"
-repo-rev = "main"
+git-tree-sha1 = "42938732977428e949e23acbd46e95bafbd381c9"
 repo-url = "https://github.com/quinnj/PtySessions.jl.git"
 uuid = "581b29ee-4021-4243-bea3-a8421693f905"
 version = "0.1.0"
@@ -403,6 +386,12 @@ version = "0.1.0"
 deps = ["SHA"]
 uuid = "9a3f8284-a2c9-5f02-9a11-845980a1fd5c"
 version = "1.11.0"
+
+[[deps.Reseau]]
+deps = ["NetworkOptions", "OpenSSL_jll", "PrecompileTools", "Random", "SHA"]
+git-tree-sha1 = "0bd997a5b763395a78575989ac02e622f42461e9"
+uuid = "802f3686-a58f-41ce-bb0c-3c43c75bba36"
+version = "1.3.4"
 
 [[deps.SHA]]
 uuid = "ea8e919c-243c-51af-8825-aaa63cd721ce"
@@ -439,20 +428,13 @@ version = "1.11.0"
 [[deps.Signal]]
 deps = ["HTTP", "JSON", "Logging", "ScopedValues", "StructUtils"]
 git-tree-sha1 = "49d93bac17dc64ba7c0b77b7f37127af2de2c7ba"
-repo-rev = "main"
 repo-url = "https://github.com/quinnj/Signal.jl.git"
 uuid = "0944c9af-6677-4ce2-950b-62b1fa25f333"
 version = "0.1.0"
 
-[[deps.SimpleBufferStream]]
-git-tree-sha1 = "f305871d2f381d21527c770d4788c06c097c9bc1"
-uuid = "777ac1f9-54b0-4bf8-805c-2214025038e7"
-version = "1.2.0"
-
 [[deps.Slack]]
 deps = ["Base64", "HTTP", "JSON", "Logging", "StructUtils"]
 git-tree-sha1 = "70d1af45c5e47b733b0b9d77a9acb4be946a9b70"
-repo-rev = "main"
 repo-url = "https://github.com/quinnj/Slack.jl.git"
 uuid = "4d517630-ce0d-4555-8fa7-416d9f8f5684"
 version = "0.1.0"
@@ -512,8 +494,7 @@ version = "1.12.1"
 
 [[deps.Telegram]]
 deps = ["HTTP", "JSON", "Logging", "ScopedValues"]
-git-tree-sha1 = "122c412253698084dcc340e838d6a27fc44ff243"
-repo-rev = "main"
+git-tree-sha1 = "f5c920fdbdc1ae1730336cad734c83b02b326469"
 repo-url = "https://github.com/quinnj/Telegram.jl.git"
 uuid = "0f099131-46f3-42ed-8989-d9c7888465f9"
 version = "0.1.0"
@@ -529,11 +510,6 @@ weakdeps = ["SQLite"]
 
     [deps.Tempus.extensions]
     TempusSQLiteExt = "SQLite"
-
-[[deps.Test]]
-deps = ["InteractiveUtils", "Logging", "Random", "Serialization"]
-uuid = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
-version = "1.11.0"
 
 [[deps.TimeZones]]
 deps = ["Artifacts", "Dates", "Downloads", "InlineStrings", "Mocking", "Printf", "Scratch", "TZJData", "Unicode", "p7zip_jll"]

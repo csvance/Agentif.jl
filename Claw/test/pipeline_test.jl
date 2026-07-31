@@ -14,6 +14,13 @@ using HTTP
 using Logging
 using SQLite
 
+function status_error(status::Integer;
+    headers = Pair{String, String}[],
+    body::AbstractString = "")
+    request = HTTP.Request("POST", "/v1/messages")
+    return HTTP.StatusError(HTTP.Response(status, headers; body, request))
+end
+
 # ─── Fixtures ───
 
 mutable struct RecordingChannel <: Agentif.AbstractChannel
@@ -188,18 +195,18 @@ end
     # Captured shapes, not spec-shaped fabrications: Anthropic returns 429 with a
     # rate_limit_error body, and a rotated key comes back as 401 with an
     # invalid_request_error body (no `invalid_grant` anywhere).
-    rate_limited = HTTP.StatusError(429, "POST", "/v1/messages",
-        HTTP.Response(429, ["retry-after" => "23"];
-            body = """{"type":"error","error":{"type":"rate_limit_error","message":"Number of request tokens has exceeded your per-minute rate limit"}}"""))
-    rotated_key = HTTP.StatusError(401, "POST", "/v1/messages",
-        HTTP.Response(401; body = """{"type":"error","error":{"type":"invalid_request_error","message":"invalid x-api-key"}}"""))
-    overloaded = HTTP.StatusError(529, "POST", "/v1/messages",
-        HTTP.Response(529; body = """{"type":"error","error":{"type":"overloaded_error"}}"""))
+    rate_limited = status_error(429;
+        headers = ["retry-after" => "23"],
+        body = """{"type":"error","error":{"type":"rate_limit_error","message":"Number of request tokens has exceeded your per-minute rate limit"}}""")
+    rotated_key = status_error(401;
+        body = """{"type":"error","error":{"type":"invalid_request_error","message":"invalid x-api-key"}}""")
+    overloaded = status_error(529;
+        body = """{"type":"error","error":{"type":"overloaded_error"}}""")
 
     @test Claw.classify_eval_failure(rate_limited) == :rate_limit
     @test Claw.classify_eval_failure(rotated_key) == :auth
     @test Claw.classify_eval_failure(overloaded) == :overloaded
-    @test Claw.classify_eval_failure(HTTP.StatusError(402, "POST", "/x", HTTP.Response(402))) == :billing
+    @test Claw.classify_eval_failure(status_error(402)) == :billing
     @test Claw.classify_eval_failure(Agentif.AbortEvaluation()) == :aborted
     @test Claw.classify_eval_failure(EOFError()) == :network
     @test Claw.classify_eval_failure(ErrorException("read timed out after 30s")) == :network
@@ -405,8 +412,8 @@ end
     a._channels[ch.id] = ch
     register_test_handler!(a)
     attempts = Threads.Atomic{Int}(0)
-    boom = HTTP.StatusError(429, "POST", "/v1/messages",
-        HTTP.Response(429; body = """{"type":"error","error":{"type":"rate_limit_error"}}"""))
+    boom = status_error(429;
+        body = """{"type":"error","error":{"type":"rate_limit_error"}}""")
 
     local id
     with_handler((args...; kwargs...) -> (Threads.atomic_add!(attempts, 1); throw(boom))) do
@@ -433,8 +440,8 @@ end
     a._channels[ch.id] = ch
     register_test_handler!(a)
     attempts = Threads.Atomic{Int}(0)
-    rotated_key = HTTP.StatusError(401, "POST", "/v1/messages",
-        HTTP.Response(401; body = """{"type":"error","error":{"type":"invalid_request_error","message":"invalid x-api-key"}}"""))
+    rotated_key = status_error(401;
+        body = """{"type":"error","error":{"type":"invalid_request_error","message":"invalid x-api-key"}}""")
 
     local id
     with_handler((args...; kwargs...) -> (Threads.atomic_add!(attempts, 1); throw(rotated_key))) do
@@ -882,9 +889,13 @@ if !Sys.iswindows()
         tools = Claw.get_tools(es)
         start_pty = tools[findfirst(t -> t.name == "start_pty", tools)].func
 
-        sync_output = start_pty("sync-race", "printf sync-sentinel; exit 9",
-            nothing, nothing, true)
-        @test occursin("sync-sentinel", sync_output)
+        # Non-login shells start fast enough to expose the process-exit/PTY-drain
+        # race. Repeat the short path so a one-shot scheduling win cannot hide it.
+        for i in 1:20
+            sync_output = start_pty("sync-race-$i", "printf sync-sentinel; exit 9",
+                nothing, nothing, true)
+            @test occursin("sync-sentinel", sync_output)
+        end
 
         exit_gate = tempname()
         start_pty("cleanup-race",
