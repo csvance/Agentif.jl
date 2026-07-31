@@ -23,6 +23,10 @@ const WATCHER_TEST_MODEL = Agentif.Model(
 )
 Agentif.registerModel!(WATCHER_TEST_MODEL)
 
+watcher_status_error(status::Integer) = HTTP.StatusError(HTTP.Response(
+    status;
+    request = HTTP.Request("POST", "/v1/messages")))
+
 # ─── Recording channel ───
 
 struct RecordingChannel <: Agentif.AbstractChannel
@@ -165,7 +169,7 @@ println("=" ^ 60)
 end
 
 @testset "classify_eval_failure" begin
-    se(status) = HTTP.StatusError(status, "POST", "/v1", HTTP.Response(status))
+    se(status) = watcher_status_error(status)
     @test Claw.classify_eval_failure(se(429)) === :rate_limit
     @test Claw.classify_eval_failure(se(401)) === :auth
     @test Claw.classify_eval_failure(se(403)) === :auth
@@ -257,7 +261,7 @@ end
     a._channels[ch.id] = ch
     ev = WatcherTestEvent("test_event", "process email")
     handler = (; id = "h-429", prompt = "Test prompt", channel_id = ch.id)
-    err = HTTP.StatusError(429, "POST", "/v1/messages", HTTP.Response(429))
+    err = watcher_status_error(429)
     run_handler_guarded(a, ev, handler; base_handler = make_throwing_handler(err))
     rows = fetch_evals(a.db)
     @test length(rows) == 1
@@ -278,7 +282,7 @@ end
     a._channels[ch.id] = ch
     ev = WatcherTestEvent("test_event", "process durable event")
     handler = (; id = "h-durable-429", prompt = "Test prompt", channel_id = ch.id)
-    err = HTTP.StatusError(429, "POST", "/v1/messages", HTTP.Response(429))
+    err = watcher_status_error(429)
     failure = try
         Claw._run_event_handler!(
             a,
@@ -443,7 +447,7 @@ end
     a._channels[ch.id] = ch
     ev = WatcherTestEvent("test_event", "x")
     handler = (; id = "h-watcherfail", prompt = "Test prompt", channel_id = ch.id)
-    err = HTTP.StatusError(429, "POST", "/v1/messages", HTTP.Response(429))
+    err = watcher_status_error(429)
     run_handler_guarded(a, ev, handler; base_handler = make_throwing_handler(err))
     rows = fetch_evals(a.db)
     @test length(rows) == 1

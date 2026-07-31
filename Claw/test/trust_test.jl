@@ -57,6 +57,9 @@ end
 const EXEC_COMMAND_TOOL = Agentif.@tool "Run a shell command." function exec_command(cmd::String)
     return "ran $cmd"
 end
+const UNKNOWN_CUSTOM_TOOL = Agentif.@tool "A deployment-specific mutation." function custom_mutation(value::String)
+    return value
+end
 
 # A registered stub model so `evaluate` can build an Agent without reaching a
 # provider; the stub `base_handler` below returns before any request is made.
@@ -76,7 +79,8 @@ function make_assistant(db_path::String = ":memory:"; sources = Claw.EventSource
     append!(a.tools, Claw.MANAGEMENT_TOOLS)
     append!(a.tools, Claw.TEMPUS_TOOLS)
     append!(a.tools, Claw.DB_TOOLS)
-    append!(a.tools, Agentif.AgentTool[EMAIL_SEND_TOOL, EMAIL_SEARCH_TOOL, EXEC_COMMAND_TOOL])
+    append!(a.tools, Agentif.AgentTool[
+        EMAIL_SEND_TOOL, EMAIL_SEARCH_TOOL, EXEC_COMMAND_TOOL, UNKNOWN_CUSTOM_TOOL])
     return a
 end
 
@@ -182,12 +186,13 @@ end
             @test denied in owner_tools
             @test !(denied in untrusted_tools)
         end
-        # Read/search/db tools survive: an untrusted handler still has to be able to
-        # read the thing it was triggered by.
+        # Only reviewed read/scratch tools survive. A deployment-specific tool is
+        # denied until the operator explicitly allowlists it.
         for kept in ("db_search", "db_store", "db_list_keys", "email_search",
                      "get_system_prompt", "list_channels", "list_event_handlers")
             @test kept in untrusted_tools
         end
+        @test !("custom_mutation" in untrusted_tools)
         @test untrusted_tools ⊆ owner_tools
     finally
         Claw.shutdown!(a; timeout_s = 5)
@@ -207,7 +212,22 @@ end
         @test tool_names(Claw.resolve_handler_tools(a, owner)) == ["db_search", "email_send"]
         # A corrupted tier is read back as the restrictive one, never as owner.
         @test Claw._decode_handler_trust("nonsense") === :untrusted
+        @test Claw._decode_handler_trust("") === :untrusted
+        @test Claw._decode_handler_trust(1) === :untrusted
         @test Claw._decode_handler_trust(missing) === :owner
+        @test Claw._handler_trust((; trust = "owner")) === :untrusted
+        # Corrupt stored subsets must become an empty set. `nothing` means the full
+        # default set, so treating malformed JSON as `nothing` would fail open.
+        @test Claw._decode_handler_tools("not-json") == String[]
+        @test Claw._decode_handler_tools("{}") == String[]
+        @test Claw._decode_handler_tools("[1]") == String[]
+        @test Claw._decode_handler_tools(1) == String[]
+        @test Claw._decode_handler_tools(missing) === nothing
+        corrupt = (;
+            trust = :owner,
+            tools = Claw._decode_handler_tools("not-json"),
+        )
+        @test isempty(Claw.resolve_handler_tools(a, corrupt))
     finally
         Claw.shutdown!(a; timeout_s = 5)
     end
@@ -246,31 +266,41 @@ end
     end
 end
 
-# ─── §2.2 Owner identity ───
-
-@testset "is_owner_context" begin
-    a = make_assistant(; owner_channels = ["mm-jacob"], owner_user_ids = ["u-123"])
+@testset "watcher supervision cannot restore owner tools" begin
+    watcher = Claw.WatcherConfig(;
+        provider = "trust-test",
+        model_id = "trust-test-model",
+        apikey = "test-key",
+        stall_timeout_s = 5.0,
+        max_eval_duration_s = 10.0,
+        check_interval_s = 0.05,
+        watcher_timeout_s = 5.0,
+    )
+    a = make_assistant(; watcher)
+    Claw.CURRENT_ASSISTANT[] = a
     try
-        @test Claw.is_owner_context(a, Claw.ReplChannel())          # the REPL is always owner
-        @test Claw.is_owner_context(a, "repl")
-        @test Claw.is_owner_context(a, "mm-jacob")
-        @test Claw.is_owner_context(a, TrustChannel("mm-jacob"))
-        @test Claw.is_owner_context(a, nothing, "u-123")
-        @test !Claw.is_owner_context(a, TrustChannel("mm-random"))
-        @test !Claw.is_owner_context(a, nothing, "u-999")
-        @test !Claw.is_owner_context(a, nothing, nothing)
-        @test !Claw.is_owner_context(a, nothing, "")
+        seen = Ref{Vector{String}}(String[])
+        capture = function (f, agent, state, input, abort; kw...)
+            seen[] = sort!(String[t.name for t in agent.tools])
+            return state
+        end
+        ev = TrustEvent("hello", TrustChannel("watched-trust-eval"))
+        handler = (;
+            id = "watched-untrusted",
+            prompt = "",
+            channel_id = nothing,
+            trust = :untrusted,
+            tools = nothing,
+        )
+
+        Claw._run_event_handler!(a, ev, handler; base_handler = capture)
+
+        @test !("set_system_prompt" in seen[])
+        @test !("email_send" in seen[])
+        @test !("custom_mutation" in seen[])
+        @test "db_search" in seen[]
     finally
         Claw.shutdown!(a; timeout_s = 5)
-    end
-
-    # Nothing is owner by default — the lists start empty on purpose.
-    b = make_assistant()
-    try
-        @test Claw.is_owner_context(b, Claw.ReplChannel())
-        @test !Claw.is_owner_context(b, TrustChannel("mm-jacob"), "u-123")
-    finally
-        Claw.shutdown!(b; timeout_s = 5)
     end
 end
 
@@ -283,6 +313,13 @@ end
         Claw.register_event_handler!(a, Claw.EventHandler("mail-triage", ["inbox_mail"], "", nothing))
         Claw.register_event_handler!(a, Claw.EventHandler("group-chat", ["group_message"], "", nothing))
         Claw.register_event_handler!(a, Claw.EventHandler("dm-only", ["dm_message"], "", nothing))
+        Claw.register_event_handler!(a, Claw.EventHandler(
+            "mail-owner-narrow",
+            ["inbox_mail"],
+            "",
+            nothing;
+            tools = ["db_search"],
+        ))
         Claw.register_event_handler!(a,
             Claw.EventHandler("mail-triage-safe", ["inbox_mail"], "", nothing; trust = :untrusted))
 
@@ -310,6 +347,7 @@ end
         @test occursin("group-chat", msg)
         @test occursin("dm-to-group", msg)
         @test !occursin("dm-only", msg)
+        @test !occursin("mail-owner-narrow", msg)
         @test !occursin("mail-triage-safe:", msg)
         @test occursin("set_system_prompt", msg)      # tools at risk are named
         @test occursin("email_send", msg)
@@ -360,6 +398,21 @@ end
     github = Base.get_extension(Claw, :ClawGitHubExt)
     if github !== nothing
         @test Claw.is_loopback_host(github.GitHubEventSource(; secret = "s").host)
+    end
+end
+
+@testset "Telegram webhook authentication is mandatory" begin
+    telegram = Base.get_extension(Claw, :ClawTelegramExt)
+    if telegram !== nothing
+        @test Claw.validate_source(telegram.TelegramEventSource(; use_polling = true)) === nothing
+        @test_throws ErrorException Claw.validate_source(
+            telegram.TelegramEventSource(; use_polling = false, secret_token = nothing))
+        @test_throws ErrorException Claw.validate_source(
+            telegram.TelegramEventSource(; use_polling = false, secret_token = "  "))
+        @test Claw.validate_source(telegram.TelegramEventSource(;
+            use_polling = false,
+            secret_token = "reviewed-secret",
+        )) === nothing
     end
 end
 

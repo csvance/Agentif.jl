@@ -67,6 +67,13 @@ function _worker_env()
     # constructor only sets JULIA_PROJECT when the env key is absent, so an
     # inherited "." would point the worker at the wrong project.
     project = Base.ACTIVE_PROJECT[]
+    if project === nothing
+        # Julia 1.10 can leave ACTIVE_PROJECT unset inside `Pkg.test`, even though
+        # the first LOAD_PATH entry still resolves to the test sandbox project.
+        # `active_project()` follows that load path and returns its Project.toml.
+        project_file = Base.active_project()
+        project = project_file === nothing ? nothing : dirname(project_file)
+    end
     if project !== nothing
         env["JULIA_PROJECT"] = project
     end

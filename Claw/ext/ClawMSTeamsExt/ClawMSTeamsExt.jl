@@ -113,7 +113,7 @@ Keep your response concise."""
 
 """
     MSTeamsEventSource(; app_id, app_password, host, port, path, health_path,
-                         verify_jwt = true, issuers, clock_skew_s, openid_config_url)
+                         issuers, clock_skew_s, openid_config_url)
 
 Teams webhook receiver.
 
@@ -121,11 +121,6 @@ Two §2.1 changes from the original: `host` defaults to **loopback**, not
 `0.0.0.0` — the safe deployment (behind a proxy) is the one you get by default —
 and every inbound activity must carry a valid Bot Framework JWT before an event is
 created.
-
-`verify_jwt = false` exists for local development against the Bot Framework
-Emulator. It is refused at `validate_source` on any non-loopback bind address:
-turning off authentication *and* listening on the network is the configuration this
-whole section exists to prevent.
 """
 Base.@kwdef struct MSTeamsEventSource <: Claw.EventSource
     app_id::String = get(ENV, "MSTEAMS_APP_ID", "")
@@ -134,7 +129,6 @@ Base.@kwdef struct MSTeamsEventSource <: Claw.EventSource
     port::Int = 3978
     path::String = "/api/messages"
     health_path::String = "/healthz"
-    verify_jwt::Bool = get(ENV, "MSTEAMS_VERIFY_JWT", "1") != "0"
     issuers::Vector{String} = BF_DEFAULT_ISSUERS
     clock_skew_s::Float64 = 300.0
     openid_config_url::String = BF_OPENID_CONFIG_URL
@@ -305,15 +299,9 @@ end
 function Claw.validate_source(source::MSTeamsEventSource)
     isempty(strip(source.app_id)) && error("ClawMSTeamsExt: missing MSTEAMS_APP_ID")
     isempty(strip(source.app_password)) && error("ClawMSTeamsExt: missing MSTEAMS_APP_PASSWORD")
-    # Fail closed (§2.1): unauthenticated + reachable is the combination that turns
-    # any POST into an evaluated "user message" with the owner's full tool set.
-    if !source.verify_jwt && !Claw.is_loopback_host(source.host)
-        error("ClawMSTeamsExt: refusing to bind $(source.host):$(source.port) with " *
-              "verify_jwt = false. Inbound Bot Framework JWT validation is the only thing " *
-              "distinguishing a real Teams activity from anyone who can reach the port. " *
-              "Either leave verify_jwt = true, or bind 127.0.0.1 and put an authenticating " *
-              "proxy in front.")
-    end
+    (isfinite(source.clock_skew_s) && source.clock_skew_s >= 0) ||
+        error("ClawMSTeamsExt: clock_skew_s must be finite and nonnegative")
+    isempty(source.issuers) && error("ClawMSTeamsExt: issuers must not be empty")
     return nothing
 end
 
@@ -339,7 +327,9 @@ function _authenticating_handler(inner::Function, source::MSTeamsEventSource, ke
             ok, reason = _bf_authorize(req, source, keys)
             if !ok
                 @warn "ClawMSTeamsExt: rejected unauthenticated activity" reason maxlog = 50
-                return HTTP.Response(401, ["WWW-Authenticate" => "Bearer"], "unauthorized")
+                status = occursin("endorsement", reason) ? 403 : 401
+                headers = status == 401 ? ["WWW-Authenticate" => "Bearer"] : Pair{String, String}[]
+                return HTTP.Response(status, headers, "unauthorized")
             end
         end
         return inner(req)
@@ -372,18 +362,13 @@ function Claw.start!(source::MSTeamsEventSource, assistant::Claw.AgentAssistant)
             end
             return nothing
         end
-        handler = routed
-        if source.verify_jwt
-            keys = BotFrameworkKeys(source.openid_config_url)
-            # Warm the cache so the first real activity is not the one paying for the
-            # fetch; a failure here is non-fatal (and fails closed on every request
-            # until a refresh succeeds).
-            _bf_refresh_keys!(keys)
-            handler = _authenticating_handler(routed, source, keys)
-        else
-            @warn "ClawMSTeamsExt: inbound JWT validation is DISABLED; every POST to $(source.path) is trusted" host=source.host port=source.port
-        end
-        @info "ClawMSTeamsExt: Starting webhook server" host=source.host port=source.port path=source.path verify_jwt=source.verify_jwt
+        keys = BotFrameworkKeys(source.openid_config_url)
+        # Warm the cache so the first real activity is not the one paying for the
+        # fetch. A failure is non-fatal and every request fails closed until a
+        # rate-limited refresh succeeds.
+        _bf_refresh_keys!(keys)
+        handler = _authenticating_handler(routed, source, keys)
+        @info "ClawMSTeamsExt: Starting authenticated webhook server" host=source.host port=source.port path=source.path
         HTTP.serve(handler, source.host, source.port)
     end)
 end

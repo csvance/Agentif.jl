@@ -223,14 +223,17 @@ deserves its own review.
 
 ## 2.1 Inbound authentication
 
-- **MSTeams**: validate the Bot Framework JWT (issuer, audience = app id, signing keys
-  from the OpenID config, expiry) before any event is created; refuse to start bound
-  to a non-loopback interface without validation configured.
+- **MSTeams**: validate the Bot Framework JWT before any event is created. Validation
+  is mandatory. It checks the signature, issuer, audience, `nbf`/`exp` lifetime,
+  Activity `serviceUrl`, and signing-key endorsement for the Activity `channelId`.
+  Signing keys refresh when the cache is older than 24 hours. The source has no
+  authentication-disable setting.
   > **Corrected after implementation.** This cannot live inside the `MSTeams.run_server`
   > callback — that callback receives only the parsed activity, so the `Authorization`
   > header is unreachable from it. It is *not* blocked upstream though: the extension
   > serves HTTP itself and delegates routing to `MSTeams.build_server_handler`, so the
-  > check runs strictly before an event exists. No MSTeams.jl change needed. Also note
+  > check runs strictly before an event exists. No MSTeams.jl change was needed for
+  > authentication. Also note
   > JWTs.jl is not in this stack's manifest; verification is written on stdlibs
   > (`SHA.sha256` + GMP `powermod` for the RSA operation, plus an explicit
   > EMSA-PKCS1-v1_5 padding check), which is fine as it involves no secrets.
@@ -239,6 +242,8 @@ deserves its own review.
   `WebhookEvent` carries only `(kind, payload, repository, sender)`, so the header
   never reaches the callback. Needs a GitHub.jl change; until then GitHub events have
   at-least-once delivery but no redelivery deduplication.
+- **Telegram**: polling needs no inbound listener. Webhook mode requires a nonempty
+  secret token and fails validation before startup when it is absent.
 - Default all HTTP-listening sources to `127.0.0.1` unless a host is set explicitly,
   so the safe deployment (behind a proxy) is the default one. That is MSTeams, GitHub
   **and Telegram** — Telegram's webhook mode is also an HTTP listener binding
@@ -264,18 +269,36 @@ rather than silent: log once at startup naming every handler that is owner-tier 
 fed by a source carrying third-party content, so the exposure is stated on every boot
 instead of having to be remembered.
 
-Owner identity: a configured `owner_channels` / `owner_user_ids` list; the REPL is
-always owner. Tool availability is resolved per eval from the handler's trust tier.
+Tool availability is resolved per eval from the handler's static trust tier. The
+untrusted tier uses a fail-closed allowlist: new and deployment-specific tools are
+not granted until the operator explicitly reviews and adds them.
+
+The built-in untrusted set still includes reviewed read/search/scratch tools. This is
+an integrity and network-egress boundary, not a confidentiality boundary: a read tool
+can return file, email, system-prompt, or scratch data to the handler's channel. Use
+the handler's explicit `tools` subset, or remove names from
+`UNTRUSTED_ALLOWED_TOOLS`, when those reads are not safe for that channel.
 
 ## 2.3 Egress policy for `web_fetch`
 
-Currently unrestricted: any host, any method, arbitrary headers and bodies, redirects
-followed without re-validation. For an agent processing third-party content this is a
-ready-made exfiltration and internal-pivot channel. Add: DNS resolution with
-private/loopback/link-local ranges denied (re-checked on every redirect hop, since DNS
-can rebind), non-GET methods gated behind config, a wall-clock deadline per fetch, and
-fetched content wrapped in explicit untrusted-content delimiters when injected into
-the model's context.
+`web_fetch` now rejects URL credentials, private/loopback/link-local/reserved
+destinations, caller-controlled transport headers, and credential-bearing headers by
+default. It checks every resolved address, then connects to one exact checked address
+while it keeps the original host for HTTP and TLS. It repeats this process for every
+redirect. Even after a credential-header opt-in, a cross-origin redirect strips those
+headers. Non-GET methods need an explicit policy opt-in. One wall-clock deadline covers
+the full redirect chain.
+
+The process-wide policy is only the default. `with_web_fetch_policy` uses a task-local
+override, so one concurrent evaluation cannot relax another evaluation's network
+rules. Fetched text is wrapped in explicit untrusted-content delimiters before it is
+returned to the model. DuckDuckGo titles and snippets from `web_search` use the same
+delimiters.
+
+This policy blocks SSRF and accidental credential-header forwarding. It is not a
+general data-loss-prevention system. An owner-tier model can still put data in a
+public URL, and an operator can explicitly allow non-GET requests or sensitive
+headers. Untrusted handlers therefore do not receive `web_fetch` by default.
 
 ## 2.4 Subprocess environment scrubbing
 
@@ -289,11 +312,12 @@ OpenClaw model — is noted as future work; env scrubbing plus the tool policy i
 > spawns with `addenv`, which **merges onto the parent environment rather than
 > replacing it**, so an allowlist alone was a complete no-op and the worker still
 > returned the key — caught by the test, not by reading the code. Denied names must be
-> explicitly shadowed with `""` (`blank_denied`). A second, residual hole: `bash -l`
-> re-sources the user's profile, which can re-export the very variables scrubbed here;
-> `LLMTOOLS_SUBPROCESS_LOGIN_SHELL=0` drops `-l`, but the default keeps it for PATH
-> behavior, so a login shell is not guaranteed clean. Tests use a sentinel value so
-> they prove inheritance *from this process* was cut regardless of a developer profile.
+> explicitly shadowed with `""` (`blank_denied`). Login shells also re-source the
+> user's profile and can restore removed credentials, so subprocesses now use a
+> non-login shell by default. PowerShell also starts with `-NoProfile
+> -NonInteractive`. `LLMTOOLS_SUBPROCESS_LOGIN_SHELL=1` is an explicit compatibility
+> opt-in. This is defense in depth, not a sandbox: a child still has the current OS
+> user's filesystem access.
 
 ---
 
@@ -313,6 +337,10 @@ OpenClaw model — is noted as future work; env scrubbing plus the tool policy i
   trust value decodes to `:untrusted`, never `:owner`, so corruption can only restrict.
   The cost of that safety is that the exposure persists until you opt in, which is why
   §2.2 requires the startup warning naming the handlers still at risk.
+- `LLMTools` requires HTTP 2. Its pinned-address client path uses the HTTP 2 client
+  API. Telegram and Mattermost received HTTP 2 compatibility bounds after clean
+  precompile/load checks. MSTeams also needed removed body APIs replaced; its inbound
+  and outbound request paths now have direct HTTP 2 regression tests.
 
 ## Testing strategy
 

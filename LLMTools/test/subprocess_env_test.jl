@@ -92,9 +92,6 @@ end
             with_secrets() do
                 tools = Dict(t.name => t.func for t in LLMTools.create_terminal_tools(pwd()))
                 exec_command = tools["exec_command"]
-                # `bash -l` re-sources the user's profile, which on a developer
-                # machine may itself export a real key; the sentinel is what proves
-                # inheritance from *this* process was cut.
                 out = exec_command("echo \"KEY=[\$ANTHROPIC_API_KEY]\"; echo \"CLAW=[\$CLAW_AGENT_API_KEY]\"",
                     nothing, nothing, 4000, nothing, nothing)
                 @test !occursin(SENTINEL, out)
@@ -116,6 +113,8 @@ end
     @testset "the login-shell flag is honored" begin
         saved = get(ENV, "LLMTOOLS_SUBPROCESS_LOGIN_SHELL", nothing)
         try
+            Base.delete!(ENV, "LLMTOOLS_SUBPROCESS_LOGIN_SHELL")
+            @test !("-l" in LLMTools.subprocess_shell_command("bash", "echo hi").exec)
             ENV["LLMTOOLS_SUBPROCESS_LOGIN_SHELL"] = "1"
             @test "-l" in LLMTools.subprocess_shell_command("bash", "echo hi").exec
             ENV["LLMTOOLS_SUBPROCESS_LOGIN_SHELL"] = "0"

@@ -34,15 +34,16 @@ const BF_SHA256_DIGESTINFO = UInt8[
 struct BFRSAKey
     n::BigInt
     e::BigInt
+    endorsements::Set{String}
 end
 
 """
     BotFrameworkKeys
 
-Cached signing keys from the Bot Framework OpenID configuration. Refreshed on an
-unknown `kid` (Microsoft rotates keys without warning) but no more often than
-`min_refresh_interval_s`, so a flood of forged tokens with random `kid`s cannot turn
-into a fetch amplifier.
+Cached signing keys from the Bot Framework OpenID configuration. Refreshed after
+`max_cache_age_s` or on an unknown `kid` (Microsoft rotates keys without warning),
+but no more often than `min_refresh_interval_s`. The attempt limit also applies when
+the cache is empty, so a forged-token flood cannot amplify a metadata outage.
 """
 mutable struct BotFrameworkKeys
     openid_url::String
@@ -50,12 +51,21 @@ mutable struct BotFrameworkKeys
     fetched_at::Float64
     last_attempt_at::Float64
     min_refresh_interval_s::Float64
+    max_cache_age_s::Float64
     lock::ReentrantLock
 end
 
-BotFrameworkKeys(openid_url::AbstractString = BF_OPENID_CONFIG_URL; min_refresh_interval_s::Real = 60.0) =
+function BotFrameworkKeys(openid_url::AbstractString = BF_OPENID_CONFIG_URL;
+        min_refresh_interval_s::Real = 60.0,
+        max_cache_age_s::Real = 24 * 60 * 60,
+    )
+    (isfinite(min_refresh_interval_s) && min_refresh_interval_s >= 0) ||
+        throw(ArgumentError("min_refresh_interval_s must be finite and nonnegative"))
+    (isfinite(max_cache_age_s) && max_cache_age_s > 0) ||
+        throw(ArgumentError("max_cache_age_s must be finite and positive"))
     BotFrameworkKeys(String(openid_url), Dict{String, BFRSAKey}(), 0.0, 0.0,
-        Float64(min_refresh_interval_s), ReentrantLock())
+        Float64(min_refresh_interval_s), Float64(max_cache_age_s), ReentrantLock())
+end
 
 # ─── base64url ───
 
@@ -94,24 +104,39 @@ end
 # ─── Key set ───
 
 function _bf_fetch_keys(openid_url::AbstractString)
-    config = JSON.parse(String(HTTP.get(openid_url; readtimeout = 10, retry = false).body))
+    config = JSON.parse(String(HTTP.get(openid_url; request_timeout = 10, retry = false).body))
     jwks_uri = get(() -> nothing, config, "jwks_uri")
     jwks_uri === nothing && error("Bot Framework OpenID config has no jwks_uri")
-    jwks = JSON.parse(String(HTTP.get(String(jwks_uri); readtimeout = 10, retry = false).body))
+    jwks = JSON.parse(String(HTTP.get(String(jwks_uri); request_timeout = 10, retry = false).body))
     raw_keys = get(() -> nothing, jwks, "keys")
     raw_keys isa AbstractVector || error("Bot Framework JWKS has no key array")
     keys = Dict{String, BFRSAKey}()
     for k in raw_keys
         k isa AbstractDict || continue
-        String(get(() -> "", k, "kty")) == "RSA" || continue
+        get(() -> nothing, k, "kty") == "RSA" || continue
+        use = get(() -> nothing, k, "use")
+        (use === nothing || use == "sig") || continue
+        alg = get(() -> nothing, k, "alg")
+        (alg === nothing || alg == "RS256") || continue
         kid = get(() -> nothing, k, "kid")
         n = get(() -> nothing, k, "n")
         e = get(() -> nothing, k, "e")
-        (kid === nothing || n === nothing || e === nothing) && continue
-        keys[String(kid)] = BFRSAKey(
-            _bf_bytes_to_bigint(_bf_b64url_decode(String(n))),
-            _bf_bytes_to_bigint(_bf_b64url_decode(String(e))),
-        )
+        (kid isa AbstractString && n isa AbstractString && e isa AbstractString) || continue
+        endorsements_raw = get(() -> Any[], k, "endorsements")
+        endorsements_raw isa AbstractVector || continue
+        endorsements = Set{String}(
+            lowercase(String(v)) for v in endorsements_raw if v isa AbstractString)
+        key = try
+            BFRSAKey(
+                _bf_bytes_to_bigint(_bf_b64url_decode(n)),
+                _bf_bytes_to_bigint(_bf_b64url_decode(e)),
+                endorsements,
+            )
+        catch
+            continue
+        end
+        (key.n > 0 && key.e > 0) || continue
+        keys[String(kid)] = key
     end
     isempty(keys) && error("Bot Framework JWKS contained no usable RSA keys")
     return keys
@@ -127,11 +152,12 @@ so a transient network blip does not lock out every subsequent activity.
 function _bf_refresh_keys!(cache::BotFrameworkKeys; force::Bool = false)
     return lock(cache.lock) do
         now = time()
-        if !force && !isempty(cache.keys) && (now - cache.fetched_at) < cache.min_refresh_interval_s
+        fresh = !isempty(cache.keys) && (now - cache.fetched_at) < cache.max_cache_age_s
+        if !force && fresh
             return true
         end
-        if (now - cache.last_attempt_at) < cache.min_refresh_interval_s && !isempty(cache.keys)
-            return true
+        if (now - cache.last_attempt_at) < cache.min_refresh_interval_s
+            return !isempty(cache.keys)
         end
         cache.last_attempt_at = now
         try
@@ -146,6 +172,9 @@ function _bf_refresh_keys!(cache::BotFrameworkKeys; force::Bool = false)
 end
 
 function _bf_lookup_key(cache::BotFrameworkKeys, kid::AbstractString)
+    # This is a no-op while the cache is younger than 24 hours. It also performs
+    # the required periodic refresh before a still-present but revoked key is used.
+    _bf_refresh_keys!(cache)
     key = lock(cache.lock) do
         get(cache.keys, String(kid), nothing)
     end
@@ -188,28 +217,48 @@ end
 # ─── Token verification ───
 
 _bf_claim_string(claims, name) = let v = get(() -> nothing, claims, name)
-    v === nothing ? nothing : String(v)
+    v isa AbstractString ? String(v) : nothing
 end
 
 _bf_claim_number(claims, name) = let v = get(() -> nothing, claims, name)
-    v === nothing ? nothing : (v isa Number ? Float64(v) : tryparse(Float64, string(v)))
+    # `Bool <: Number` in Julia, but JSON booleans are not JWT NumericDate values.
+    value = if v isa Number && !(v isa Bool)
+        try
+            Float64(v)
+        catch
+            nothing
+        end
+    elseif v isa AbstractString
+        tryparse(Float64, v)
+    else
+        nothing
+    end
+    value !== nothing && isfinite(value) ? value : nothing
 end
 
 """
-    verify_bot_framework_token(cache, token; app_id, issuers, clock_skew_s)
+    verify_bot_framework_token(cache, token;
+        app_id, service_url, channel_id, issuers, clock_skew_s)
         -> (ok::Bool, reason::String)
 
 Full inbound check: RS256 only (an `alg` of `none` or `HS256` is the classic JWT
 forgery and is refused outright), signature against the published key for the
-token's `kid`, `iss` in `issuers`, `aud` equal to this bot's app id, and `exp`/`nbf`
-inside a small clock skew. Returns a reason so a rejection is diagnosable without
-logging the token.
+token's `kid`, `iss` in `issuers`, `aud` equal to this bot's app id, `exp`/`nbf`
+inside a small clock skew, the token's `serviceurl` claim equal to the Activity
+`serviceUrl`, and a signing-key endorsement for the Activity `channelId`. Returns a
+reason so a rejection is diagnosable without logging the token.
 """
 function verify_bot_framework_token(cache::BotFrameworkKeys, token::AbstractString;
         app_id::AbstractString,
+        service_url::AbstractString,
+        channel_id::AbstractString,
         issuers::AbstractVector{<:AbstractString} = BF_DEFAULT_ISSUERS,
         clock_skew_s::Real = 300.0,
     )
+    (isfinite(clock_skew_s) && clock_skew_s >= 0) ||
+        return (false, "clock skew must be finite and nonnegative")
+    isempty(service_url) && return (false, "activity has no serviceUrl")
+    isempty(channel_id) && return (false, "activity has no channelId")
     parts = split(String(token), '.')
     length(parts) == 3 || return (false, "malformed token (expected 3 dot-separated parts)")
     header = try
@@ -250,10 +299,22 @@ function verify_bot_framework_token(cache::BotFrameworkKeys, token::AbstractStri
 
     now = time()
     exp = _bf_claim_number(claims, "exp")
-    exp === nothing && return (false, "token has no exp claim")
+    exp === nothing && return (false, "token has no valid exp claim")
     exp + clock_skew_s < now && return (false, "token expired")
     nbf = _bf_claim_number(claims, "nbf")
-    (nbf !== nothing && nbf - clock_skew_s > now) && return (false, "token not valid yet")
+    nbf === nothing && return (false, "token has no valid nbf claim")
+    exp >= nbf || return (false, "token exp precedes nbf")
+    nbf - clock_skew_s > now && return (false, "token not valid yet")
+
+    # Bot Framework uses the historical lowercase claim name `serviceurl`, while
+    # the Activity JSON property is camel-case `serviceUrl`.
+    claimed_service_url = _bf_claim_string(claims, "serviceurl")
+    claimed_service_url == String(service_url) ||
+        return (false, "serviceurl claim does not match the activity serviceUrl")
+
+    normalized_channel_id = lowercase(String(channel_id))
+    normalized_channel_id in key.endorsements ||
+        return (false, "signing key has no endorsement for channel '$channel_id'")
 
     return (true, "ok")
 end
@@ -270,8 +331,20 @@ function _bf_authorize(req::HTTP.Request, source, cache::BotFrameworkKeys)
     isempty(raw) && return (false, "missing Authorization header")
     m = match(r"^\s*[Bb]earer\s+(\S+)\s*$", String(raw))
     m === nothing && return (false, "Authorization header is not a bearer token")
+    activity = try
+        JSON.parse(String(req.body))
+    catch
+        return (false, "activity body is not valid JSON")
+    end
+    activity isa AbstractDict || return (false, "activity body is not an object")
+    service_url = _bf_claim_string(activity, "serviceUrl")
+    service_url === nothing && return (false, "activity has no valid serviceUrl")
+    channel_id = _bf_claim_string(activity, "channelId")
+    channel_id === nothing && return (false, "activity has no valid channelId")
     return verify_bot_framework_token(cache, String(m.captures[1]);
         app_id = strip(source.app_id),
+        service_url,
+        channel_id,
         issuers = source.issuers,
         clock_skew_s = source.clock_skew_s)
 end

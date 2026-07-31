@@ -80,9 +80,8 @@ it an allowlist alone changes nothing. Shadowing each denied name with `""` is t
 only way to blank it out without an upstream change. `setenv`-based spawns
 (`PtySessions`, the codex `Cmd`) replace the environment outright and do not need it.
 
-Caveat worth knowing: a *login* shell (`bash -l`) re-sources the user's profile,
-which can re-export the very variables scrubbed here. Set
-`LLMTOOLS_SUBPROCESS_LOGIN_SHELL=0` to drop `-l` if your profile exports secrets.
+Caveat: this is environment scrubbing, not a filesystem sandbox. A child can still
+read files available to the current OS user, including files below `HOME`.
 """
 function subprocess_env(; extra_allow = String[], overrides = Dict{String, String}(),
         blank_denied::Bool = false)
@@ -109,13 +108,18 @@ end
 """
     subprocess_shell_command(shell, cmd) -> Cmd
 
-Build the shell invocation for a model-supplied command string. Login shells
-(`-l`) are the historical default because they give the command the user's normal
-PATH; `LLMTOOLS_SUBPROCESS_LOGIN_SHELL=0` turns that off for deployments whose
-profile re-exports credentials that §2.4 is trying to withhold.
+Build the shell invocation for a model-supplied command string. Non-login shells are
+the secure default: the allowlisted environment already carries `PATH`, while a
+login shell can re-source a profile and restore credentials that were removed.
+PowerShell uses `-NoProfile -NonInteractive` for the same reason.
+`LLMTOOLS_SUBPROCESS_LOGIN_SHELL=1` is an explicit compatibility opt-in.
 """
 function subprocess_shell_command(shell::AbstractString, cmd::AbstractString)
-    Sys.iswindows() && return Cmd([String(shell), "-Command", String(cmd)])
-    login = get(ENV, "LLMTOOLS_SUBPROCESS_LOGIN_SHELL", "1") != "0"
+    login = get(ENV, "LLMTOOLS_SUBPROCESS_LOGIN_SHELL", "0") == "1"
+    if Sys.iswindows()
+        return login ?
+            Cmd([String(shell), "-Command", String(cmd)]) :
+            Cmd([String(shell), "-NoProfile", "-NonInteractive", "-Command", String(cmd)])
+    end
     return login ? Cmd([String(shell), "-l", "-c", String(cmd)]) : Cmd([String(shell), "-c", String(cmd)])
 end

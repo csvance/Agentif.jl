@@ -277,12 +277,25 @@ Base.@kwdef mutable struct TelegramEventSource <: Claw.EventSource
     host::String = get(ENV, "TELEGRAM_WEBHOOK_HOST", "127.0.0.1")
     port::Int = 8080
     path::String = "/webhook"
-    secret_token::Union{String, Nothing} = nothing
+    secret_token::Union{String, Nothing} = let
+        token = strip(get(ENV, "TELEGRAM_WEBHOOK_SECRET_TOKEN", ""))
+        isempty(token) ? nothing : token
+    end
     # Runtime state (set during start!)
     client::Union{Nothing, Telegram.Client} = nothing
 end
 
 Claw.get_event_types(::TelegramEventSource) = Claw.EventType[MESSAGE_EVENT_TYPE, REACTION_EVENT_TYPE]
+
+function Claw.validate_source(source::TelegramEventSource)
+    if !source.use_polling
+        token = source.secret_token
+        (token isa String && !isempty(strip(token))) || error(
+            "Telegram webhook mode requires a secret token. Set " *
+            "TELEGRAM_WEBHOOK_SECRET_TOKEN or pass secret_token explicitly.")
+    end
+    return nothing
+end
 
 function Claw.get_event_handlers(::TelegramEventSource)
     Claw.EventHandler[
@@ -446,6 +459,7 @@ end
 # ─── start! ───
 
 function Claw.start!(source::TelegramEventSource, assistant::Claw.AgentAssistant)
+    Claw.validate_source(source)
     errormonitor(Threads.@spawn begin
         Telegram.with_telegram(ENV["TELEGRAM_BOT_TOKEN"]) do
             me = Telegram.get_me()

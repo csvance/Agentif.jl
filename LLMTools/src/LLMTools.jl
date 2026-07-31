@@ -6,6 +6,7 @@ using Agentif: UserMessage, AssistantMessage, ToolResultMessage, ToolCallContent
 using Agentif: message_text, evaluate
 using Base64, Dates, HTTP, JSON, Logging, PtySessions, UUIDs
 using ConcurrentUtilities: Workers, Worker, remote_eval, remote_fetch
+using ScopedValues: ScopedValue, @with
 
 # Shared session management infrastructure
 include("session_utils.jl")

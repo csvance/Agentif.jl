@@ -156,6 +156,9 @@ unchanged; restriction is a one-field opt-in. Because that default persists, `in
 logs a single startup warning naming every owner-tier handler that is fed by
 third-party content — see [`trust_exposure_report`](@ref).
 
+Read access can still disclose data into the response channel. For a
+confidentiality boundary, also pass an explicit `tools` subset.
+
 `tools` optionally narrows the handler to a named subset (`nothing` = the default
 set). Trust filtering applies on top: naming a denied tool does not grant it to an
 `:untrusted` handler.
@@ -195,9 +198,6 @@ Base.@kwdef struct AgentConfig
     base_dir::String = pwd()
     enable_web::Bool = false
     enable_coding::Bool = false
-    # Owner identity (§2.2). Empty by default; the REPL is always owner regardless.
-    owner_channels::Vector{String} = String[]
-    owner_user_ids::Vector{String} = String[]
 end
 
 # ─── Watcher (dual-model supervised evaluation) ───
@@ -507,21 +507,24 @@ _encode_handler_tools(tools::Vector{String}) = JSON.json(tools)
 
 function _decode_handler_tools(raw)
     (raw === nothing || raw === missing) && return nothing
+    raw isa AbstractString || return String[]
     s = String(raw)
-    isempty(strip(s)) && return nothing
+    isempty(strip(s)) && return String[]
     parsed = try
         JSON.parse(s)
     catch
-        return nothing
+        return String[]
     end
-    parsed isa AbstractVector || return nothing
+    parsed isa AbstractVector || return String[]
+    all(x -> x isa AbstractString, parsed) || return String[]
     return String[String(x) for x in parsed]
 end
 
 function _decode_handler_trust(raw)
     (raw === nothing || raw === missing) && return :owner
+    raw isa AbstractString || return :untrusted
     s = strip(lowercase(String(raw)))
-    isempty(s) && return :owner
+    isempty(s) && return :untrusted
     sym = Symbol(s)
     # An unrecognized tier is treated as the restrictive one: a corrupted or
     # hand-edited value must not silently upgrade a handler to full trust.
@@ -1205,7 +1208,7 @@ const DB_TOOLS = Agentif.AgentTool[DB_STORE_TOOL, DB_SEARCH_TOOL, DB_LIST_KEYS_T
 
 include("llmtools.jl")
 
-# Per-handler tool policy, owner identity, startup exposure report (§2.2).
+# Per-handler tool policy and startup exposure report (§2.2).
 include("trust.jl")
 
 # ─── Evaluate ───
@@ -1436,8 +1439,6 @@ function AgentAssistant(db_path::String="";
     base_dir::String=pwd(),
     enable_web::Bool=false,
     enable_coding::Bool=false,
-    owner_channels::Vector{String}=String[],
-    owner_user_ids::Vector{String}=String[],
     level::Union{Nothing, LogLevel, Int, Symbol, AbstractString}=nothing,
     watcher::Union{Nothing, WatcherConfig}=nothing,
     pipeline::PipelineConfig=PipelineConfig(),
@@ -1450,8 +1451,7 @@ function AgentAssistant(db_path::String="";
     session_store = Agentif.SQLiteSessionStore(db, search_store)
     tempus_store = Tempus.SQLiteStore(db)
     scheduler = Tempus.Scheduler(tempus_store)
-    config = AgentConfig(; name, provider, model_id, apikey, timezone, base_dir, enable_web, enable_coding,
-        owner_channels, owner_user_ids)
+    config = AgentConfig(; name, provider, model_id, apikey, timezone, base_dir, enable_web, enable_coding)
     log_level = Agentif.resolve_log_level(level)
     return _new_agent_assistant(;
         config,

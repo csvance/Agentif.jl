@@ -404,7 +404,7 @@ end
 end
 
 @testset "discover_models!" begin
-    server = HTTP.serve!(ip"127.0.0.1", 0) do req
+    server = HTTP.serve!("127.0.0.1", 0) do req
         if req.target == "/v1/models"
             return HTTP.Response(
                 200,
@@ -427,8 +427,7 @@ end
     end
 
     try
-        sock = getsockname(server.listener.server)
-        port = sock[2]
+        port = HTTP.port(server)
 
         provider_ok = "discover-ok-$(rand(1:10^9))"
         models = LLMProviders.discover_models!("http://127.0.0.1:$port"; provider = provider_ok)
