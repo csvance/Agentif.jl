@@ -24,7 +24,7 @@ PtySessions = {url = "https://github.com/quinnj/PtySessions.jl.git"}
 [compat]
 Agentif = "1"
 ConcurrentUtilities = "2"
-HTTP = "1"
+HTTP = "1, 2"
 JSON = "1.3"
 Logging = "1"
 LoggingExtras = "1"

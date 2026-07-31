@@ -216,7 +216,63 @@ function _activity_to_events(activity::AbstractDict, client::MSTeams.BotClient)
     return events
 end
 
+Claw.event_source_tag(::MSTeamsMessageEvent) = "msteams"
+Claw.event_source_tag(::MSTeamsReactionEvent) = "msteams"
+function _msteams_event_extra(ch::MSTeamsChannel)
+    return Dict{String, Any}(
+        "activity" => ch.activity,
+        "user_id" => ch.user_id,
+        "user_name" => ch.user_name,
+        "message_id" => ch.message_id,
+    )
+end
+function Claw.event_extra(ev::MSTeamsMessageEvent)
+    extra = _msteams_event_extra(ev.channel)
+    extra["direct_ping"] = ev.direct_ping
+    return extra
+end
+function Claw.event_extra(ev::MSTeamsReactionEvent)
+    extra = _msteams_event_extra(ev.channel)
+    extra["reaction"] = ev.reaction
+    extra["action"] = ev.action
+    return extra
+end
+
+_extra_string(extra, key) = let value = get(() -> "", extra, key)
+    value isa AbstractString ? String(value) : ""
+end
+
+function _rehydrate_msteams_event(client::MSTeams.BotClient, row)
+    activity = get(() -> nothing, row.extra, "activity")
+    activity isa AbstractDict || return nothing
+    ch = _activity_channel(
+        activity,
+        client,
+        _extra_string(row.extra, "user_id"),
+        _extra_string(row.extra, "user_name"),
+        _extra_string(row.extra, "message_id"),
+    )
+    Agentif.channel_id(ch) == row.channel_id || return nothing
+    return Claw.ReplayedChannelEvent(row.name, row.content, ch)
+end
+
+# Bot Framework activity ids are unique per delivery.
+function _msteams_dedup_key(activity::AbstractDict, event)
+    id = _string_or_empty(get(() -> "", activity, "id"))
+    isempty(id) && return nothing
+    if event isa MSTeamsReactionEvent
+        return "msteams:$(id):reaction:$(event.action):$(event.reaction)"
+    end
+    return "msteams:$(id):message"
+end
+
 # ─── start! ───
+
+function Claw.validate_source(source::MSTeamsEventSource)
+    isempty(strip(source.app_id)) && error("ClawMSTeamsExt: missing MSTEAMS_APP_ID")
+    isempty(strip(source.app_password)) && error("ClawMSTeamsExt: missing MSTEAMS_APP_PASSWORD")
+    return nothing
+end
 
 function Claw.start!(source::MSTeamsEventSource, assistant::Claw.AgentAssistant)
     app_id = strip(source.app_id)
@@ -226,6 +282,10 @@ function Claw.start!(source::MSTeamsEventSource, assistant::Claw.AgentAssistant)
 
     errormonitor(Threads.@spawn begin
         client = MSTeams.BotClient(; app_id=app_id, app_password=app_password)
+        Claw.register_rehydrator!(
+            "msteams",
+            row -> _rehydrate_msteams_event(client, row),
+        )
         @info "ClawMSTeamsExt: Starting webhook server" host=source.host port=source.port path=source.path
         MSTeams.run_server(; host=source.host, port=source.port, client=client, path=source.path, health_path=source.health_path) do activity
             for event in _activity_to_events(activity, client)
@@ -236,7 +296,7 @@ function Claw.start!(source::MSTeamsEventSource, assistant::Claw.AgentAssistant)
                     ch = event.channel
                     @info "ClawMSTeamsExt: reaction" conversation_id=ch.conversation_id user_id=ch.user_id reaction=event.reaction action=event.action
                 end
-                put!(assistant.event_queue, event)
+                Claw.submit_event!(assistant, event; dedup_key = _msteams_dedup_key(activity, event))
             end
             return nothing
         end

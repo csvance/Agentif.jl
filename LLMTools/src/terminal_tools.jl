@@ -11,7 +11,13 @@ mutable struct PtySessionMetadata
     workdir::String
     status::String
     last_exit_code::Union{Nothing, Int}
+    auto_cleanup::Bool
 end
+
+PtySessionMetadata(session, created_at, last_used, command, workdir, status, last_exit_code) =
+    PtySessionMetadata(session, created_at, last_used, command, workdir, status, last_exit_code, true)
+
+automatic_cleanup(meta::PtySessionMetadata) = meta.auto_cleanup
 
 # SessionRegistry interface implementation
 function resolve_status(meta::PtySessionMetadata)

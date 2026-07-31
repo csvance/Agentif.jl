@@ -289,6 +289,66 @@ function Claw.get_event_handlers(::TelegramEventSource)
     ]
 end
 
+Claw.event_source_tag(::TelegramMessageEvent) = "telegram"
+Claw.event_source_tag(::TelegramReactionEvent) = "telegram"
+function _telegram_event_extra(ch::TelegramChannel)
+    return Dict{String, Any}(
+        "message_id" => ch.message_id,
+        "user_id" => ch.user_id,
+        "user_name" => ch.user_name,
+        "chat_type" => ch.chat_type,
+    )
+end
+function Claw.event_extra(ev::TelegramMessageEvent)
+    extra = _telegram_event_extra(ev.channel)
+    extra["direct_ping"] = ev.direct_ping
+    return extra
+end
+function Claw.event_extra(ev::TelegramReactionEvent)
+    extra = _telegram_event_extra(ev.channel)
+    extra["emoji"] = ev.emoji
+    return extra
+end
+
+# "telegram:<chat_id>" round-trips, so a replayed event rebuilds its channel from
+# the live client (group chat ids are negative — the sign must be accepted).
+function _rehydrate_telegram_event(source::TelegramEventSource, row)
+    row.channel_id === nothing && return Claw.ReplayedEvent(row.name, row.content)
+    client = source.client
+    client === nothing && return nothing
+    m = match(r"^telegram:(-?\d+)$", row.channel_id)
+    m === nothing && return nothing
+    raw_message_id = get(() -> nothing, row.extra, "message_id")
+    message_id = raw_message_id isa Integer ? Int64(raw_message_id) : nothing
+    user_id = let value = get(() -> "", row.extra, "user_id")
+        value isa AbstractString ? String(value) : ""
+    end
+    user_name = let value = get(() -> "", row.extra, "user_name")
+        value isa AbstractString ? String(value) : ""
+    end
+    chat_type = let value = get(() -> "private", row.extra, "chat_type")
+        value isa AbstractString ? String(value) : "private"
+    end
+    ch = TelegramChannel(
+        parse(Int64, m.captures[1]),
+        message_id,
+        client,
+        IOBuffer(),
+        user_id,
+        user_name,
+        chat_type,
+    )
+    return Claw.ReplayedChannelEvent(row.name, row.content, ch)
+end
+
+function _register_telegram_rehydrator!(source::TelegramEventSource)
+    Claw.register_rehydrator!(
+        "telegram",
+        row -> _rehydrate_telegram_event(source, row),
+    )
+    return nothing
+end
+
 # ─── Update handling ───
 
 function _handle_message(update, bot_user_id, bot_username, assistant)
@@ -325,7 +385,10 @@ function _handle_message(update, bot_user_id, bot_username, assistant)
     @info "ClawTelegramExt: message" chat_id message_id direct_ping
 
     ch = TelegramChannel(chat_id, message_id, Telegram._get_client(), IOBuffer(), user_id, user_name, chat_type)
-    put!(assistant.event_queue, TelegramMessageEvent(ch, text, direct_ping))
+    # Telegram redelivers an update until it is confirmed; `update_id` is the
+    # delivery id, so a redelivery collides on the UNIQUE dedup_key.
+    Claw.submit_event!(assistant, TelegramMessageEvent(ch, text, direct_ping);
+        dedup_key = "telegram:update:$(update.update_id):message")
 end
 
 function _handle_reaction(update, bot_user_id, assistant)
@@ -363,7 +426,8 @@ function _handle_reaction(update, bot_user_id, assistant)
     @info "ClawTelegramExt: reaction" emoji chat_id message_id user_id
 
     ch = TelegramChannel(chat_id, message_id, Telegram._get_client(), IOBuffer(), user_id, user_name, chat_type)
-    put!(assistant.event_queue, TelegramReactionEvent(ch, emoji, user_name, message_id))
+    Claw.submit_event!(assistant, TelegramReactionEvent(ch, emoji, user_name, message_id);
+        dedup_key = "telegram:update:$(update.update_id):reaction")
 end
 
 function _handle_update(update, bot_user_id::String, bot_username::String, assistant::Claw.AgentAssistant)
@@ -384,6 +448,7 @@ function Claw.start!(source::TelegramEventSource, assistant::Claw.AgentAssistant
 
             # Store client for on-demand channel construction
             source.client = Telegram._get_client()
+            _register_telegram_rehydrator!(source)
 
             # Seed channels from persisted handler/job channel_ids so that
             # non-ChannelEvents (e.g. JMAP email) can route to Telegram

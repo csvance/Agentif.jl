@@ -2,5 +2,6 @@ using Test
 
 include("smoke_test.jl")
 include("db_tools_test.jl")
+include("pipeline_test.jl")
 include("extensions_test.jl")
 include("watcher_test.jl")

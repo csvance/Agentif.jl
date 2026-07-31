@@ -158,7 +158,7 @@ function start_summary_server(; summary_text::String = "SUMMARY", status::Int = 
         )
         return HTTP.Response(200, ["Content-Type" => "text/event-stream"], summary_sse_body(summary_text))
     end
-    port = HTTP.Sockets.getsockname(server.listener.server)[2]
+    port = test_server_port(server)
     return server, port
 end
 
@@ -613,15 +613,19 @@ end
     user_msgs = [Agentif.message_text(m) for m in state.messages if m isa UserMessage]
     @test user_msgs == ["hello sqlite world", "second sqlite row"]
 
-    row_iter = SQLite.DBInterface.execute(db, "SELECT entry, user_id, channel_id FROM session_entries WHERE entry_id = ?", ("entry-1",))
-    row = iterate(row_iter)
-    @test row !== nothing
-    parsed = JSON.parse(row[1].entry, SessionEntry)
+    rows = SQLite.rowtable(SQLite.DBInterface.execute(
+        db,
+        "SELECT entry, user_id, channel_id FROM session_entries WHERE entry_id = ?",
+        ("entry-1",),
+    ))
+    @test length(rows) == 1
+    row = only(rows)
+    parsed = JSON.parse(row.entry, SessionEntry)
     @test parsed.id == "entry-1"
     @test parsed.user_id == "U100"
     @test parsed.channel_id == "chan:alpha"
-    @test row[1].user_id == "U100"
-    @test row[1].channel_id == "chan:alpha"
+    @test row.user_id == "U100"
+    @test row.channel_id == "chan:alpha"
 
     results = LocalSearch.search(search_store, "hello sqlite world"; limit = 5)
     matches = filter(r -> startswith(r.id, "session:entry:entry-1"), results)
@@ -639,6 +643,32 @@ end
     # entry has no channel_flags → tagged as public
     @test "session:public" in tags
     @test "session:ch:chan:alpha" in tags
+end
+
+@testset "AgentifSQLiteExt schema checks release read snapshots" begin
+    path = joinpath(mktempdir(), "session.sqlite")
+    initial = SQLite.DB(path)
+    Agentif.init_sqlite_session_schema!(initial)
+    close(initial)
+
+    # On an existing schema, `_ensure_column!` finds `post_id` before the end of
+    # PRAGMA table_info. It must still close that cursor so this connection can
+    # observe commits made through another WAL connection.
+    reader = SQLite.DB(path)
+    Agentif.init_sqlite_session_schema!(reader)
+    writer = SQLite.DB(path)
+    SQLite.execute(writer,
+        "INSERT INTO session_branches (branch_id, leaf_entry_id) VALUES ('probe', 'fresh')")
+    leaves = String[
+        String(row.leaf_entry_id)
+        for row in SQLite.DBInterface.execute(
+            reader,
+            "SELECT leaf_entry_id FROM session_branches WHERE branch_id = 'probe'",
+        )
+    ]
+    @test leaves == ["fresh"]
+    close(writer)
+    close(reader)
 end
 
 @testset "AgentifSQLiteExt schema columns" begin
@@ -1575,8 +1605,12 @@ end
     @test scrubbed.parent_id == "s1"
     @test get_entry(store, "s3").parent_id == "s2"
     # Stored JSON no longer carries the message text at all.
-    row = iterate(SQLite.DBInterface.execute(store.db, "SELECT entry FROM session_entries WHERE entry_id = ?", ("s2",)))
-    @test !occursin("bravo", String(row[1].entry))
+    rows = SQLite.rowtable(SQLite.DBInterface.execute(
+        store.db,
+        "SELECT entry FROM session_entries WHERE entry_id = ?",
+        ("s2",),
+    ))
+    @test !occursin("bravo", String(only(rows).entry))
     # Search doc removed.
     results = LocalSearch.search(store.search_store, "secret bravo"; limit = 10)
     @test !any(r -> r.id == "session:entry:s2", results)
@@ -2474,7 +2508,7 @@ end
     end
 
     try
-        port = HTTP.Sockets.getsockname(server.listener.server)[2]
+        port = test_server_port(server)
         base_url = "http://127.0.0.1:$port"
         # Sampling controls come from model.kw; the newest-model guard strips all three.
         model = anthropic_test_model(
@@ -2655,7 +2689,7 @@ end
     end
 
     try
-        port = HTTP.Sockets.getsockname(server.listener.server)[2]
+        port = test_server_port(server)
         model = anthropic_test_model(baseUrl = "http://127.0.0.1:$port")
         agent = Agent(id = "anthropic-thinking-test", prompt = "You are helpful.", model = model, apikey = "test-key", tools = AgentTool[])
 
@@ -2707,7 +2741,7 @@ end
     end
 
     try
-        port = HTTP.Sockets.getsockname(server.listener.server)[2]
+        port = test_server_port(server)
         model = anthropic_test_model(baseUrl = "http://127.0.0.1:$port")
         agent = Agent(id = "anthropic-pause-test", prompt = "You are helpful.", model = model, apikey = "test-key", tools = AgentTool[])
 
@@ -2790,7 +2824,7 @@ end
     end
 
     try
-        port = HTTP.Sockets.getsockname(server.listener.server)[2]
+        port = test_server_port(server)
         model = anthropic_test_model(baseUrl = "http://127.0.0.1:$port")
         agent = Agent(
             id = "anthropic-server-pause-test",
@@ -2868,7 +2902,7 @@ end
     end
 
     try
-        port = HTTP.Sockets.getsockname(server.listener.server)[2]
+        port = test_server_port(server)
         model = anthropic_test_model(baseUrl = "http://127.0.0.1:$port")
         agent = Agent(
             id = "anthropic-nonstream-pause-test",
@@ -2909,7 +2943,7 @@ end
     end
 
     try
-        port = HTTP.Sockets.getsockname(server.listener.server)[2]
+        port = test_server_port(server)
         model = anthropic_test_model(baseUrl = "http://127.0.0.1:$port")
         agent = Agent(id = "anthropic-pause-bound-test", prompt = "You are helpful.", model = model, apikey = "test-key", tools = AgentTool[])
 

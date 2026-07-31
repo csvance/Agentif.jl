@@ -2,6 +2,8 @@ module Claw
 
 using Agentif
 using Dates
+using HTTP
+using JSON
 using LLMTools
 using LocalSearch
 using Logging
@@ -45,6 +47,17 @@ end
 
 const AGENT_DATA_WRITE_LOCK = ReentrantLock()
 
+"""
+    _exec!(db, sql, params = ())
+
+Run a write and *reset the statement*. `SQLite.DBInterface.execute` returns a lazy
+cursor; for a write, the statement stays in progress — holding its lock and leaving
+the change uncommitted — until something else runs on that connection or the cursor
+is finalized by GC. That is invisible while everything shares one handle, and turns
+into lost/stale writes the moment a second connection exists (§1.7).
+"""
+_exec!(db::SQLite.DB, sql::AbstractString, params = ()) = (SQLite.execute(db, sql, params); nothing)
+
 function _resolve_timezone(name::String)
     try
         return TimeZone(name)
@@ -57,23 +70,51 @@ function _zdt_to_unix(zdt::ZonedDateTime)
     return datetime2unix(DateTime(astimezone(zdt, tz"UTC")))
 end
 
+"""
+    _fetch_one(db, sql, params) -> row or nothing
+
+Fetch the first row of a query and **close the cursor**.
+
+`SQLite.DBInterface.execute` returns a lazy cursor; taking only its first row with
+`iterate` leaves the statement mid-step, which under WAL pins that connection to the
+read snapshot it started with. The connection then stops seeing other connections'
+commits — verified directly: a partially-consumed SELECT made a second connection's
+committed INSERT permanently invisible to the first. (The same lazy-cursor mechanic in
+a row-returning `PRAGMA` is what left `journal_mode=WAL` holding its lock and made
+every second connection fail with "database is locked".)
+"""
+function _fetch_one(db::SQLite.DB, sql::AbstractString, params = ())
+    cursor = SQLite.DBInterface.execute(db, sql, params)
+    try
+        state = iterate(cursor)
+        # A row is a lazy view over the live statement, so its columns must be
+        # copied out before the cursor closes — reading them afterwards yields
+        # `missing`.
+        if state === nothing
+            return nothing
+        end
+        row = state[1]
+        names = Tuple(propertynames(row))
+        return NamedTuple{names}(map(n -> getproperty(row, n), names))
+    finally
+        SQLite.DBInterface.close!(cursor)
+    end
+end
+
 function _get_agent_metadata(db::SQLite.DB, key::String)
-    row = iterate(SQLite.DBInterface.execute(db,
-        "SELECT value FROM claw_agent_metadata WHERE key = ?", (key,)))
+    row = _fetch_one(db, "SELECT value FROM claw_agent_metadata WHERE key = ?", (key,))
     row === nothing && return nothing
-    return String(row[1].value)
+    return String(row.value)
 end
 
 function _set_agent_metadata!(db::SQLite.DB, key::String, value::String)
-    SQLite.DBInterface.execute(db,
-        "INSERT OR REPLACE INTO claw_agent_metadata (key, value, updated_at) VALUES (?, ?, ?)",
+    _exec!(db, "INSERT OR REPLACE INTO claw_agent_metadata (key, value, updated_at) VALUES (?, ?, ?)",
         (key, value, time()))
     return
 end
 
 function _ensure_agent_metadata_defaults!(db::SQLite.DB)
-    SQLite.DBInterface.execute(db,
-        "INSERT OR IGNORE INTO claw_agent_metadata (key, value, updated_at) VALUES (?, ?, ?)",
+    _exec!(db, "INSERT OR IGNORE INTO claw_agent_metadata (key, value, updated_at) VALUES (?, ?, ?)",
         (AGENT_SYSTEM_PROMPT_KEY, SOUL_TEMPLATE, time()))
     return
 end
@@ -114,55 +155,164 @@ end
 
 include("watcher.jl")
 
+# SQLite ownership discipline + pipeline runtime structures (§1.7).
+include("dbwriter.jl")
+
 struct AgentAssistant
     config::AgentConfig
     db::SQLite.DB
+    db_path::String
     _channels::Dict{String, Agentif.AbstractChannel}  # runtime-only registry
-    event_queue::Base.Channel{Event}
+    # The in-memory queue carries persisted event rowids as wakeups only (§1.1);
+    # the events themselves live in `claw_events`.
+    event_queue::Base.Channel{Int}
     session_store::Agentif.SessionStore
     tools::Vector{Agentif.AgentTool}
     scheduler::Tempus.Scheduler
     log_level::Union{Nothing, LogLevel}
     watcher::Union{Nothing, WatcherConfig}
+    pipeline::PipelineConfig
+    _writer::SQLiteWriter
+    _readers::ReaderPool
+    # Live event objects for the hot path: a freshly-arrived event still holds its
+    # streaming channel, which cannot survive serialization. Replay falls back to
+    # `rehydrate_event`.
+    _live_events::Dict{Int, Event}
+    _live_lock::ReentrantLock
+    _lanes::Dict{String, Lane}
+    _lanes_lock::ReentrantLock
+    _inflight::Dict{Int, Agentif.Abort}
+    _inflight_lock::ReentrantLock
+    _pending_wakeups::Set{Int}
+    _wakeup_lock::ReentrantLock
+    _sem::Base.Semaphore
+    _sources::Vector{SupervisedSource}
+    _tasks::Vector{Task}
+    _state::Base.RefValue{Symbol}   # :new | :running | :stopping | :stopped
+    _shutdown_lock::ReentrantLock
+    _shutdown_complete::Threads.Event
+    _scheduler_started::Base.RefValue{Bool}
+    _signal_handler_installed::Base.RefValue{Bool}
 end
 
-# Preserve the pre-watcher positional constructor. WatcherConfig remains an
-# opt-in keyword on the public AgentAssistant constructor below.
+function _new_agent_assistant(;
+        config,
+        db,
+        db_path = "",
+        _channels = Dict{String, Agentif.AbstractChannel}(),
+        event_queue = Base.Channel{Int}(Inf),
+        session_store,
+        tools = Agentif.AgentTool[],
+        scheduler,
+        log_level = nothing,
+        watcher = nothing,
+        pipeline = PipelineConfig(),
+        _writer,
+        _readers,
+        _live_events = Dict{Int, Event}(),
+        _live_lock = ReentrantLock(),
+        _lanes = Dict{String, Lane}(),
+        _lanes_lock = ReentrantLock(),
+        _inflight = Dict{Int, Agentif.Abort}(),
+        _inflight_lock = ReentrantLock(),
+        _pending_wakeups = Set{Int}(),
+        _wakeup_lock = ReentrantLock(),
+        _sem = Base.Semaphore(4),
+        _sources = SupervisedSource[],
+        _tasks = Task[],
+        _state = Ref(:new),
+        _shutdown_lock = ReentrantLock(),
+        _shutdown_complete = Threads.Event(),
+        _scheduler_started = Ref(false),
+        _signal_handler_installed = Ref(false),
+    )
+    return AgentAssistant(
+        config,
+        db,
+        db_path,
+        _channels,
+        event_queue,
+        session_store,
+        tools,
+        scheduler,
+        log_level,
+        watcher,
+        pipeline,
+        _writer,
+        _readers,
+        _live_events,
+        _live_lock,
+        _lanes,
+        _lanes_lock,
+        _inflight,
+        _inflight_lock,
+        _pending_wakeups,
+        _wakeup_lock,
+        _sem,
+        _sources,
+        _tasks,
+        _state,
+        _shutdown_lock,
+        _shutdown_complete,
+        _scheduler_started,
+        _signal_handler_installed,
+    )
+end
+
+# Preserve the pre-watcher positional constructor. The durable pipeline needs
+# additional runtime state, which is initialized with safe shared-DB defaults.
 function AgentAssistant(
         config::AgentConfig,
         db::SQLite.DB,
         channels::Dict{String, Agentif.AbstractChannel},
-        event_queue::Base.Channel{Event},
+        event_queue::Base.Channel,
         session_store::Agentif.SessionStore,
         tools::Vector{Agentif.AgentTool},
         scheduler::Tempus.Scheduler,
         log_level::Union{Nothing, LogLevel},
     )
-    return AgentAssistant(
-        config, db, channels, event_queue, session_store, tools, scheduler,
-        log_level, nothing)
+    pipeline = PipelineConfig()
+    wakeups = event_queue isa Base.Channel{Int} ? event_queue : Base.Channel{Int}(Inf)
+    return _new_agent_assistant(;
+        config,
+        db,
+        _channels = channels,
+        event_queue = wakeups,
+        session_store,
+        tools,
+        scheduler,
+        log_level,
+        pipeline,
+        _writer = SQLiteWriter("", db),
+        _readers = ReaderPool("", db),
+        _sem = Base.Semaphore(pipeline.max_concurrent_evals),
+    )
 end
 
 # ─── SQLite schema ───
 
 function _init_claw_schema!(db::SQLite.DB)
-    SQLite.DBInterface.execute(db, "PRAGMA journal_mode=WAL")
-    SQLite.DBInterface.execute(db, "PRAGMA synchronous=NORMAL")
-    SQLite.DBInterface.execute(db, "PRAGMA busy_timeout=5000")
+    # Pragmas go through `SQLite.execute` (step + reset). `DBInterface.execute`
+    # hands back a lazy cursor, and an unconsumed `PRAGMA journal_mode=WAL` cursor
+    # keeps holding its exclusive lock, which blocks every other connection to the
+    # file — including the dedicated writer connection (§1.7).
+    SQLite.execute(db, "PRAGMA busy_timeout=5000")
+    SQLite.execute(db, "PRAGMA journal_mode=WAL")
+    SQLite.execute(db, "PRAGMA synchronous=NORMAL")
 
     # Drop legacy table before enabling foreign keys to avoid lock errors
-    SQLite.DBInterface.execute(db, "DROP TABLE IF EXISTS claw_channels")
+    SQLite.execute(db, "DROP TABLE IF EXISTS claw_channels")
 
-    SQLite.DBInterface.execute(db, "PRAGMA foreign_keys=ON")
+    SQLite.execute(db, "PRAGMA foreign_keys=ON")
 
-    SQLite.DBInterface.execute(db, """
+    _exec!(db, """
         CREATE TABLE IF NOT EXISTS claw_event_types (
             name TEXT PRIMARY KEY,
             description TEXT NOT NULL DEFAULT ''
         )
     """)
 
-    SQLite.DBInterface.execute(db, """
+    _exec!(db, """
         CREATE TABLE IF NOT EXISTS claw_event_handlers (
             id TEXT PRIMARY KEY,
             prompt TEXT NOT NULL DEFAULT '',
@@ -170,7 +320,7 @@ function _init_claw_schema!(db::SQLite.DB)
         )
     """)
 
-    SQLite.DBInterface.execute(db, """
+    _exec!(db, """
         CREATE TABLE IF NOT EXISTS claw_handler_event_types (
             handler_id TEXT NOT NULL,
             event_type_name TEXT NOT NULL,
@@ -178,7 +328,7 @@ function _init_claw_schema!(db::SQLite.DB)
         )
     """)
 
-    SQLite.DBInterface.execute(db, """
+    _exec!(db, """
         CREATE TABLE IF NOT EXISTS claw_agent_data (
             key TEXT PRIMARY KEY,
             value TEXT NOT NULL,
@@ -191,16 +341,16 @@ function _init_claw_schema!(db::SQLite.DB)
         )
     """)
 
-    SQLite.DBInterface.execute(db, """
+    _exec!(db, """
         CREATE TABLE IF NOT EXISTS claw_agent_data_tags (
             key TEXT NOT NULL REFERENCES claw_agent_data(key) ON DELETE CASCADE,
             tag TEXT NOT NULL,
             PRIMARY KEY (key, tag)
         )
     """)
-    SQLite.DBInterface.execute(db, "CREATE INDEX IF NOT EXISTS idx_claw_agent_data_tags_tag ON claw_agent_data_tags(tag)")
+    _exec!(db, "CREATE INDEX IF NOT EXISTS idx_claw_agent_data_tags_tag ON claw_agent_data_tags(tag)")
 
-    SQLite.DBInterface.execute(db, """
+    _exec!(db, """
         CREATE TABLE IF NOT EXISTS claw_agent_metadata (
             key TEXT PRIMARY KEY,
             value TEXT NOT NULL,
@@ -208,7 +358,7 @@ function _init_claw_schema!(db::SQLite.DB)
         )
     """)
 
-    SQLite.DBInterface.execute(db, """
+    _exec!(db, """
         CREATE TABLE IF NOT EXISTS claw_evals (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             event_name TEXT NOT NULL,
@@ -227,9 +377,15 @@ function _init_claw_schema!(db::SQLite.DB)
             watcher_note TEXT
         )
     """)
-    SQLite.DBInterface.execute(db, "CREATE INDEX IF NOT EXISTS idx_claw_evals_status ON claw_evals(status)")
+    _exec!(db, "CREATE INDEX IF NOT EXISTS idx_claw_evals_status ON claw_evals(status)")
 
     _ensure_agent_metadata_defaults!(db)
+
+    # Everything above is the version-1 baseline (it predates any migration
+    # mechanism, so it stays idempotent CREATE IF NOT EXISTS); everything after is
+    # applied through the PRAGMA user_version ladder.
+    _migrate_claw_schema!(db)
+    return nothing
 end
 
 # ─── EventSource interface ───
@@ -275,8 +431,7 @@ function register_event_source!(assistant::AgentAssistant, es::EventSource)
         assistant._channels[id] = ch
     end
     for et in get_event_types(es)
-        SQLite.DBInterface.execute(db,
-            "INSERT OR IGNORE INTO claw_event_types (name, description) VALUES (?, ?)",
+        _exec!(db, "INSERT OR IGNORE INTO claw_event_types (name, description) VALUES (?, ?)",
             (et.name, et.description))
     end
     for eh in get_event_handlers(es)
@@ -287,31 +442,31 @@ function register_event_source!(assistant::AgentAssistant, es::EventSource)
 end
 
 function register_channels!(assistant::AgentAssistant, channels)
+    added = false
     for ch in channels
         id = Agentif.channel_id(ch)
         assistant._channels[id] = ch
+        added = true
     end
+    added && assistant._state[] === :running && _rehydration_ready!(assistant)
+    return nothing
 end
 
 function _upsert_event_handler!(db::SQLite.DB, eh::EventHandler)
-    SQLite.DBInterface.execute(db,
-        "INSERT OR REPLACE INTO claw_event_handlers (id, prompt, channel_id) VALUES (?, ?, ?)",
+    _exec!(db, "INSERT OR REPLACE INTO claw_event_handlers (id, prompt, channel_id) VALUES (?, ?, ?)",
         (eh.id, eh.prompt, eh.channel_id))
-    # Insert new subscriptions before deleting stale ones so a crash mid-upsert
-    # can never leave the handler with zero event types (a dead automation);
+    # Insert new subscriptions before deleting stale ones so a partial upsert can
+    # never leave the handler with zero event types (a dead automation);
     # worst case is a transient union of old+new until the next upsert.
     for et_name in eh.event_types
-        SQLite.DBInterface.execute(db,
-            "INSERT OR IGNORE INTO claw_handler_event_types (handler_id, event_type_name) VALUES (?, ?)",
+        _exec!(db, "INSERT OR IGNORE INTO claw_handler_event_types (handler_id, event_type_name) VALUES (?, ?)",
             (eh.id, et_name))
     end
     if isempty(eh.event_types)
-        SQLite.DBInterface.execute(db,
-            "DELETE FROM claw_handler_event_types WHERE handler_id = ?", (eh.id,))
+        _exec!(db, "DELETE FROM claw_handler_event_types WHERE handler_id = ?", (eh.id,))
     else
         placeholders = join(fill("?", length(eh.event_types)), ",")
-        SQLite.DBInterface.execute(db,
-            "DELETE FROM claw_handler_event_types WHERE handler_id = ? AND event_type_name NOT IN ($placeholders)",
+        _exec!(db, "DELETE FROM claw_handler_event_types WHERE handler_id = ? AND event_type_name NOT IN ($placeholders)",
             (eh.id, eh.event_types...))
     end
 end
@@ -323,8 +478,8 @@ end
 
 function unregister_event_handler!(assistant::AgentAssistant, handler_id::String)
     db = assistant.db
-    SQLite.DBInterface.execute(db, "DELETE FROM claw_handler_event_types WHERE handler_id = ?", (handler_id,))
-    SQLite.DBInterface.execute(db, "DELETE FROM claw_event_handlers WHERE id = ?", (handler_id,))
+    _exec!(db, "DELETE FROM claw_handler_event_types WHERE handler_id = ?", (handler_id,))
+    _exec!(db, "DELETE FROM claw_event_handlers WHERE id = ?", (handler_id,))
     return
 end
 
@@ -420,7 +575,7 @@ event_content(::TempusJobEvent) = ""
 function _fire_tempus_job(; event_type::String)
     assistant = get_current_assistant()
     assistant === nothing && return
-    put!(assistant.event_queue, TempusJobEvent(event_type))
+    submit_event!(assistant, TempusJobEvent(event_type); source = "tempus")
     return
 end
 
@@ -566,8 +721,7 @@ Gotchas:
     end
     names = strip.(split(event_type_names, ","))
     for n in names
-        result = iterate(SQLite.DBInterface.execute(a.db,
-            "SELECT 1 FROM claw_event_types WHERE name = ?", (n,)))
+        result = _fetch_one(a.db, "SELECT 1 FROM claw_event_types WHERE name = ?", (n,))
         result === nothing && return "Unknown event type: $n"
     end
     if cid !== nothing
@@ -638,7 +792,7 @@ Gotchas:
     a === nothing && return "No assistant initialized"
     haskey(a._channels, channel_id) || return "Unknown channel: $channel_id"
     et_name = "tempus_job:$name"
-    SQLite.DBInterface.execute(a.db,
+    _exec!(a.db,
         "INSERT OR IGNORE INTO claw_event_types (name, description) VALUES (?, ?)",
         (et_name, "Scheduled job: $name"))
     eh = EventHandler(et_name, [et_name], prompt, channel_id)
@@ -665,7 +819,7 @@ Silently succeeds even if the job doesn't exist.""" function remove_job(name::St
     Tempus.purgeJob!(a.scheduler.store, name)
     et_name = "tempus_job:$name"
     unregister_event_handler!(a, et_name)
-    SQLite.DBInterface.execute(a.db, "DELETE FROM claw_event_types WHERE name = ?", (et_name,))
+    _exec!(a.db, "DELETE FROM claw_event_types WHERE name = ?", (et_name,))
     "Job '$name' removed"
 end
 
@@ -770,16 +924,15 @@ Gotchas:
     lock(AGENT_DATA_WRITE_LOCK) do
         _with_busy_retry() do
             # Preserve original created_at on update
-            existing = iterate(SQLite.DBInterface.execute(a.db,
-                "SELECT created_at FROM claw_agent_data WHERE key = ?", (key,)))
-            created = existing !== nothing ? existing[1].created_at : now
-            SQLite.DBInterface.execute(a.db,
+            existing = _fetch_one(a.db, "SELECT created_at FROM claw_agent_data WHERE key = ?", (key,))
+            created = existing !== nothing ? existing.created_at : now
+            _exec!(a.db,
                 "INSERT OR REPLACE INTO claw_agent_data (key, value, created_at, updated_at, channel_id, channel_flags, user_id, post_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 (key, value, created, now, ch_id, ch_flags, user_id, post_id))
             # Update tags
-            SQLite.DBInterface.execute(a.db, "DELETE FROM claw_agent_data_tags WHERE key = ?", (key,))
+            _exec!(a.db, "DELETE FROM claw_agent_data_tags WHERE key = ?", (key,))
             for tag in parsed_tags
-                SQLite.DBInterface.execute(a.db,
+                _exec!(a.db,
                     "INSERT INTO claw_agent_data_tags (key, tag) VALUES (?, ?)", (key, tag))
             end
             search_store = _get_search_store(a)
@@ -843,10 +996,9 @@ Gotchas:
             all(t -> t in row_tags, filter_tags) || continue
         end
         # Time filter
-        meta = iterate(SQLite.DBInterface.execute(a.db,
-            "SELECT created_at, updated_at FROM claw_agent_data WHERE key = ?", (k,)))
+        meta = _fetch_one(a.db, "SELECT created_at, updated_at FROM claw_agent_data WHERE key = ?", (k,))
         if meta !== nothing
-            row = meta[1]
+            row = meta
             after_ts !== nothing && row.created_at < after_ts && continue
             before_ts !== nothing && row.created_at > before_ts && continue
         end
@@ -961,10 +1113,9 @@ Returns confirmation or "Key not found" if the key doesn't exist.""" function db
     a === nothing && return "No assistant initialized"
     removed = lock(AGENT_DATA_WRITE_LOCK) do
         _with_busy_retry() do
-            existing = iterate(SQLite.DBInterface.execute(a.db,
-                "SELECT 1 FROM claw_agent_data WHERE key = ?", (key,)))
+            existing = _fetch_one(a.db, "SELECT 1 FROM claw_agent_data WHERE key = ?", (key,))
             existing === nothing && return false
-            SQLite.DBInterface.execute(a.db, "DELETE FROM claw_agent_data WHERE key = ?", (key,))
+            _exec!(a.db, "DELETE FROM claw_agent_data WHERE key = ?", (key,))
             search_store = _get_search_store(a)
             LocalSearch.delete!(search_store, "agent_data:$key")
             return true
@@ -1119,6 +1270,8 @@ function _run_event_handler!(
         ev::Event,
         handler;
         level::Union{Nothing, LogLevel} = assistant.log_level,
+        abort::Union{Nothing, Agentif.Abort} = nothing,
+        pipeline_managed::Bool = false,
         eval_kw...,  # forwarded to evaluate (test seam, e.g. base_handler)
     )
     ch = _resolve_event_channel(assistant, ev, handler.channel_id)
@@ -1126,54 +1279,32 @@ function _run_event_handler!(
         ch = SinkChannel("handler:$(handler.id)")
     end
     if assistant.watcher !== nothing
-        supervised_evaluate(assistant, ev, handler, ch; level, eval_kw...)
+        supervised_evaluate(
+            assistant,
+            ev,
+            handler,
+            ch;
+            level,
+            abort,
+            propagate_failure = pipeline_managed,
+            eval_kw...,
+        )
         return nothing
     end
     input = make_prompt(handler.prompt, ev)
     @debug "Claw handler evaluate start" handler_id = handler.id event_name = get_name(ev) channel_id = Agentif.channel_id(ch)
-    evaluate(assistant, input; channel = ch, level = level, eval_kw...)
+    if abort === nothing
+        evaluate(assistant, input; channel = ch, level = level, eval_kw...)
+    else
+        evaluate(assistant, input; channel = ch, level = level, abort = abort, eval_kw...)
+    end
     @debug "Claw handler evaluate end" handler_id = handler.id event_name = get_name(ev)
     return nothing
 end
 
-function start_event_loop!(assistant::AgentAssistant; level::Union{Nothing, LogLevel} = assistant.log_level)
-    errormonitor(@async begin
-        Agentif.with_log_level(level) do
-            @info "Claw: event loop started" level
-            for ev in assistant.event_queue
-                @debug "Claw: event received" event_type = typeof(ev)
-                nm = try
-                    get_name(ev)
-                catch e
-                    @error "Event dropped: failed to compute event name" event_type = typeof(ev) exception = (e, catch_backtrace())
-                    continue
-                end
-                @debug "Claw: event name resolved" event_name = nm
-                handlers = try
-                    _event_handlers_for(assistant, nm)
-                catch e
-                    @error "Event handler lookup failed" event = nm exception = (e, catch_backtrace())
-                    continue
-                end
-                @debug "Claw: found handlers" event_name = nm handler_count = length(handlers)
-                for handler in handlers
-                    errormonitor(@async begin
-                        Agentif.with_log_level(level) do
-                            started_at = time()
-                            try
-                                @info "Claw: running handler" handler_id = handler.id event_name = nm
-                                _run_event_handler!(assistant, ev, handler; level)
-                                @info "Claw: handler completed" handler_id = handler.id event_name = nm duration_s = round(time() - started_at; digits = 4)
-                            catch e
-                                @error "Event handler failed" handler = handler.id event = nm exception = (e, catch_backtrace())
-                            end
-                        end
-                    end)
-                end
-            end
-        end
-    end)
-end
+# The durable event pipeline: ingestion, claiming, lanes, retries, supervision and
+# graceful shutdown (§1.1–§1.6).
+include("pipeline.jl")
 
 # ─── Constructor ───
 
@@ -1188,6 +1319,7 @@ function AgentAssistant(db_path::String="";
     enable_coding::Bool=false,
     level::Union{Nothing, LogLevel, Int, Symbol, AbstractString}=nothing,
     watcher::Union{Nothing, WatcherConfig}=nothing,
+    pipeline::PipelineConfig=PipelineConfig(),
 )
     watcher !== nothing && validate_watcher_config(watcher)
     db_path = isempty(db_path) ? joinpath(pwd(), "$(something(name, "claw")).sqlite") : db_path
@@ -1199,12 +1331,18 @@ function AgentAssistant(db_path::String="";
     scheduler = Tempus.Scheduler(tempus_store)
     config = AgentConfig(; name, provider, model_id, apikey, timezone, base_dir, enable_web, enable_coding)
     log_level = Agentif.resolve_log_level(level)
-    return AgentAssistant(
-        config, db,
-        Dict{String, Agentif.AbstractChannel}(),
-        Base.Channel{Event}(Inf),
-        session_store, Agentif.AgentTool[], scheduler, log_level,
+    return _new_agent_assistant(;
+        config,
+        db,
+        db_path,
+        session_store,
+        scheduler,
+        log_level,
         watcher,
+        pipeline,
+        _writer = SQLiteWriter(db_path, db),
+        _readers = ReaderPool(db_path, db),
+        _sem = Base.Semaphore(max(1, pipeline.max_concurrent_evals)),
     )
 end
 
@@ -1214,34 +1352,37 @@ function init!(
         db_path::String = "";
         event_sources = nothing,
         level::Union{Nothing, LogLevel, Int, Symbol, AbstractString} = nothing,
+        install_signal_handlers::Bool = !isinteractive(),
         kwargs...,
     )
-    sources = event_sources === nothing ? lock(() -> collect(EVENT_SOURCES), EVENT_SOURCES_LOCK) : event_sources
+    sources = event_sources === nothing ?
+        lock(() -> collect(EVENT_SOURCES), EVENT_SOURCES_LOCK) :
+        collect(event_sources)
     assistant = AgentAssistant(db_path; level, kwargs...)
     CURRENT_ASSISTANT[] = assistant
     # Crash recovery: evals left 'running' by a previous process can never
     # complete; flip them to failed/process_crash for post-crash forensics.
     _with_busy_retry() do
-        SQLite.DBInterface.execute(assistant.db,
+        _exec!(assistant.db,
             "UPDATE claw_evals SET status = 'failed', failure_class = 'process_crash', finished_at = ? WHERE status = 'running'",
             (time(),))
         return nothing
     end
     # Purge ephemeral tables (re-populated from EventSources)
-    SQLite.DBInterface.execute(assistant.db, "DELETE FROM claw_event_types")
+    _exec!(assistant.db, "DELETE FROM claw_event_types")
     # Re-seed event types for persisted Tempus jobs: they are only inserted at
     # add_job time, so the purge above would otherwise orphan them (breaking
     # list_event_types and add_event_handler validation for those types).
     for j in Tempus.getJobs(assistant.scheduler.store)
         et_name = "tempus_job:$(j.name)"
-        SQLite.DBInterface.execute(assistant.db,
+        _exec!(assistant.db,
             "INSERT OR IGNORE INTO claw_event_types (name, description) VALUES (?, ?)",
             (et_name, "Scheduled job: $(j.name)"))
     end
     # Auto-register LLMToolsEventSource if not already provided
     if !any(es -> es isa LLMToolsEventSource, sources)
         llm_es = LLMToolsEventSource(assistant.config)
-        register_event_source!(assistant, llm_es)
+        push!(sources, llm_es)
     end
     for es in sources
         register_event_source!(assistant, es)
@@ -1250,10 +1391,12 @@ function init!(
     append!(assistant.tools, TEMPUS_TOOLS)
     append!(assistant.tools, DB_TOOLS)
     Tempus.run!(assistant.scheduler)
+    assistant._scheduler_started[] = true
     start_event_loop!(assistant; level = assistant.log_level)
-    for es in sources
-        start!(es, assistant)
-    end
+    # Crash/stuck-worker recovery before sources start producing new work.
+    _recover_events!(assistant)
+    start_sources!(assistant, sources)
+    install_signal_handlers && install_shutdown_handler!(assistant)
     return assistant
 end
 
@@ -1298,6 +1441,9 @@ get_event_handlers(::ReplEventSource) = EventHandler[
     EventHandler("repl_default", ["repl_input"], "", nothing)
 ]
 
+event_source_tag(::ReplInputEvent) = "repl"
+event_lane(::ReplInputEvent) = "repl"
+
 # ─── REPL macro ───
 
 macro a_str(input)
@@ -1305,7 +1451,9 @@ macro a_str(input)
         a = Claw.get_current_assistant()
         a === nothing && error("No assistant initialized. Call Claw.init!() first.")
         ch = ReplChannel()
-        put!(a.event_queue, ReplInputEvent($(esc(input)), ch))
+        if Claw.submit_event!(a, ReplInputEvent($(esc(input)), ch)) === nothing
+            error("Claw: failed to enqueue REPL input")
+        end
         wait(ch.completion)
         nothing
     end
@@ -1313,6 +1461,7 @@ end
 
 function __init__()
     isinteractive() && register_event_source!(ReplEventSource())
+    _register_builtin_rehydrators!()
     return
 end
 
