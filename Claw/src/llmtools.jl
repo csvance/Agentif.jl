@@ -439,39 +439,18 @@ function _start_pty_capture(session; release::Union{Nothing, String} = nothing)
             put!(started, e)
             return
         end
-        inactive_empty_polls = 0
         while !stop[]
-            output = try
-                LLMTools.PtySessions.readavailable(session)
-            catch
-                ""
-            end
+            # Bounded wait keeps stop[] responsive; at_eof is a deterministic
+            # completion signal (process exited AND every output byte drained),
+            # which replaces the old EAGAIN-vs-EOF quiescence heuristic that the
+            # pre-Base.TTY PtySessions forced on this loop.
+            output, at_eof = LLMTools.read_pty_output(session, 0.25)
             if !isempty(output)
                 lock(buffer_lock) do
                     write(buffer, output)
                 end
             end
-            active = try
-                LLMTools.PtySessions.isactive(session)
-            catch
-                false
-            end
-            if active
-                inactive_empty_polls = 0
-            elseif isempty(output)
-                # Process exit and PTY EOF are separate events. A fast child can
-                # exit before the kernel exposes its final master-side bytes.
-                # PtySessions currently reports both EAGAIN and EOF as "", so
-                # require a short quiescent drain window instead of treating the
-                # first inactive poll as completion.
-                inactive_empty_polls += 1
-                inactive_empty_polls >= 3 && break
-            else
-                inactive_empty_polls = 0
-            end
-            # Drain much faster than the model-facing notification cadence. On
-            # macOS, unread PTY bytes can disappear when the slave closes.
-            sleep(0.01)
+            at_eof && break
         end
     end)
     start_error = take!(started)
@@ -939,8 +918,7 @@ Example:
                 session.last_used = time()
             end
             if sync
-                sleep(0.5)
-                output = try; LLMTools.PtySessions.readavailable(pty_meta.session); catch; ""; end
+                output = LLMTools.read_pty_output(pty_meta.session, 0.5)[1]
                 return LLMTools.truncate_tool_output(output; label = "PTY output")
             end
             return "Input sent to PTY '$name'. You'll be notified when output is available."

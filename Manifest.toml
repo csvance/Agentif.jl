@@ -377,8 +377,9 @@ uuid = "de0858da-6303-5e67-8744-51eddeeeb8d7"
 version = "1.11.0"
 
 [[deps.PtySessions]]
-git-tree-sha1 = "42938732977428e949e23acbd46e95bafbd381c9"
-repo-url = "https://github.com/quinnj/PtySessions.jl.git"
+git-tree-sha1 = "90364bf2f528abd8fe6f0ff8da9813b1864b4200"
+repo-rev = "main"
+repo-url = "https://github.com/JuliaServices/PtySessions.jl.git"
 uuid = "581b29ee-4021-4243-bea3-a8421693f905"
 version = "0.1.0"
 

@@ -33,7 +33,9 @@ end
 
 function close_quietly(meta::PtySessionMetadata)
     try
-        close(meta.session)
+        # force: closing the master alone no longer kills a running child
+        # (PtySessions ≥ the Base.TTY rewrite); SIGKILL the process group too
+        close(meta.session; force = true)
     catch
     end
     return nothing
@@ -52,27 +54,43 @@ const PTY_REGISTRY = SessionRegistry{PtySessionMetadata}(
     SessionRegistryConfig(20, 15, 0.5, 1),
 )
 
+# --- PTY output reading ---
+
+"""
+    read_pty_output(session, timeout_s) -> (output::String, at_eof::Bool)
+
+Wait up to `timeout_s` seconds for the session to produce any output, then
+return everything that has arrived without blocking further. Returns `("",
+false)` when nothing arrives in time. `at_eof` is `true` once the session's
+output has ended (process exited and all bytes drained) — a deterministic
+completion signal, unlike polling `isactive` (a process can exit before its
+final output is readable).
+
+Built on `PtySessions.expect`, whose internal reader-task reuse makes repeated
+short-timeout calls safe (no task leak, no lost data: output consumed while
+waiting stays buffered on the session).
+"""
+function read_pty_output(session::PtySessions.PtySession, timeout_s::Real)
+    isopen(session) || return ("", true)
+    drained() = bytesavailable(session) > 0 ? String(readavailable(session)) : ""
+    try
+        # matches the first character to arrive; MATCH_INVALID_UTF means any
+        # text output matches, then drain the rest of what came with it
+        first_chunk = PtySessions.expect(session, r"(?s)."; timeout = max(timeout_s, 0.05))
+        return (first_chunk * drained(), false)
+    catch e
+        e isa PtySessions.ExpectTimeoutError && return (drained(), false)
+        e isa EOFError && return (drained(), true)
+        e isa Base.IOError && return ("", true)  # closed underneath us
+        rethrow()
+    end
+end
+
 # --- Terminal tools ---
 
 function create_terminal_tools(base_dir::AbstractString = pwd())
     base = ensure_base_dir(base_dir)
     ensure_cleanup_task_running!(PTY_REGISTRY)
-
-    function readavailable_nonblocking(session::PtySessions.PtySession)
-        session.master_fd < 0 && return ""
-        return PtySessions.readavailable(session)
-    end
-
-    function readavailable_with_timeout(session::PtySessions.PtySession, timeout_s::Real)
-        deadline = time() + timeout_s
-        output = ""
-        while time() < deadline
-            output = readavailable_nonblocking(session)
-            !isempty(output) && return output
-            sleep(0.01)
-        end
-        return ""
-    end
 
     exec_command = @tool(
         """Execute a shell command in a new PTY (pseudo-terminal) session.
@@ -157,7 +175,7 @@ Limits: Maximum 20 concurrent sessions. Old exited sessions are auto-cleaned. Ou
                 ))
 
                 sleep(yield_ms / 1000.0)
-                output = readavailable_with_timeout(pty_session, max(0.2, min(1.0, yield_ms / 1000.0)))
+                output = read_pty_output(pty_session, max(0.2, min(1.0, yield_ms / 1000.0)))[1]
                 is_running = try
                     PtySessions.isactive(pty_session)
                 catch
@@ -165,7 +183,7 @@ Limits: Maximum 20 concurrent sessions. Old exited sessions are auto-cleaned. Ou
                 end
                 if !is_running
                     sleep(0.05)
-                    output *= readavailable_with_timeout(pty_session, 0.2)
+                    output *= read_pty_output(pty_session, 0.2)[1]
                 end
 
                 if is_running
@@ -275,25 +293,14 @@ Gotchas: If the session has exited, returns an error. The `chars` value is sent 
             start_time = time()
             try
                 if !isempty(chars)
-                    write_timeout_s = max(1.0, min(5.0, yield_ms / 1000.0))
-                    written = PtySessions.write_with_timeout(pty_session, chars; timeout_s = write_timeout_s)
-                    if written < ncodeunits(chars)
-                        push!(events, make_event(
-                            PTY_REGISTRY,
-                            "warning";
-                            session_id,
-                            payload = Dict(
-                                "kind" => "partial_write",
-                                "written" => written,
-                                "requested" => ncodeunits(chars),
-                            ),
-                        ))
-                    end
+                    # libuv-backed write: completes fully or throws (handled below);
+                    # the old write_with_timeout partial-write path is gone with it
+                    write(pty_session, chars)
                     sleep(0.1)
                 end
 
                 sleep(yield_ms / 1000.0)
-                output = readavailable_with_timeout(pty_session, max(1.0, min(2.0, yield_ms / 1000.0)))
+                output = read_pty_output(pty_session, max(1.0, min(2.0, yield_ms / 1000.0)))[1]
                 is_running = try
                     PtySessions.isactive(pty_session)
                 catch

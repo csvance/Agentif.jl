@@ -37,7 +37,7 @@ LocalSearch = {url = "https://github.com/quinnj/LocalSearch.jl.git"}
 MSTeams = {url = "https://github.com/quinnj/MSTeams.jl.git"}
 Mattermost = {url = "https://github.com/quinnj/Mattermost.jl.git"}
 OAuth = {url = "https://github.com/JuliaServices/OAuth.jl.git", rev = "main"}
-PtySessions = {url = "https://github.com/quinnj/PtySessions.jl.git"}
+PtySessions = {url = "https://github.com/JuliaServices/PtySessions.jl.git"}
 Signal = {url = "https://github.com/quinnj/Signal.jl.git"}
 Slack = {url = "https://github.com/quinnj/Slack.jl.git"}
 Telegram = {url = "https://github.com/quinnj/Telegram.jl.git"}
