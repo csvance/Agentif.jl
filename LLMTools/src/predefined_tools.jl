@@ -120,6 +120,9 @@ function truncate_tail(content::String; max_lines::Int = DEFAULT_MAX_LINES, max_
 end
 
 function truncate_tool_output(content::String; label::String = "Output", hint::Union{Nothing, String} = nothing)
+    # Tool results are JSON-encoded for the provider, so they must be valid
+    # UTF-8 even when the underlying source emitted arbitrary bytes.
+    content = repair_utf8(content)
     truncation = truncate_head(content)
     output = truncation.content
     hint_value = hint === nothing ? "" : " " * String(hint)
@@ -1379,14 +1382,20 @@ function create_web_fetch_tool()
           web_fetch("https://api.example.com/items", method="POST", headers="{\\\"Content-Type\\\": \\\"application/json\\\"}", body="{\\\"name\\\": \\\"test\\\"}")""",
         web_fetch(
             url::String,
-            method::String = "GET",
+            method::Union{Nothing, String} = nothing,
             headers::Union{Nothing, String} = nothing,
             body::Union{Nothing, String} = nothing,
-            extract_text::Bool = false,
-            timeout::Int = WEB_FETCH_READ_TIMEOUT,
+            extract_text::Union{Nothing, Bool} = nothing,
+            timeout::Union{Nothing, Int} = nothing,
             file_id::Union{Nothing, String} = nothing,
             offset::Union{Nothing, Int} = nothing
         ) = begin
+            # These must admit `nothing`: a concrete type with a Julia default is
+            # still a required field in the generated schema, so a model taking
+            # the documented default emits an unparseable call.
+            method = method === nothing ? "GET" : method
+            extract_text = extract_text === nothing ? false : extract_text
+            timeout = timeout === nothing ? WEB_FETCH_READ_TIMEOUT : timeout
             # If file_id is provided, read from existing temp file
             if file_id !== nothing
                 return read_cached_web_content(file_id, offset, extract_text)
@@ -1827,9 +1836,13 @@ function create_web_search_tool()
           web_search("site:github.com openai api client", num_results=5)""",
         web_search(
             query::String,
-            num_results::Int = 10,
-            timeout::Int = WEB_FETCH_READ_TIMEOUT
+            num_results::Union{Nothing, Int} = nothing,
+            timeout::Union{Nothing, Int} = nothing
         ) = begin
+            # See web_fetch: concrete-typed arguments with Julia defaults are
+            # schema-required, so their documented defaults are unreachable.
+            num_results = num_results === nothing ? 10 : num_results
+            timeout = timeout === nothing ? WEB_FETCH_READ_TIMEOUT : timeout
             query = strip(query)
             isempty(query) && throw(ArgumentError("Search query cannot be empty"))
 

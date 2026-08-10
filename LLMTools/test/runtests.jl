@@ -9,5 +9,7 @@ using Test, LLMTools
     include("terminal_tools_test.jl")
     include("egress_test.jl")
     include("web_tools_test.jl")
+    include("optional_args_test.jl")
+    include("hostile_output_test.jl")
     include("worker_tools_test.jl")
 end

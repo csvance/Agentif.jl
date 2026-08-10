@@ -37,6 +37,12 @@ end
 # --- Output limit constants ---
 const DEFAULT_MAX_OUTPUT_LINES = 1000
 const DEFAULT_MAX_OUTPUT_TOKENS = 10_000
+
+# Upper bound on any model-supplied yield window. `yield_time_ms` is only a
+# "wait this long for output before returning", so no legitimate call needs more
+# than a few minutes -- but the value comes straight from the model, and an
+# unclamped one (e.g. typemax(Int)) sleeps the agent forever.
+const MAX_YIELD_TIME_MS = 300_000
 const TRANSCRIPT_MAX_BYTES = 1024 * 1024
 const EVENT_DELTA_MAX_BYTES = 8 * 1024
 const RESPONSE_SCHEMA_VERSION = 1
@@ -136,6 +142,13 @@ function chunk_text_by_bytes(text::String, max_bytes::Int)
 end
 
 function project_output(raw_output::String, max_lines::Int, max_output_tokens::Int)
+    # A tool result is JSON-encoded and shipped to a provider, so it must be
+    # valid UTF-8; a subprocess is free to emit arbitrary bytes (`cat` on a
+    # binary, `head -c 100 /dev/urandom`, a truncated multi-byte sequence).
+    # Repair here rather than per read: this is the first point at which the
+    # output is fully accumulated, so a multi-byte character split across two
+    # PTY reads is already rejoined and is not mistaken for corruption.
+    raw_output = repair_utf8(raw_output)
     original_lines = line_count(raw_output)
     original_bytes = ncodeunits(raw_output)
     original_tokens = approx_token_count(raw_output)
