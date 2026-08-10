@@ -94,16 +94,6 @@ function truncate_tool_output(content::String; label::String = "Output", hint::U
     return output
 end
 
-function truncate_string_to_bytes_from_end(text::String, max_bytes::Int)
-    bytes = Vector{UInt8}(codeunits(text))
-    length(bytes) <= max_bytes && return text
-    start = length(bytes) - max_bytes + 1
-    while start <= length(bytes) && (bytes[start] & 0xc0) == 0x80
-        start += 1
-    end
-    return String(bytes[start:end])
-end
-
 function truncate_line(line::AbstractString; max_chars::Int = GREP_MAX_LINE_LENGTH)
     length(line) <= max_chars && return (text = String(line), was_truncated = false)
     return (text = String(first(line, max_chars)) * " [truncated]", was_truncated = true)
