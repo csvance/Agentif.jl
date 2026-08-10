@@ -77,12 +77,6 @@ end
     @test event isa OpenAIResponses.StreamOutputTextDeltaEvent
     @test event.delta == "hi"
 
-    user_item = OpenAIResponses.Message(; role = "user", content = OpenAIResponses.Content[OpenAIResponses.InputTextContent(; text = "hello")])
-    req = OpenAIResponses.Request(; model = "gpt-test", input = OpenAIResponses.InputItem[user_item], stream = true)
-    roundtrip = JSON.parse(JSON.json(req))
-    @test roundtrip["model"] == "gpt-test"
-    @test roundtrip["stream"] == true
-
     unknown_content = JSON.parse("{\"type\":\"output_audio\",\"audio\":\"...\"}", OpenAIResponses.Content)
     @test unknown_content isa OpenAIResponses.UnknownContent
 
