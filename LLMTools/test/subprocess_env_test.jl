@@ -1,7 +1,7 @@
 # subprocess_env_test.jl — subprocess environment scrubbing (hardening §2.4)
 #
 # The attack: a prompt injection gets the model to run `echo $ANTHROPIC_API_KEY` (or
-# `env`, or `remote_eval(w, :(ENV))`) in a PTY/worker/codex child, and the key comes
+# `env`, or `remote_eval(w, :(ENV))`) in a PTY or worker child, and the key comes
 # straight back as tool output. Children now receive an allowlist, not the parent's
 # environment.
 
