@@ -60,6 +60,8 @@ const WATCH_TRACE_MAX = 50
 mutable struct WatchState
     last_activity::Threads.Atomic{Float64}  # wall-clock time for the journal
     last_activity_monotonic::Threads.Atomic{UInt64}
+    progress_epoch::Threads.Atomic{Int}
+    progress_lock::ReentrantLock
     turns::Threads.Atomic{Int}
     tool_calls::Threads.Atomic{Int}
     trace::Vector{String}       # bounded ring buffer of one-line summaries
@@ -71,6 +73,8 @@ end
 WatchState(eval_id::Int) = WatchState(
     Threads.Atomic{Float64}(time()),
     Threads.Atomic{UInt64}(time_ns()),
+    Threads.Atomic{Int}(0),
+    ReentrantLock(),
     Threads.Atomic{Int}(0),
     Threads.Atomic{Int}(0),
     String[],
@@ -114,16 +118,24 @@ end
 function watch_observer(ws::WatchState)
     return function (event)
         try
-            ws.last_activity[] = time()
-            ws.last_activity_monotonic[] = time_ns()
-            if event isa Agentif.TurnStartEvent
-                n = Threads.atomic_add!(ws.turns, 1) + 1
-                _trace!(ws, "turn $n")
-            elseif event isa Agentif.ToolExecutionStartEvent
-                Threads.atomic_add!(ws.tool_calls, 1)
-                _trace!(ws, "tool $(event.tool_call.name)")
-            elseif event isa Agentif.AgentErrorEvent
-                _record_error!(ws, event.error)
+            lock(ws.progress_lock) do
+                ws.last_activity[] = time()
+                ws.last_activity_monotonic[] = time_ns()
+                if event isa Agentif.TurnStartEvent
+                    n = Threads.atomic_add!(ws.turns, 1) + 1
+                    _trace!(ws, "turn $n")
+                elseif event isa Agentif.ToolExecutionStartEvent
+                    Threads.atomic_add!(ws.tool_calls, 1)
+                    _trace!(ws, "tool $(event.tool_call.name)")
+                elseif event isa Agentif.AgentErrorEvent
+                    _record_error!(ws, event.error)
+                end
+                # Commit the progress snapshot after all event-derived state. A
+                # repeated evaluate-start event is only a liveness heartbeat; it
+                # does not make the work snapshot judged by the watcher obsolete.
+                if !(event isa Agentif.AgentEvaluateStartEvent)
+                    Threads.atomic_add!(ws.progress_epoch, 1)
+                end
             end
         catch e
             @debug "watch_observer failed" exception = (e,)
@@ -477,15 +489,37 @@ function supervised_evaluate(assistant, ev::Event, handler, ch::Agentif.Abstract
             if cfg.on_track_checks && ws.turns[] - last_ontrack_turns >= cfg.on_track_every_turns
                 last_ontrack_turns = ws.turns[]
                 try
-                    verdict, sentence = watcher_on_track_verdict(cfg, _watch_ctx(ws, handler, ev, event_name, started, nothing))
-                    # The primary can finish while the secondary model is
-                    # evaluating its verdict. Never abort a completed eval.
-                    istaskdone(task) && break
+                    # Bind the verdict to the exact primary activity snapshot
+                    # sent to the watcher. The primary task also includes session
+                    # persistence, which can still be pending after the model has
+                    # completed its turn. Task completion alone therefore cannot
+                    # decide whether a verdict is stale.
+                    verdict_progress_epoch = lock(() -> ws.progress_epoch[], ws.progress_lock)
+                    ctx = _watch_ctx(ws, handler, ev, event_name, started, nothing)
+                    verdict, sentence = watcher_on_track_verdict(cfg, ctx)
+                    verdict_state = lock(ws.progress_lock) do
+                        if istaskdone(task)
+                            return :completed
+                        elseif ws.progress_epoch[] != verdict_progress_epoch
+                            return :stale
+                        elseif verdict === :abort
+                            # Linearize the abort with progress events. If the
+                            # primary completed a turn first, its epoch wins and
+                            # this verdict is stale. Otherwise the abort wins.
+                            Agentif.abort!(eval_abort)
+                            return :aborted
+                        end
+                        return :current
+                    end
+                    verdict_state === :completed && break
+                    if verdict_state === :stale
+                        @debug "Claw watcher: discarded stale on-track verdict" eval_id handler_id = handler.id verdict
+                        continue
+                    end
                     if verdict === :abort
                         abort_reason = :off_track
                         ontrack_note = sentence
                         @warn "Claw watcher: off-track verdict; aborting" eval_id handler_id = handler.id note = sentence
-                        Agentif.abort!(eval_abort)
                         break
                     elseif verdict === :concern
                         @info "Claw watcher: on-track concern" eval_id note = sentence

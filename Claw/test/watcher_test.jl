@@ -385,8 +385,11 @@ end
 end
 
 @testset "Completed primary is not aborted by a stale on-track verdict" begin
+    verdict_started = Base.Event()
+    session_write_started = Base.Event()
     slow_abort_verdict = function (f, agent, state, input, abort; kw...)
-        sleep(0.3)
+        notify(verdict_started)
+        wait(session_write_started)
         return finish_state!(state, input; text = "ABORT — stale verdict")
     end
     cfg = watcher_cfg(;
@@ -396,12 +399,24 @@ end
         base_handler = slow_abort_verdict,
     )
     a = make_watcher_assistant(; watcher = cfg)
+    execute_session_write = a.session_store.execute_write
+    delay_first_session_write = Ref(true)
+    a.session_store.execute_write = function (f)
+        return execute_session_write() do db
+            if delay_first_session_write[]
+                delay_first_session_write[] = false
+                notify(session_write_started)
+                sleep(1.0)
+            end
+            return f(db)
+        end
+    end
     ch = RecordingChannel("rec-stale-verdict")
     a._channels[ch.id] = ch
     ev = WatcherTestEvent("test_event", "quick work")
     handler = (; id = "h-stale-verdict", prompt = "Test prompt", channel_id = ch.id)
     primary = function (f, agent, state, input, abort; kw...)
-        sleep(0.1)
+        wait(verdict_started)
         return finish_state!(state, input; text = "done")
     end
     run_handler_guarded(a, ev, handler; base_handler = primary)
