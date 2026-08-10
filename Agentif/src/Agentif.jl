@@ -24,7 +24,7 @@ include("channels.jl")
 include("middleware.jl")
 
 # Exports
-export Agent, Abort, abort!, isaborted, AgentHandler, AgentMiddleware
+export Agent, Abort, abort!, isaborted, AgentHandler
 export evaluate, stream, build_default_handler
 export steer_middleware, tool_call_middleware, queue_middleware, evaluate_middleware, session_middleware
 export input_guardrail_middleware, skills_middleware, compaction_middleware, channel_middleware

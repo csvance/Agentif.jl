@@ -1,5 +1,4 @@
 const AgentHandler = Function
-const AgentMiddleware = Function
 
 const DEFAULT_MAX_TOOL_RESULT_BYTES = 1_048_576  # 1MB
 const MAX_TOOL_RESULT_BYTES = Ref(DEFAULT_MAX_TOOL_RESULT_BYTES)

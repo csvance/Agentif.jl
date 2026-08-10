@@ -429,13 +429,11 @@ function evaluate(
         skill_registry::Union{Nothing, SkillRegistry} = nothing,
         channel::Union{Nothing, AbstractChannel} = nothing,
         abort::Abort = Abort(),
-        repeat_input::Bool = false,
         level::Union{Nothing, LogLevel, Int, Symbol, AbstractString} = nothing,
         kw...,
     ) where {F <: Function}
-    current_input = repeat_input && input isa String ? input * "\n\n" * input : input
     handler = build_default_handler(; base_handler, compaction_config, steer_queue, message_queue, session_store, input_guardrail, skill_registry, channel)
     return with_log_level(level) do
-        handler(f, agent, state, current_input, abort; kw...)
+        handler(f, agent, state, input, abort; kw...)
     end
 end
