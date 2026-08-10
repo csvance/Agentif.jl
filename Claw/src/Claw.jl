@@ -874,6 +874,27 @@ const TEMPUS_TOOLS = Agentif.AgentTool[LIST_JOBS_TOOL, ADD_JOB_TOOL, REMOVE_JOB_
 
 # ─── Agent data (scratch space) tools ───
 
+# The db tools are model-facing, so their string arguments are arbitrary bytes:
+# JSON can encode a NUL escape, and the model can echo back invalid UTF-8 it saw
+# in another tool's output. Repair the encoding before anything else, so the
+# char-level work downstream (strip/lowercase in _parse_tags, the search
+# backend's tokenizer) is total instead of throwing InvalidCharError.
+_repair_db_arg(::Nothing) = nothing
+_repair_db_arg(s::String) = LLMTools.repair_utf8(s)
+
+# NUL bytes survive UTF-8 repair (they are valid UTF-8) but cannot cross the C
+# string boundary into the search backend's tokenizer, which reports them as an
+# opaque `embedded NULs are not allowed in C strings`. Reject them up front,
+# naming the offending argument, so the model gets something it can act on and
+# no half-written row is left behind.
+function _db_nul_error(tool::String, args::Pair{String, <:Union{Nothing, String}}...)
+    for (name, value) in args
+        value !== nothing && contains(value, '\0') &&
+            return "$tool: `$name` contains NUL bytes (0x00), which cannot be stored or searched; strip them and retry."
+    end
+    return nothing
+end
+
 function _parse_tags(s::Union{Nothing, String})
     s === nothing && return String[]
     return unique(sort([lowercase(strip(t)) for t in split(s, ",") if !isempty(strip(t))]))
@@ -963,6 +984,9 @@ Gotchas:
 - Value is indexed for semantic search, so descriptive text is more findable than raw IDs.""" function db_store(key::String, value::String, tags::Union{Nothing, String} = nothing)
     a = get_current_assistant()
     a === nothing && return "No assistant initialized"
+    key, value, tags = _repair_db_arg(key), _repair_db_arg(value), _repair_db_arg(tags)
+    err = _db_nul_error("db_store", "key" => key, "value" => value, "tags" => tags)
+    err === nothing || return err
     parsed_tags = _parse_tags(tags)
     user_id, ch_id, _sch_id, ch_flags = Agentif.current_session_entry_metadata()
     ch = Agentif.CURRENT_CHANNEL[]
@@ -1010,6 +1034,9 @@ Gotchas:
 - Time filters apply to the entry's created_at timestamp, not updated_at.""" function db_search(query::String, tags::Union{Nothing, String} = nothing, after::Union{Nothing, String} = nothing, before::Union{Nothing, String} = nothing, limit::Union{Nothing, Int} = nothing)
     a = get_current_assistant()
     a === nothing && return "No assistant initialized"
+    query, tags, after, before = _repair_db_arg(query), _repair_db_arg(tags), _repair_db_arg(after), _repair_db_arg(before)
+    err = _db_nul_error("db_search", "query" => query, "tags" => tags, "after" => after, "before" => before)
+    err === nothing || return err
     n = limit === nothing ? 10 : limit
     search_store = _get_search_store(a)
     max_fetch = n * 3
@@ -1074,6 +1101,9 @@ Gotchas:
 - Shows keys and metadata only, not values. Use db_search to see content.""" function db_list_keys(tags::Union{Nothing, String} = nothing, after::Union{Nothing, String} = nothing, before::Union{Nothing, String} = nothing, limit::Union{Nothing, Int} = nothing)
     a = get_current_assistant()
     a === nothing && return "No assistant initialized"
+    tags, after, before = _repair_db_arg(tags), _repair_db_arg(after), _repair_db_arg(before)
+    err = _db_nul_error("db_list_keys", "tags" => tags, "after" => after, "before" => before)
+    err === nothing || return err
     n = limit === nothing ? 50 : limit
     filter_tags = _parse_tags(tags)
     after_ts = _parse_time_filter(after; timezone = a.config.timezone)
@@ -1158,6 +1188,9 @@ Arguments:
 Returns confirmation or "Key not found" if the key doesn't exist.""" function db_remove(key::String)
     a = get_current_assistant()
     a === nothing && return "No assistant initialized"
+    key = _repair_db_arg(key)
+    err = _db_nul_error("db_remove", "key" => key)
+    err === nothing || return err
     removed = lock(AGENT_DATA_WRITE_LOCK) do
         _with_busy_retry() do
             existing = _fetch_one(a.db, "SELECT 1 FROM claw_agent_data WHERE key = ?", (key,))
