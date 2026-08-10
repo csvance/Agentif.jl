@@ -1,8 +1,9 @@
 # Fuzz harnesses
 
 Adversarial harnesses that complement the unit suites. They are **not** run by
-`test/runtests.jl`: two need network and a paid API key, and all three are slow.
-Run them by hand when touching tool plumbing, the PTY path, or the agent loop.
+`test/runtests.jl`: two need network and a paid API key, and all four are slow.
+Run them by hand when touching tool plumbing, the PTY path, the agent loop, or
+the Claw event pipeline.
 Bugs they find should become regression tests in the normal suites (as the
 existing `LLMTools/test/hostile_output_test.jl`, `LLMTools/test/optional_args_test.jl`,
 and `Claw/test/pty_output_test.jl` did).
@@ -50,3 +51,32 @@ Reads `OPENROUTER_API_KEY` from `~/league-easy/.env`. Defaults to
 JULIA_NUM_THREADS=4 julia --project=. test/fuzz/agent_fuzz.jl
 FUZZ_MODEL=deepseek/deepseek-v4-flash julia --project=. test/fuzz/agent_fuzz.jl
 ```
+
+## `claw_pipeline_fuzz.jl` — Claw's durable event pipeline (mostly offline)
+
+`claw_fuzz.jl` covers only Claw's PTY capture. This one covers the runtime:
+submit → dedup → claim → lane → retry/dead-letter → recovery → shutdown, plus the
+model-facing db tools. Hostile content (invalid and truncated UTF-8, NUL bytes,
+SQL/JSON metacharacters, 200KB payloads, 20k-line bodies, control characters) is
+pushed through a concurrent submit storm with a fault-injecting handler swapped in
+via the `RUN_EVENT_HANDLER_FN` seam, so scenarios 1-3 need no API key.
+
+Asserts: no exception escapes `submit_event!`, dedup keys persist at most once,
+nothing wedges in `pending`/`running`, crash-marked rows recover on reboot, and
+db-tool output is valid UTF-8 and JSON-encodable.
+
+Scenario 4 is **live** and skipped without `OPENROUTER_API_KEY` (read from
+`~/league-easy/.env`): it drives the real `_run_event_handler!` → `Claw.evaluate`
+→ `Agentif.evaluate` path with the same model `agent_fuzz.jl` uses, covering
+system-prompt assembly, channel streaming, and session persistence end to end.
+
+```bash
+JULIA_NUM_THREADS=4 julia --project=. test/fuzz/claw_pipeline_fuzz.jl
+```
+
+Known pre-existing findings (present identically on `main` — compare before
+treating any as a regression): `db_store`/`db_search` raise on NUL bytes and
+invalid UTF-8 (reachable from a model, since JSON tool arguments can encode a NUL
+escape), and live concurrent handlers can dead-letter events with
+`SQLiteException("database is locked")`. The invalid-UTF-8 findings for persisted
+payloads are artifacts of injecting raw bytes that no real source emits.
