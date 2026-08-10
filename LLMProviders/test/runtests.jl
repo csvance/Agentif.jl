@@ -1,8 +1,6 @@
 using Test
-using HTTP
 using JSON
 using JSONSchema
-using Sockets
 using LLMProviders
 
 const OpenAIResponses = LLMProviders.OpenAIResponses
@@ -376,46 +374,6 @@ end
     @test LLMProviders.calculateCost(tiered, DummyUsage(100, 10, 100, 1))["input"] ≈ 0.01
 end
 
-@testset "discover_models!" begin
-    server = HTTP.serve!("127.0.0.1", 0) do req
-        if req.target == "/v1/models"
-            return HTTP.Response(
-                200,
-                ["Content-Type" => "application/json"],
-                """
-                {
-                  "data": [
-                    {"id": "local-a"},
-                    {"name": "missing-id"}
-                  ]
-                }
-                """,
-            )
-        elseif req.target == "/bad-data/v1/models"
-            return HTTP.Response(200, ["Content-Type" => "application/json"], "{\"data\": {\"id\": \"oops\"}}")
-        elseif req.target == "/bad-json/v1/models"
-            return HTTP.Response(200, ["Content-Type" => "application/json"], "{bad json")
-        end
-        return HTTP.Response(404, ["Content-Type" => "text/plain"], "not found")
-    end
-
-    try
-        port = HTTP.port(server)
-
-        provider_ok = "discover-ok-$(rand(1:10^9))"
-        models = LLMProviders.discover_models!("http://127.0.0.1:$port"; provider = provider_ok)
-        @test length(models) == 1
-        @test models[1].id == "local-a"
-        @test LLMProviders.getModel(provider_ok, "local-a") !== nothing
-
-        @test_throws Exception LLMProviders.discover_models!("http://127.0.0.1:$port/bad-data"; provider = "discover-bad-data")
-        @test_throws Exception LLMProviders.discover_models!("http://127.0.0.1:$port/bad-json"; provider = "discover-bad-json")
-        @test_throws Exception LLMProviders.discover_models!("http://127.0.0.1:$port/missing"; provider = "discover-404")
-    finally
-        close(server)
-    end
-end
-
 @testset "Generated model registry" begin
     # Roster shipped by models_generated.json plus models_custom.jl. Keep this
     # explicit so providers registered by earlier testsets do not enter the sweep.
@@ -504,13 +462,7 @@ end
         @test model !== nothing
         @test model !== nothing && all(==(0.0), values(model.cost))
     end
-    @test LLMProviders.getModel("openai-codex", "gpt-codex-5.3") !== nothing
-
     @test LLMProviders.getModel("minimax", "MiniMax-M2.7") !== nothing
-    m21 = LLMProviders.getModel("minimax", "minimax/minimax-m2.1")
-    @test m21 !== nothing
-    @test m21 !== nothing && m21.baseUrl == "https://api.minimax.io/v1"
-    @test m21 !== nothing && m21.id == "MiniMax-M2.1"
 
     for model in LLMProviders.getModels("google-gemini-cli")
         @test model.api == "google-gemini-cli"

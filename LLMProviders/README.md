@@ -9,7 +9,6 @@ It exposes:
 - `getModels(provider)`
 - `getModel(provider, model_id)`
 - `registerModel!(model)`
-- `discover_models!(base_url; provider=...)`
 - provider-specific request/response modules such as `OpenAIResponses` and `AnthropicMessages`
 
 ## Repo-Root Workflow

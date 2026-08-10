@@ -105,59 +105,6 @@ function calculateCost(model::Model, usage)
     return cost
 end
 
-const _LOCAL_COMPAT = Dict{String, Any}(
-    "supportsStore" => false,
-    "supportsDeveloperRole" => false,
-    "supportsReasoningEffort" => false,
-    "stripThinkTags" => true,
-    "maxTokensField" => "max_tokens",
-)
-
-"""
-    discover_models!(base_url::String; provider::String="local") -> Vector{Model}
-
-Query a local OpenAI-compatible server at `base_url` (e.g. "http://localhost:8000")
-and register all discovered models. Supports vLLM, Ollama, llama.cpp, LM Studio, etc.
-"""
-function discover_models!(base_url::String; provider::String="local")
-    url = rstrip(base_url, '/') * "/v1/models"
-    resp = HTTP.get(url; status_exception=false)
-    resp.status == 200 || error("Failed to query $url: HTTP $(resp.status)")
-    data = try
-        JSON.parse(resp.body)
-    catch e
-        error("Invalid JSON from $url: $(sprint(showerror, e))")
-    end
-    entries = get(() -> nothing, data, "data")
-    entries isa AbstractVector || error("Invalid /v1/models payload from $url: expected `data` array")
-    models = Model[]
-    api_base = rstrip(base_url, '/') * "/v1"
-    for (idx, entry) in enumerate(entries)
-        entry isa AbstractDict || continue
-        id = get(() -> nothing, entry, "id")
-        if !(id isa AbstractString) || isempty(strip(id))
-            @warn "Skipping discovered model without valid id" index = idx provider
-            continue
-        end
-        model = Model(
-            id = String(id),
-            name = String(id),
-            api = "openai-completions",
-            provider = provider,
-            baseUrl = api_base,
-            reasoning = false,
-            input = ["text"],
-            cost = Dict("input" => 0.0, "output" => 0.0, "cacheRead" => 0.0, "cacheWrite" => 0.0),
-            contextWindow = 131072,
-            maxTokens = 8192,
-            compat = _LOCAL_COMPAT,
-        )
-        registerModel!(model)
-        push!(models, model)
-    end
-    return models
-end
-
 # Load generated models
 include("models_generated.jl")
 include("models_custom.jl")

@@ -1,6 +1,6 @@
 module LLMProviders
 
-using HTTP, JSON, JSONSchema, StructUtils, UUIDs
+using JSON, JSONSchema, StructUtils, UUIDs
 
 # Include model definitions
 include("models.jl")
@@ -13,7 +13,7 @@ include("providers/google_generative_ai.jl")
 include("providers/google_gemini_cli.jl")
 
 # Exports
-export Model, getModel, getProviders, getModels, calculateCost, registerModel!, discover_models!
+export Model, getModel, getProviders, getModels, calculateCost, registerModel!
 export OpenAIResponses, OpenAICompletions, AnthropicMessages, GoogleGenerativeAI, GoogleGeminiCli
 
 end # module
