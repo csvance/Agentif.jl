@@ -153,6 +153,85 @@ const FAST = (; scan_interval_s = 0.05, min_refire_gap_s = 0.05, lane_backlog_wa
     end
 end
 
+@testset "session persistence shares the pipeline writer" begin
+    path = tempname() * ".sqlite"
+    a = make_assistant(path)
+    try
+        # Pause inside LocalSearch after it has read the document metadata and
+        # before it writes the embedding rows. With a second write connection,
+        # the journal commit below makes that read snapshot stale and the chunk
+        # insert fails with SQLITE_BUSY_SNAPSHOT (extended code 517).
+        embedding_started = Base.Event()
+        search_stores = Any[a.session_store.search_store]
+        if hasproperty(a.session_store, :write_search_store)
+            push!(search_stores, a.session_store.write_search_store)
+        end
+        unique!(search_stores)
+        for search_store in search_stores
+            dims = search_store.dimensions
+            search_store.embed = texts -> begin
+                notify(embedding_started)
+                sleep(0.15)
+                zeros(Float32, dims, length(texts))
+            end
+        end
+
+        n = 8
+        start = Base.Event()
+        session_errors = Any[]
+        session_errors_lock = ReentrantLock()
+        tasks = map(1:n) do i
+            Threads.@spawn begin
+                wait(start)
+                entry = Agentif.SessionEntry(;
+                    id = "contention-$i",
+                    messages = Agentif.AgentMessage[Agentif.UserMessage("message $i")],
+                )
+                try
+                    Agentif.append_entry!(a.session_store, entry)
+                catch e
+                    lock(session_errors_lock) do
+                        push!(session_errors, e)
+                    end
+                end
+            end
+        end
+        writer_errors = Any[]
+        writer_task = Threads.@spawn begin
+            wait(embedding_started)
+            for i in 1:32
+                try
+                    Claw.execute_write(a._writer,
+                        "INSERT INTO claw_source_journal (ts, source, action, detail) VALUES (?, ?, ?, ?)",
+                        (time(), "test", "session-contention", string(i)))
+                catch e
+                    push!(writer_errors, e)
+                end
+            end
+        end
+
+        notify(start)
+        foreach(wait, tasks)
+        wait(writer_task)
+
+        @test isempty(session_errors)
+        @test isempty(writer_errors)
+        @test hasproperty(a.session_store, :write_search_store)
+        @test a.session_store.write_search_store.db === a._writer.db
+        @test Int(Claw._fetch_one(a.db,
+            "SELECT COUNT(*) AS n FROM session_entries WHERE entry_id LIKE 'contention-%'").n) == n
+        @test Int(Claw._fetch_one(a.db,
+            "SELECT COUNT(*) AS n FROM documents WHERE key LIKE 'session:entry:contention-%'").n) == n
+        @test Int(Claw._fetch_one(a.db,
+            "SELECT COUNT(*) AS n FROM chunks WHERE hash IN (SELECT hash FROM documents WHERE key LIKE 'session:entry:contention-%')").n) == n
+    finally
+        Claw.shutdown!(a; timeout_s = 5)
+        rm(path; force = true)
+        rm(path * "-wal"; force = true)
+        rm(path * "-shm"; force = true)
+    end
+end
+
 @testset "pipeline writes are committed, not parked in an open statement" begin
     # `DBInterface.execute` hands back a lazy cursor; for a write the statement
     # stays in progress (uncommitted, holding its lock) until something else runs on

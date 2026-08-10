@@ -1083,6 +1083,20 @@ function shutdown!(assistant::AgentAssistant; timeout_s::Real = assistant.pipeli
 
     close_writer!(assistant._writer)
     close_readers!(assistant._readers)
+    # File-backed assistants own the session reader opened by the constructor.
+    # Its mutation-side LocalSearch store uses the writer connection, which the
+    # preceding call already closed.
+    session_db = try
+        getproperty(assistant.session_store, :db)
+    catch
+        nothing
+    end
+    if session_db isa SQLite.DB && session_db !== assistant.db && session_db !== assistant._writer.db
+        try
+            close(session_db)
+        catch
+        end
+    end
     try
         close(assistant.db)
     catch

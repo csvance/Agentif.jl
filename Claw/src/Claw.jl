@@ -993,20 +993,19 @@ Gotchas:
     post_id = ch !== nothing ? Agentif.entry_id(ch) : nothing
     now = time()
     lock(AGENT_DATA_WRITE_LOCK) do
-        _with_busy_retry() do
+        Agentif.with_session_write(a.session_store) do db, search_store
             # Preserve original created_at on update
-            existing = _fetch_one(a.db, "SELECT created_at FROM claw_agent_data WHERE key = ?", (key,))
+            existing = _fetch_one(db, "SELECT created_at FROM claw_agent_data WHERE key = ?", (key,))
             created = existing !== nothing ? existing.created_at : now
-            _exec!(a.db,
+            _exec!(db,
                 "INSERT OR REPLACE INTO claw_agent_data (key, value, created_at, updated_at, channel_id, channel_flags, user_id, post_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 (key, value, created, now, ch_id, ch_flags, user_id, post_id))
             # Update tags
-            _exec!(a.db, "DELETE FROM claw_agent_data_tags WHERE key = ?", (key,))
+            _exec!(db, "DELETE FROM claw_agent_data_tags WHERE key = ?", (key,))
             for tag in parsed_tags
-                _exec!(a.db,
+                _exec!(db,
                     "INSERT INTO claw_agent_data_tags (key, tag) VALUES (?, ?)", (key, tag))
             end
-            search_store = _get_search_store(a)
             vis_tags = _agent_data_visibility_tags(ch_id, ch_flags)
             LocalSearch.load!(search_store, value; id="agent_data:$key", title=key, tags=vcat(parsed_tags, ["claw_agent_data"], vis_tags))
             return nothing
@@ -1192,11 +1191,10 @@ Returns confirmation or "Key not found" if the key doesn't exist.""" function db
     err = _db_nul_error("db_remove", "key" => key)
     err === nothing || return err
     removed = lock(AGENT_DATA_WRITE_LOCK) do
-        _with_busy_retry() do
-            existing = _fetch_one(a.db, "SELECT 1 FROM claw_agent_data WHERE key = ?", (key,))
+        Agentif.with_session_write(a.session_store) do db, search_store
+            existing = _fetch_one(db, "SELECT 1 FROM claw_agent_data WHERE key = ?", (key,))
             existing === nothing && return false
-            _exec!(a.db, "DELETE FROM claw_agent_data WHERE key = ?", (key,))
-            search_store = _get_search_store(a)
+            _exec!(db, "DELETE FROM claw_agent_data WHERE key = ?", (key,))
             LocalSearch.delete!(search_store, "agent_data:$key")
             return true
         end
@@ -1259,13 +1257,11 @@ function scrub_post!(assistant::AgentAssistant, post_id::String)
     Agentif.scrub_post!(assistant.session_store, post_id)
     # 2. Hard-delete agent data matching this post_id
     lock(AGENT_DATA_WRITE_LOCK) do
-        _with_busy_retry() do
-            db = assistant.db
+        Agentif.with_session_write(assistant.session_store) do db, search_store
             rows = SQLite.DBInterface.execute(db,
                 "SELECT key FROM claw_agent_data WHERE post_id = ?", (post_id,))
             keys = String[String(r.key) for r in rows]
             if !isempty(keys)
-                search_store = _get_search_store(assistant)
                 for key in keys
                     try
                         Base.delete!(search_store, "agent_data:$key")
@@ -1450,14 +1446,16 @@ function AgentAssistant(db_path::String="";
     db_path = isempty(db_path) ? joinpath(pwd(), "$(something(name, "claw")).sqlite") : db_path
     db = SQLite.DB(db_path)
     _init_claw_schema!(db)
-    # The session store writes (entry row + search index) must not share `db`
-    # with Claw's readers. Reads on the shared handle can leave a lazy cursor
-    # mid-step, which under WAL pins that connection to an old read snapshot;
-    # once the writer connection commits, a write from the pinned handle can no
-    # longer upgrade and fails with "database is locked" even after waiting out
-    # busy_timeout. A dedicated handle keeps session writes off that snapshot.
-    # Same ownership rule as SQLiteWriter: a private in-memory database cannot be
-    # reopened, so those keep sharing the handle.
+    writer = SQLiteWriter(db_path, db)
+    # LocalSearch performs a read/embedding/write sequence for each session
+    # entry. Bind its mutation-side store to the writer connection so another
+    # connection cannot commit between the read snapshot and the write upgrade.
+    write_search_store = execute_write(writer) do writer_db
+        LocalSearch.Store(writer_db)
+    end
+
+    # Reads keep a separate connection. A private in-memory database cannot be
+    # reopened, so it uses the shared connection and store.
     session_db = db
     if !_is_private_memory_path(db_path)
         try
@@ -1467,8 +1465,13 @@ function AgentAssistant(db_path::String="";
             session_db = db
         end
     end
-    search_store = LocalSearch.Store(session_db)
-    session_store = Agentif.SQLiteSessionStore(session_db, search_store)
+    search_store = session_db === writer.db ? write_search_store : LocalSearch.Store(session_db)
+    session_store = Agentif.SQLiteSessionStore(
+        session_db,
+        search_store;
+        write_search_store,
+        execute_write = f -> execute_write(f, writer),
+    )
     tempus_store = Tempus.SQLiteStore(db)
     scheduler = Tempus.Scheduler(tempus_store)
     config = AgentConfig(; name, provider, model_id, apikey, timezone, base_dir, enable_web, enable_coding)
@@ -1482,7 +1485,7 @@ function AgentAssistant(db_path::String="";
         log_level,
         watcher,
         pipeline,
-        _writer = SQLiteWriter(db_path, db),
+        _writer = writer,
         _readers = ReaderPool(db_path, db),
         _sem = Base.Semaphore(max(1, pipeline.max_concurrent_evals)),
     )

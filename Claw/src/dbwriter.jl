@@ -8,9 +8,9 @@
 #
 # This file introduces a single writer task owning a dedicated write connection,
 # fed by a request channel, plus a small pool of read connections (safe under WAL).
-# Agentif's session store, Tempus and LocalSearch keep using the shared handle —
-# their call sites are untouched — while everything Claw owns in the durable event
-# pipeline goes through the writer, which is what makes real transactions possible.
+# Agentif's session store can submit its complete entry-and-index transaction to
+# this writer. Tempus keeps its own compatibility store on the main handle. Claw's
+# durable pipeline and session persistence therefore have one write owner.
 
 # ─── Pipeline configuration ───
 
