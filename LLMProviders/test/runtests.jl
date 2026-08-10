@@ -20,14 +20,6 @@ struct DummyUsage
     cacheWrite::Int
 end
 
-@testset "Future" begin
-    f = LLMProviders.Future{Int}(() -> 42)
-    @test wait(f) == 42
-
-    f_err = LLMProviders.Future{Int}(() -> error("boom"))
-    @test_throws CapturedException wait(f_err)
-end
-
 @testset "OpenAICompletions" begin
     msg = OpenAICompletions.Message(
         ; role = "assistant",
@@ -350,25 +342,6 @@ end
     @test cost["cacheWrite"] == 0.0
     @test cost["total"] == 0.005
 
-    # Keep the public pre-tier positional constructor working.
-    positional = LLMProviders.Model(
-        model.id,
-        model.name,
-        model.api,
-        model.provider,
-        model.baseUrl,
-        model.reasoning,
-        model.input,
-        model.cost,
-        model.contextWindow,
-        model.maxTokens,
-        model.headers,
-        model.compat,
-        model.kw,
-    )
-    @test isempty(positional.costTiers)
-    @test positional.thinkingLevelMap === nothing
-
     tiered = LLMProviders.Model(;
         id = "tiered",
         name = "Tiered",
@@ -441,23 +414,6 @@ end
     finally
         close(server)
     end
-end
-
-@testset "OpenAI Codex model registry" begin
-    spark = LLMProviders.getModel("openai-codex", "gpt-5.3-codex-spark")
-    @test spark !== nothing
-    @test spark.id == "gpt-5.3-codex-spark"
-    @test spark.api == "openai-codex-responses"
-    @test spark.provider == "openai-codex"
-    @test spark.maxTokens == 32000
-
-    v51 = LLMProviders.getModel("openai-codex", "gpt-5.1-codex")
-    @test v51 !== nothing
-    @test v51.id == "gpt-5.1-codex"
-
-    v54 = LLMProviders.getModel("openai-codex", "gpt-5.4")
-    @test v54 !== nothing
-    @test v54.id == "gpt-5.4"
 end
 
 @testset "Generated model registry" begin

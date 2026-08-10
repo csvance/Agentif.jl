@@ -123,12 +123,6 @@ end
     traceId::Union{Nothing, String} = nothing
 end
 
-struct StreamDoneEvent end
-
-@omit_null @kwarg struct StreamErrorEvent
-    message::String
-end
-
 @omit_null @kwarg struct ThinkingConfig
     includeThoughts::Union{Nothing, Bool} = nothing
     thinkingBudget::Union{Nothing, Int} = nothing

@@ -28,32 +28,6 @@ end
     thinkingLevelMap::Union{Nothing, Dict{String, Any}} = nothing
 end
 
-# Preserve the pre-tier positional constructor. Most callers use keywords, but
-# Model is exported and downstream packages may still use the full field order.
-Model(id, name, api, provider, baseUrl, reasoning, input, cost, contextWindow,
-    maxTokens, headers, compat, kw) =
-    Model(id, name, api, provider, baseUrl, reasoning, input, cost, contextWindow,
-        maxTokens, headers, compat, kw, ModelCostTier[], nothing)
-
-with(model::Model; kw...) =
-    Model(;
-    id = model.id,
-    name = model.name,
-    api = model.api,
-    provider = model.provider,
-    baseUrl = model.baseUrl,
-    reasoning = model.reasoning,
-    input = model.input,
-    cost = model.cost,
-    contextWindow = model.contextWindow,
-    maxTokens = model.maxTokens,
-    headers = model.headers,
-    compat = model.compat,
-    kw = kw,
-    costTiers = model.costTiers,
-    thinkingLevelMap = model.thinkingLevelMap,
-)
-
 # Model registry - will be populated from models_generated.jl
 const _model_registry = Dict{String, Dict{String, Model}}()
 
