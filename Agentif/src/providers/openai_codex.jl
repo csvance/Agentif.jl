@@ -117,77 +117,6 @@ end
 codex_optional_string(value)::Union{Nothing, String} =
     value === nothing ? nothing : string(value)
 
-function trimmed_codex_options(kw::NamedTuple)
-    account_id = if hasproperty(kw, :account_id)
-        codex_optional_string(getproperty(kw, :account_id))
-    elseif hasproperty(kw, :accountId)
-        codex_optional_string(getproperty(kw, :accountId))
-    else
-        nothing
-    end
-    session_id = if hasproperty(kw, :session_id)
-        codex_optional_string(getproperty(kw, :session_id))
-    elseif hasproperty(kw, :sessionId)
-        codex_optional_string(getproperty(kw, :sessionId))
-    else
-        nothing
-    end
-    reasoning_effort = if hasproperty(kw, :reasoning_effort)
-        codex_optional_string(getproperty(kw, :reasoning_effort))
-    elseif hasproperty(kw, :reasoningEffort)
-        codex_optional_string(getproperty(kw, :reasoningEffort))
-    elseif hasproperty(kw, :reasoning)
-        codex_optional_string(getproperty(kw, :reasoning))
-    else
-        nothing
-    end
-    reasoning_summary = if hasproperty(kw, :reasoning_summary)
-        codex_optional_string(getproperty(kw, :reasoning_summary))
-    elseif hasproperty(kw, :reasoningSummary)
-        codex_optional_string(getproperty(kw, :reasoningSummary))
-    else
-        nothing
-    end
-    text_verbosity = if hasproperty(kw, :text_verbosity)
-        codex_optional_string(getproperty(kw, :text_verbosity))
-    elseif hasproperty(kw, :textVerbosity)
-        codex_optional_string(getproperty(kw, :textVerbosity))
-    else
-        nothing
-    end
-    transport_value = if hasproperty(kw, :transport)
-        getproperty(kw, :transport)
-    elseif hasproperty(kw, :transportMode)
-        getproperty(kw, :transportMode)
-    elseif hasproperty(kw, :websocket)
-        getproperty(kw, :websocket)
-    elseif hasproperty(kw, :websockets)
-        getproperty(kw, :websockets)
-    else
-        nothing
-    end
-    transport = normalize_codex_transport(transport_value)
-    retry_settings = (
-        max_retries = codex_env_int(
-            "AGENTIF_CODEX_MAX_RETRIES", CODEX_DEFAULT_MAX_RETRIES),
-        retry_base_ms = codex_env_int(
-            "AGENTIF_CODEX_RETRY_BASE_MS", CODEX_DEFAULT_RETRY_BASE_MS),
-        retry_max_ms = codex_env_int(
-            "AGENTIF_CODEX_RETRY_MAX_MS", CODEX_DEFAULT_RETRY_MAX_MS),
-    )
-    return (;
-        account_id,
-        session_id,
-        reasoning_effort,
-        reasoning_summary,
-        text_verbosity,
-        include_opt = nothing,
-        max_tokens = nothing,
-        transport,
-        retry_settings,
-    )
-end
-
 function build_codex_tools(tools::Vector{<:AgentTool})
     isempty(tools) && return nothing
     provider_tools = Vector{Dict{String, Any}}()
@@ -937,22 +866,18 @@ function codex_retryable_message(message::AbstractString)
     return occursin(CODEX_RETRYABLE_ERROR_REGEX, lowercase(message))
 end
 
-if TRIMMED_BUILD
-    codex_nested_retryable_exception(::Exception) = false
-else
-    function codex_nested_retryable_exception(err::Exception)
-        if err isa TaskFailedException
-            task = getfield(err, :task)
-            for (nested, _) in Base.current_exceptions(task)
-                nested isa Exception && codex_retryable_exception(nested) && return true
-            end
-        elseif err isa CompositeException
-            for nested in getfield(err, :exceptions)
-                nested isa Exception && codex_retryable_exception(nested) && return true
-            end
+function codex_nested_retryable_exception(err::Exception)
+    if err isa TaskFailedException
+        task = getfield(err, :task)
+        for (nested, _) in Base.current_exceptions(task)
+            nested isa Exception && codex_retryable_exception(nested) && return true
         end
-        return false
+    elseif err isa CompositeException
+        for nested in getfield(err, :exceptions)
+            nested isa Exception && codex_retryable_exception(nested) && return true
+        end
     end
+    return false
 end
 
 function codex_retryable_exception(err::Exception)

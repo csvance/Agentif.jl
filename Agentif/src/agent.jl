@@ -141,11 +141,7 @@ function call_function_tool!(f, tool::AgentTool, tc::PendingToolCall)
             raw_preview = length(raw) > 500 ? string(first(raw, 500), "... (truncated, length=$(length(raw)))") : raw
             parse_msg = caught_exception_message(
                 parse_error, "Tool arguments are invalid.")
-            if TRIMMED_BUILD
-                @warn "Tool argument parsing failed" tool = tc.name call_id = tc.call_id
-            else
-                @warn "Tool argument parsing failed" tool = tc.name call_id = tc.call_id exception = (parse_error, parse_bt)
-            end
+            @warn "Tool argument parsing failed" tool = tc.name call_id = tc.call_id exception = (parse_error, parse_bt)
             output = render_tool_error_json(
                 ;
                 error_kind = "tool_argument_parse_failed",
@@ -167,11 +163,7 @@ function call_function_tool!(f, tool::AgentTool, tc::PendingToolCall)
                 is_error = true
                 error_msg = caught_exception_message(
                     normalized_error, "The tool could not complete the request.")
-                if TRIMMED_BUILD
-                    @error "Tool execution failed" tool = tc.name call_id = tc.call_id
-                else
-                    @error "Tool execution failed" tool = tc.name call_id = tc.call_id exception = (normalized_error, bt)
-                end
+                @error "Tool execution failed" tool = tc.name call_id = tc.call_id exception = (normalized_error, bt)
                 output = render_tool_error_json(
                     ;
                     error_kind = "tool_execution_failed",

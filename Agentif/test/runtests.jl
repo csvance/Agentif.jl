@@ -1725,19 +1725,6 @@ end
     @test Agentif.normalize_codex_transport("auto") == :auto
     @test Agentif.normalize_codex_transport(true) == :websocket
     @test_throws ArgumentError Agentif.normalize_codex_transport("bogus")
-
-    empty_options = Agentif.trimmed_codex_options((
-        account_id = nothing,
-        sessionId = nothing,
-        reasoning = nothing,
-        reasoningSummary = nothing,
-        textVerbosity = nothing,
-    ))
-    @test empty_options.account_id === nothing
-    @test empty_options.session_id === nothing
-    @test empty_options.reasoning_effort === nothing
-    @test empty_options.reasoning_summary === nothing
-    @test empty_options.text_verbosity === nothing
 end
 
 @testset "oauth apikey resolution" begin
