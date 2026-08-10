@@ -18,7 +18,6 @@ include("skills.jl")
 include("agent.jl")
 include("session.jl")
 include("input_guardrail.jl")
-include("output_guardrail.jl")
 include("stream.jl")
 include("compaction.jl")
 include("channels.jl")
@@ -33,8 +32,6 @@ export AbstractChannel, CURRENT_CHANNEL, with_channel, ChannelUser
 export start_streaming, append_to_stream, finish_streaming, send_message, close_channel, channel_id, channel_name
 export is_group, is_private, get_current_user
 export branch_id, parent_branch_id, branch_entry_id, entry_id, response_entry_id, search_channel_id
-export OutputGuardrailAgent, DEFAULT_OUTPUT_GUARDRAIL_AGENT
-export build_output_guardrail_input, materialize_output_guardrail_agent
 export CompactionConfig, CompactionSummaryMessage, compact!
 export with_prompt, with_tools
 export CURRENT_EVALUATION_ID
