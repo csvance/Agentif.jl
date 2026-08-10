@@ -26,9 +26,6 @@ mutable struct Future{T}
 end
 
 Future() = Future{Nothing}() # default future type
-Base.pointer(f::Future) = pointer_from_objref(f)
-Future(ptr::Ptr) = unsafe_pointer_to_objref(ptr)::Future
-Future{T}(ptr::Ptr) where {T} = unsafe_pointer_to_objref(ptr)::Future{T}
 
 function Future{T}(f) where {T}
     fut = Future{T}()

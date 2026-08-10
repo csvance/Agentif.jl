@@ -27,13 +27,6 @@ function findtool(tools, name)
     throw(ArgumentError("invalid tool for agent: `$name`"))
 end
 
-function findpendingtool(pending_tool_calls::Vector{PendingToolCall}, call_id::String)
-    for ptc in pending_tool_calls
-        ptc.call_id == call_id && return ptc
-    end
-    throw(ArgumentError("invalid call_id for pending tool calls: $call_id"))
-end
-
 function extract_function_args(func_expr::Expr)
     args = Symbol[]
     types = Any[]

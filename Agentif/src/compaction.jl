@@ -131,9 +131,6 @@ function find_cut_point(messages::Vector{StoredAgentMessage}, keep_recent_tokens
     return 0  # no valid cut point found
 end
 
-find_cut_point(messages::Vector{AgentMessage}, keep_recent_tokens::Int) =
-    find_cut_point(stored_agent_messages(messages), keep_recent_tokens)
-
 """
     format_messages_for_summary(messages::Vector{<:AgentMessage}) -> String
 
@@ -165,9 +162,6 @@ function format_messages_for_summary(messages::Vector{StoredAgentMessage})
     end
     return join(parts, "\n\n")
 end
-
-format_messages_for_summary(messages::Vector{AgentMessage}) =
-    format_messages_for_summary(stored_agent_messages(messages))
 
 """
     generate_summary(agent, to_discard, existing_summary, config, model, abort) -> Union{Nothing, String}
