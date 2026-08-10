@@ -244,7 +244,7 @@ uuid = "f3f4c4b3-4b8a-4e8c-9b4f-7b8e4e6e5b2d"
 version = "1.0.0"
 
 [[deps.LLMProviders]]
-deps = ["HTTP", "JSON", "JSONSchema", "Logging", "StructUtils", "UUIDs"]
+deps = ["HTTP", "JSON", "JSONSchema", "StructUtils", "UUIDs"]
 path = "LLMProviders"
 uuid = "e1f4c4b3-4b8a-4e8c-9b4f-7b8e4e6e5b2a"
 version = "1.0.0"

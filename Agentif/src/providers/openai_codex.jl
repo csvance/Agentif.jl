@@ -114,9 +114,6 @@ function codex_retry_settings!(kw::Dict{Symbol, Any})
     return (; max_retries, retry_base_ms, retry_max_ms)
 end
 
-codex_optional_string(value)::Union{Nothing, String} =
-    value === nothing ? nothing : string(value)
-
 function build_codex_tools(tools::Vector{<:AgentTool})
     isempty(tools) && return nothing
     provider_tools = Vector{Dict{String, Any}}()

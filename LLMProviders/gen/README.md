@@ -77,11 +77,9 @@ therefore produce a different snapshot on a later date.
 
 The generated registry loads first. The custom file loads second.
 
-- `openai-codex` uses custom zero prices for ChatGPT-subscription billing and
-  adds local aliases.
+- `openai-codex` registers the ChatGPT-subscription models with custom zero
+  prices.
 - `google-gemini-cli` adds Cloud Code Assist models.
-- `minimax` adds direct OpenAI-compatible aliases when their OpenRouter source
-  models exist.
 
 Current pi-mono already includes the frontier Anthropic models. They do not need
 custom copies.
