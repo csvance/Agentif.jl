@@ -1,17 +1,26 @@
-function google_generative_build_tools(tools::Vector{<:AgentTool})
+# Shared adapter for the two Google providers. GoogleGenerativeAI and
+# GoogleGeminiCli speak the same wire format, so the request-building and
+# stream-parsing logic is written once, parameterized by the provider module
+# `P`; the provider-specific differences (stream chunk envelope, usage
+# accounting, debug logging) are handled at the marked spots below.
+
+function google_build_tools(P::Module, tools::Vector{<:AgentTool})
     isempty(tools) && return nothing
-    decls = GoogleGenerativeAI.FunctionDeclaration[]
+    decls = P.FunctionDeclaration[]
     for tool in tools
         push!(
-            decls, GoogleGenerativeAI.FunctionDeclaration(
-                ; name = tool.name, description = tool.description, parameters = GoogleGenerativeAI.schema(parameters(tool))
+            decls, P.FunctionDeclaration(
+                ; name = tool.name, description = tool.description, parameters = P.schema(parameters(tool))
             )
         )
     end
-    return [GoogleGenerativeAI.Tool(; functionDeclarations = decls)]
+    return [P.Tool(; functionDeclarations = decls)]
 end
 
-function google_generative_build_contents(agent::Agent, state::AgentState, input::AgentTurnInput, model::Model)
+google_generative_build_tools(tools::Vector{<:AgentTool}) = google_build_tools(GoogleGenerativeAI, tools)
+google_gemini_cli_build_tools(tools::Vector{<:AgentTool}) = google_build_tools(GoogleGeminiCli, tools)
+
+function google_build_contents(P::Module, agent::Agent, state::AgentState, input::AgentTurnInput, model::Model)
     context = StoredAgentMessage[]
     for msg in state.messages
         include_in_context(msg) || continue
@@ -30,26 +39,26 @@ function google_generative_build_contents(agent::Agent, state::AgentState, input
     normalize_tool_call_id = id -> google_normalize_tool_call_id(model.id, id)
     normalized = transform_messages(context, model; normalize_tool_call_id = normalize_tool_call_id)
 
-    contents = GoogleGenerativeAI.Content[]
+    contents = P.Content[]
     for msg in normalized
         if msg isa CompactionSummaryMessage
-            push!(contents, GoogleGenerativeAI.Content(; role = "user", parts = [GoogleGenerativeAI.Part(; text = "[Previous conversation summary]\n\n$(msg.summary)")]))
+            push!(contents, P.Content(; role = "user", parts = [P.Part(; text = "[Previous conversation summary]\n\n$(msg.summary)")]))
             continue
         elseif msg isa UserMessage
-            parts = GoogleGenerativeAI.Part[]
+            parts = P.Part[]
             for block in msg.content
                 if block isa TextContent
                     isempty(strip(block.text)) && continue
-                    push!(parts, GoogleGenerativeAI.Part(; text = block.text))
+                    push!(parts, P.Part(; text = block.text))
                 elseif block isa ImageContent
                     "image" in model.input || continue
-                    push!(parts, GoogleGenerativeAI.Part(; inlineData = GoogleGenerativeAI.InlineData(; mimeType = block.mimeType, data = block.data)))
+                    push!(parts, P.Part(; inlineData = P.InlineData(; mimeType = block.mimeType, data = block.data)))
                 end
             end
             isempty(parts) && continue
-            push!(contents, GoogleGenerativeAI.Content(; role = "user", parts))
+            push!(contents, P.Content(; role = "user", parts))
         elseif msg isa AssistantMessage
-            parts = GoogleGenerativeAI.Part[]
+            parts = P.Part[]
             is_same = msg.provider == model.provider && msg.model == model.id
             blocks = copy(msg.content)
             if !any(b -> b isa ToolCallContent, blocks) && !isempty(msg.tool_calls)
@@ -61,14 +70,14 @@ function google_generative_build_contents(agent::Agent, state::AgentState, input
                 if block isa TextContent
                     isempty(strip(block.text)) && continue
                     signature = google_resolve_thought_signature(is_same, block.textSignature)
-                    push!(parts, GoogleGenerativeAI.Part(; text = block.text, thoughtSignature = signature))
+                    push!(parts, P.Part(; text = block.text, thoughtSignature = signature))
                 elseif block isa ThinkingContent
                     isempty(strip(block.thinking)) && continue
                     if is_same
                         signature = google_resolve_thought_signature(is_same, block.thinkingSignature)
-                        push!(parts, GoogleGenerativeAI.Part(; text = block.thinking, thought = true, thoughtSignature = signature))
+                        push!(parts, P.Part(; text = block.thinking, thought = true, thoughtSignature = signature))
                     else
-                        push!(parts, GoogleGenerativeAI.Part(; text = block.thinking))
+                        push!(parts, P.Part(; text = block.thinking))
                     end
                 elseif block isa ToolCallContent
                     signature = google_resolve_thought_signature(is_same, block.thoughtSignature)
@@ -77,22 +86,22 @@ function google_generative_build_contents(agent::Agent, state::AgentState, input
                         args_str = JSON.json(block.arguments)
                         push!(
                             parts,
-                            GoogleGenerativeAI.Part(;
+                            P.Part(;
                                 text = "[Historical context: a different model called tool \"$(block.name)\" with arguments: $(args_str). Do not mimic this format - use proper function calling.]",
                             ),
                         )
                     else
-                        call = GoogleGenerativeAI.FunctionCall(;
+                        call = P.FunctionCall(;
                             name = block.name,
                             args = block.arguments,
                             id = google_requires_tool_call_id(model.id) ? block.id : nothing,
                         )
-                        push!(parts, GoogleGenerativeAI.Part(; functionCall = call, thoughtSignature = signature))
+                        push!(parts, P.Part(; functionCall = call, thoughtSignature = signature))
                     end
                 end
             end
             isempty(parts) && continue
-            push!(contents, GoogleGenerativeAI.Content(; role = "model", parts))
+            push!(contents, P.Content(; role = "model", parts))
         elseif msg isa ToolResultMessage
             text_blocks = String[]
             image_blocks = ImageContent[]
@@ -107,33 +116,38 @@ function google_generative_build_contents(agent::Agent, state::AgentState, input
             has_text = !isempty(text_result)
             has_images = !isempty(image_blocks)
             response_value = has_text ? text_result : (has_images ? "(see attached image)" : "")
-            image_parts = GoogleGenerativeAI.Part[
-                GoogleGenerativeAI.Part(; inlineData = GoogleGenerativeAI.InlineData(; mimeType = block.mimeType, data = block.data)) for block in image_blocks
+            image_parts = P.Part[
+                P.Part(; inlineData = P.InlineData(; mimeType = block.mimeType, data = block.data)) for block in image_blocks
             ]
             include_id = google_requires_tool_call_id(model.id)
             supports_multimodal = google_supports_multimodal_function_response(model.id)
             response_payload = msg.is_error ? Dict("error" => response_value) : Dict("output" => response_value)
-            response = GoogleGenerativeAI.FunctionResponse(;
+            response = P.FunctionResponse(;
                 name = msg.name,
                 response = response_payload,
                 id = include_id ? msg.call_id : nothing,
                 parts = (has_images && supports_multimodal) ? image_parts : nothing,
             )
-            part = GoogleGenerativeAI.Part(; functionResponse = response)
+            part = P.Part(; functionResponse = response)
             last_content = isempty(contents) ? nothing : contents[end]
             if last_content !== nothing && last_content.role == "user" && last_content.parts !== nothing &&
                     any(p -> p.functionResponse !== nothing, last_content.parts)
                 push!(last_content.parts, part)
             else
-                push!(contents, GoogleGenerativeAI.Content(; role = "user", parts = [part]))
+                push!(contents, P.Content(; role = "user", parts = [part]))
             end
             if has_images && !supports_multimodal
-                push!(contents, GoogleGenerativeAI.Content(; role = "user", parts = [GoogleGenerativeAI.Part(; text = "Tool result image:"), image_parts...]))
+                push!(contents, P.Content(; role = "user", parts = [P.Part(; text = "Tool result image:"), image_parts...]))
             end
         end
     end
     return contents
 end
+
+google_generative_build_contents(agent::Agent, state::AgentState, input::AgentTurnInput, model::Model) =
+    google_build_contents(GoogleGenerativeAI, agent, state, input, model)
+google_gemini_cli_build_contents(agent::Agent, state::AgentState, input::AgentTurnInput, model::Model) =
+    google_build_contents(GoogleGeminiCli, agent, state, input, model)
 
 function google_generative_usage_from_response(u::Union{Nothing, GoogleGenerativeAI.UsageMetadata})
     u === nothing && return Usage()
@@ -143,7 +157,18 @@ function google_generative_usage_from_response(u::Union{Nothing, GoogleGenerativ
     return Usage(; input, output, total)
 end
 
-function google_generative_stop_reason(reason::Union{Nothing, String}, tool_calls::Vector{AgentToolCall})
+function google_gemini_cli_usage_from_response(u::Union{Nothing, GoogleGeminiCli.UsageMetadata})
+    u === nothing && return Usage()
+    input = something(u.promptTokenCount, 0)
+    candidates = something(u.candidatesTokenCount, 0)
+    thoughts = something(u.thoughtsTokenCount, 0)
+    output = candidates + thoughts
+    total = something(u.totalTokenCount, input + output)
+    cache_read = something(u.cachedContentTokenCount, 0)
+    return Usage(; input, output, cacheRead = cache_read, total)
+end
+
+function google_stop_reason(reason::Union{Nothing, String}, tool_calls::Vector{AgentToolCall})
     if !isempty(tool_calls)
         return :tool_calls
     end
@@ -161,20 +186,33 @@ function google_generative_stop_reason(reason::Union{Nothing, String}, tool_call
     return :stop
 end
 
-function google_generative_event_callback(
+const google_generative_stop_reason = google_stop_reason
+const google_gemini_cli_stop_reason = google_stop_reason
+
+# GoogleGeminiCli wraps each response in a StreamChunk envelope; GoogleGenerativeAI
+# streams GenerateContentResponse objects directly.
+function google_stream_response(P::Module, data::String)
+    P === GoogleGeminiCli && return JSON.parse(data, GoogleGeminiCli.StreamChunk).response
+    return JSON.parse(data, GoogleGenerativeAI.GenerateContentResponse)
+end
+
+function google_event_callback(
+        P::Module,
         f::F,
         agent::Agent,
         assistant_message::AssistantMessage,
         started::Base.RefValue{Bool},
         ended::Base.RefValue{Bool},
-        latest_usage::Base.RefValue{Union{Nothing, GoogleGenerativeAI.UsageMetadata}},
+        latest_usage::Base.RefValue,
         latest_finish::Base.RefValue{Union{Nothing, String}},
         seen_call_ids::Set{String},
-        abort::Abort,
+        abort::Abort;
+        debug_stream::Bool = false,
     ) where {F <: Function}
     return function (stream, event)
         maybe_abort!(abort, stream)
         data = String(event.data)
+        debug_stream && @info "gemini-cli stream event" length = length(data)
         if data == "[DONE]"
             if started[] && !ended[]
                 ended[] = true
@@ -182,21 +220,20 @@ function google_generative_event_callback(
             end
             return
         end
-        local parsed
+        local response
         try
-            parsed = JSON.parse(data, GoogleGenerativeAI.GenerateContentResponse)
+            response = google_stream_response(P, data)
         catch e
             f(AgentErrorEvent(ErrorException(sprint(showerror, e))))
             return
         end
 
-        if parsed.responseId !== nothing
-            assistant_message.response_id = parsed.responseId
-        end
-        parsed.usageMetadata !== nothing && (latest_usage[] = parsed.usageMetadata)
-        parsed.candidates === nothing && return
-        isempty(parsed.candidates) && return
-        candidate = parsed.candidates[1]
+        response === nothing && return
+        response.responseId !== nothing && (assistant_message.response_id = response.responseId)
+        response.usageMetadata !== nothing && (latest_usage[] = response.usageMetadata)
+        response.candidates === nothing && return
+        isempty(response.candidates) && return
+        candidate = response.candidates[1]
         candidate.finishReason !== nothing && (latest_finish[] = candidate.finishReason)
         candidate.content === nothing && return
         candidate.content.parts === nothing && return
@@ -262,4 +299,39 @@ function google_generative_event_callback(
         end
         return
     end
+end
+
+function google_generative_event_callback(
+        f::F,
+        agent::Agent,
+        assistant_message::AssistantMessage,
+        started::Base.RefValue{Bool},
+        ended::Base.RefValue{Bool},
+        latest_usage::Base.RefValue{Union{Nothing, GoogleGenerativeAI.UsageMetadata}},
+        latest_finish::Base.RefValue{Union{Nothing, String}},
+        seen_call_ids::Set{String},
+        abort::Abort,
+    ) where {F <: Function}
+    return google_event_callback(
+        GoogleGenerativeAI, f, agent, assistant_message, started, ended,
+        latest_usage, latest_finish, seen_call_ids, abort,
+    )
+end
+
+function google_gemini_cli_event_callback(
+        f::F,
+        agent::Agent,
+        assistant_message::AssistantMessage,
+        started::Base.RefValue{Bool},
+        ended::Base.RefValue{Bool},
+        latest_usage::Base.RefValue{Union{Nothing, GoogleGeminiCli.UsageMetadata}},
+        latest_finish::Base.RefValue{Union{Nothing, String}},
+        seen_call_ids::Set{String},
+        debug_stream::Bool,
+        abort::Abort,
+    ) where {F <: Function}
+    return google_event_callback(
+        GoogleGeminiCli, f, agent, assistant_message, started, ended,
+        latest_usage, latest_finish, seen_call_ids, abort; debug_stream,
+    )
 end

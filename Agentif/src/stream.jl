@@ -330,8 +330,7 @@ google_supports_multimodal_function_response(model_id::String) = occursin("gemin
 include("providers/openai_responses_adapter.jl")
 include("providers/openai_completions_adapter.jl")
 include("providers/anthropic_messages_adapter.jl")
-include("providers/google_generative_adapter.jl")
-include("providers/google_gemini_cli_adapter.jl")
+include("providers/google_adapter.jl")
 include("providers/openai_codex.jl")
 
 
