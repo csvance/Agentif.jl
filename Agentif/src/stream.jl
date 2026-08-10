@@ -1381,7 +1381,7 @@ function stream(
         retry_settings = codex_retry_settings!(codex_kw)
 
         tools = build_codex_tools(agent.tools)
-        current_input = codex_build_input(agent, state, input, model)
+        current_input = openai_responses_build_full_input(agent, state, input, model)
         system_prompt = agent_system_prompt(agent)
 
         request_body = Dict{String, Any}(

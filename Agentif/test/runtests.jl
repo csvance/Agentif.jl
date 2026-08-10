@@ -1785,9 +1785,9 @@ end
     end
 
     @test Agentif._responses_split_compound_id("café|élément") == ("café", "élément")
-    @test Agentif._split_compound_id("appel-é|élément") == ("appel-é", "élément")
+    @test Agentif._responses_split_compound_id("appel-é|élément") == ("appel-é", "élément")
     @test Agentif._responses_split_compound_id("|élément") == ("", "élément")
-    @test Agentif._split_compound_id("appel|") == ("appel", "")
+    @test Agentif._responses_split_compound_id("appel|") == ("appel", "")
 
     let
         prior = AssistantMessage(
@@ -1797,7 +1797,7 @@ end
         )
         push!(prior.content, Agentif.ToolCallContent(; id = "bad+call|item/with=chars__", name = "read", arguments = Dict("path" => "README.md")))
         state = AgentState(messages = AgentMessage[prior])
-        items = Agentif.codex_build_input(make_agent(), state, "continue", codex_model)
+        items = Agentif.openai_responses_build_full_input(make_agent(), state, "continue", codex_model)
 
         function_calls = [item for item in items if item isa AbstractDict && get(() -> nothing, item, "type") == "function_call"]
         tool_outputs = [item for item in items if item isa AbstractDict && get(() -> nothing, item, "type") == "function_call_output"]
@@ -1820,7 +1820,7 @@ end
         )
         push!(prior.content, Agentif.ThinkingContent(; thinking = "cross-provider reasoning"))
         state = AgentState(messages = AgentMessage[prior])
-        items = Agentif.codex_build_input(make_agent(), state, "continue", codex_model)
+        items = Agentif.openai_responses_build_full_input(make_agent(), state, "continue", codex_model)
 
         assistant_messages = [item for item in items if item isa AbstractDict && get(() -> nothing, item, "role") == "assistant"]
         reasoning_items = [item for item in items if item isa AbstractDict && get(() -> nothing, item, "type") == "reasoning"]
