@@ -415,6 +415,73 @@ end
     @test haskey(parse_payload, "raw_arguments")
 end
 
+# Regression: tool_fuzz.jl found that a confused model's arguments produced raw
+# Julia conversion errors (`Cannot convert Int64 to String`) that name no field,
+# and that truncated argument JSON escaped as a BoundsError from JSON.jl's own
+# error-reporting path. Both must arrive as field-level validation errors.
+@testset "tool argument validation errors" begin
+    T = @NamedTuple{cmd::String, workdir::Union{Nothing, String}, yield_time_ms::Union{Nothing, Int}}
+    parse_message(args) = try
+        Agentif.parse_tool_arguments(args, T)
+        nothing
+    catch e
+        e isa Agentif.ToolArgumentError || rethrow()
+        sprint(showerror, e)
+    end
+
+    @test parse_message("{\"cmd\":12345}") ==
+        "argument `cmd` expects a string, but received an integer"
+    @test parse_message("{\"cmd\":[\"ls\",\"-la\"]}") ==
+        "argument `cmd` expects a string, but received an array"
+    @test parse_message("{\"cmd\":null}") ==
+        "argument `cmd` expects a string, but received null"
+    @test parse_message("{\"cmd\":{\"a\":1}}") ==
+        "argument `cmd` expects a string, but received an object"
+    @test parse_message("{\"workdir\":\"/tmp\"}") ==
+        "missing required argument `cmd` (expected a string)"
+    @test parse_message("{\"cmd\":\"ls\",\"yield_time_ms\":\"soon\"}") ==
+        "argument `yield_time_ms` expects an integer or null, but received a string"
+    # every bad field is reported, so one round trip is enough to fix them all
+    @test parse_message("{\"cmd\":1,\"yield_time_ms\":\"soon\"}") ==
+        "argument `cmd` expects a string, but received an integer; " *
+        "argument `yield_time_ms` expects an integer or null, but received a string"
+    @test parse_message("\"echo hi\"") ==
+        "expected a JSON object of arguments, but received a string"
+    # JSON.jl v1.7.1 raises BoundsError, not its own ArgumentError, when the
+    # input ends mid-token; the call site must absorb that.
+    @test parse_message("{\"cmd\":\"echo") ==
+        "the arguments are not valid JSON: the input ends unexpectedly (truncated or malformed)"
+    @test parse_message("{") ==
+        "the arguments are not valid JSON: the input ends unexpectedly (truncated or malformed)"
+    # JSON.jl's own diagnostic survives when it is well formed
+    @test occursin("invalid JSON at byte position", parse_message("{cmd:\"echo hi\"}"))
+
+    # valid arguments are untouched, optional fields included
+    @test Agentif.parse_tool_arguments("{\"cmd\":\"echo hi\"}", T) ==
+        (cmd = "echo hi", workdir = nothing, yield_time_ms = nothing)
+    @test Agentif.parse_tool_arguments("{\"cmd\":\"echo hi\",\"yield_time_ms\":500}", T) ==
+        (cmd = "echo hi", workdir = nothing, yield_time_ms = 500)
+
+    # the rendered envelope keeps its shape; only the message got specific
+    typed_tool = @tool "Echoes." echoer(cmd::String) = cmd
+    for (args, expected) in [
+            ("{\"cmd\":12345}", "argument `cmd` expects a string, but received an integer"),
+            ("{\"cmd\":\"echo", "the input ends unexpectedly (truncated or malformed)"),
+        ]
+        tc = Agentif.PendingToolCall(; call_id = "call-bad", name = "echoer", arguments = args)
+        trm = wait(Agentif.call_function_tool!(identity, typed_tool, tc))
+        @test trm.is_error
+        payload = JSON.parse(message_text(trm))
+        @test payload["ok"] == false
+        @test payload["error_kind"] == "tool_argument_parse_failed"
+        @test payload["tool"] == "echoer"
+        @test payload["call_id"] == "call-bad"
+        @test payload["exception_type"] == "Agentif.ToolArgumentError"
+        @test payload["raw_arguments"] == args
+        @test occursin(expected, payload["message"])
+    end
+end
+
 @testset "provider tool result output wrapping" begin
     err_output = JSON.json(Dict("ok" => false, "error_kind" => "tool_execution_failed", "message" => "boom"))
     result = ToolResultMessage("call-wrap", "explode", err_output; is_error = true)

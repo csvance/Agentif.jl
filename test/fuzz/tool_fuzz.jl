@@ -73,7 +73,8 @@ function guarded(label, f; timeout_s = 60.0)
     r = fetch(t)
     if r isa Exception
         # Clean, classified failures are fine; anything else is a finding.
-        if r isa ArgumentError || r isa SystemError || r isa Base.IOError
+        if r isa ArgumentError || r isa SystemError || r isa Base.IOError ||
+           r isa Agentif.ToolArgumentError
             println("    (clean throw) $label: ", first(sprint(showerror, r), 90))
         else
             finding("$label: threw $(typeof(r)): $(first(sprint(showerror, r), 160))")
