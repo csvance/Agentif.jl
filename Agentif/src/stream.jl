@@ -137,6 +137,51 @@ function sse_emit_stream_interrupted!(
     return
 end
 
+# Shared catch-block handling for a failed SSE stream request: expected aborts
+# are swallowed, an HTTP.StatusError is surfaced as an AgentErrorEvent carrying
+# the provider's error message, a recoverable connection drop after events
+# already flowed keeps the partial message, and anything else rethrows (this
+# helper must be called from inside the catch block). The per-arm failure
+# bookkeeping is injected via the two thunks.
+function handle_sse_stream_error(
+        e,
+        f::Function,
+        assistant_message::AssistantMessage,
+        started::Base.RefValue{Bool},
+        ended::Base.RefValue{Bool},
+        events_seen::Base.RefValue{Bool};
+        on_status_error::Function,
+        on_interrupted::Function,
+    )
+    if e isa StopStreaming
+        # Expected abort
+    elseif e isa HTTP.StatusError
+        if !started[]
+            started[] = true
+            f(MessageStartEvent(:assistant, assistant_message))
+        end
+        if !ended[]
+            ended[] = true
+            f(MessageEndEvent(:assistant, assistant_message))
+        end
+        error_body = String(e.response.body)
+        error_msg = try
+            err_json = JSON.parse(error_body)
+            get(get(() -> Dict(), err_json, "error"), "message", "HTTP $(e.status)")
+        catch
+            "HTTP $(e.status): $error_body"
+        end
+        f(AgentErrorEvent(ErrorException(error_msg)))
+        on_status_error()
+    elseif events_seen[] && sse_recoverable_connection_error(e)
+        sse_emit_stream_interrupted!(f, assistant_message, started, ended, e)
+        on_interrupted()
+    else
+        rethrow()
+    end
+    return
+end
+
 mutable struct ToolCallAccumulator
     id::Union{Nothing, String}
     name::Union{Nothing, String}
@@ -508,32 +553,11 @@ function stream(
                 )
             end
         catch e
-            if e isa StopStreaming
-                # Expected abort
-            elseif e isa HTTP.StatusError
-                if !started[]
-                    started[] = true
-                    f(MessageStartEvent(:assistant, assistant_message))
-                end
-                if !ended[]
-                    ended[] = true
-                    f(MessageEndEvent(:assistant, assistant_message))
-                end
-                error_body = String(e.response.body)
-                error_msg = try
-                    err_json = JSON.parse(error_body)
-                    get(get(() -> Dict(), err_json, "error"), "message", "HTTP $(e.status)")
-                catch
-                    "HTTP $(e.status): $error_body"
-                end
-                f(AgentErrorEvent(ErrorException(error_msg)))
-                response_status[] = "failed"
-            elseif events_seen[] && sse_recoverable_connection_error(e)
-                sse_emit_stream_interrupted!(f, assistant_message, started, ended, e)
-                response_status[] = "failed"
-            else
-                rethrow()
-            end
+            handle_sse_stream_error(
+                e, f, assistant_message, started, ended, events_seen;
+                on_status_error = () -> (response_status[] = "failed"),
+                on_interrupted = () -> (response_status[] = "failed"),
+            )
         end
 
         if started[] && !ended[]
@@ -667,32 +691,11 @@ function stream(
                     )
                 end
             catch e
-                if e isa StopStreaming
-                    # Expected abort
-                elseif e isa HTTP.StatusError
-                    if !started[]
-                        started[] = true
-                        f(MessageStartEvent(:assistant, assistant_message))
-                    end
-                    if !ended[]
-                        ended[] = true
-                        f(MessageEndEvent(:assistant, assistant_message))
-                    end
-                    error_body = String(e.response.body)
-                    error_msg = try
-                        err_json = JSON.parse(error_body)
-                        get(get(() -> Dict(), err_json, "error"), "message", "HTTP $(e.status)")
-                    catch
-                        "HTTP $(e.status): $error_body"
-                    end
-                    f(AgentErrorEvent(ErrorException(error_msg)))
-                    latest_finish[] = "error"
-                elseif events_seen[] && sse_recoverable_connection_error(e)
-                    sse_emit_stream_interrupted!(f, assistant_message, started, ended, e)
-                    stream_failed[] = true
-                else
-                    rethrow()
-                end
+                handle_sse_stream_error(
+                    e, f, assistant_message, started, ended, events_seen;
+                    on_status_error = () -> (latest_finish[] = "error"),
+                    on_interrupted = () -> (stream_failed[] = true),
+                )
             end
 
             if started[] && !ended[]
@@ -1075,32 +1078,11 @@ function stream(
                         )
                     end
                 catch e
-                    if e isa StopStreaming
-                    elseif e isa HTTP.StatusError
-                        if !started[]
-                            started[] = true
-                            f(MessageStartEvent(:assistant, assistant_message))
-                        end
-                        if !ended[]
-                            ended[] = true
-                            f(MessageEndEvent(:assistant, assistant_message))
-                        end
-                        error_body = String(e.response.body)
-                        error_msg = try
-                            err_json = JSON.parse(error_body)
-                            err_obj = get(() -> Dict(), err_json, "error")
-                            get(() -> "HTTP $(e.status)", err_obj, "message")
-                        catch
-                            "HTTP $(e.status): $error_body"
-                        end
-                        f(AgentErrorEvent(ErrorException(error_msg)))
-                        stop_reason[] = "error"
-                    elseif events_seen[] && sse_recoverable_connection_error(e)
-                        sse_emit_stream_interrupted!(f, assistant_message, started, ended, e)
-                        stream_failed[] = true
-                    else
-                        rethrow()
-                    end
+                    handle_sse_stream_error(
+                        e, f, assistant_message, started, ended, events_seen;
+                        on_status_error = () -> (stop_reason[] = "error"),
+                        on_interrupted = () -> (stream_failed[] = true),
+                    )
                 end
 
                 add_usage!(total_usage, anthropic_usage_from_response(latest_usage[]))
@@ -1189,32 +1171,11 @@ function stream(
                 )
             end
         catch e
-            if e isa StopStreaming
-                # Expected abort
-            elseif e isa HTTP.StatusError
-                if !started[]
-                    started[] = true
-                    f(MessageStartEvent(:assistant, assistant_message))
-                end
-                if !ended[]
-                    ended[] = true
-                    f(MessageEndEvent(:assistant, assistant_message))
-                end
-                error_body = String(e.response.body)
-                error_msg = try
-                    err_json = JSON.parse(error_body)
-                    get(get(() -> Dict(), err_json, "error"), "message", "HTTP $(e.status)")
-                catch
-                    "HTTP $(e.status): $error_body"
-                end
-                f(AgentErrorEvent(ErrorException(error_msg)))
-                stream_failed[] = true
-            elseif events_seen[] && sse_recoverable_connection_error(e)
-                sse_emit_stream_interrupted!(f, assistant_message, started, ended, e)
-                stream_failed[] = true
-            else
-                rethrow()
-            end
+            handle_sse_stream_error(
+                e, f, assistant_message, started, ended, events_seen;
+                on_status_error = () -> (stream_failed[] = true),
+                on_interrupted = () -> (stream_failed[] = true),
+            )
         end
 
         if started[] && !ended[]
@@ -1298,32 +1259,11 @@ function stream(
                 )
             end
         catch e
-            if e isa StopStreaming
-                # Expected abort
-            elseif e isa HTTP.StatusError
-                if !started[]
-                    started[] = true
-                    f(MessageStartEvent(:assistant, assistant_message))
-                end
-                if !ended[]
-                    ended[] = true
-                    f(MessageEndEvent(:assistant, assistant_message))
-                end
-                error_body = String(e.response.body)
-                error_msg = try
-                    err_json = JSON.parse(error_body)
-                    get(get(() -> Dict(), err_json, "error"), "message", "HTTP $(e.status)")
-                catch
-                    "HTTP $(e.status): $error_body"
-                end
-                f(AgentErrorEvent(ErrorException(error_msg)))
-                stream_failed[] = true
-            elseif events_seen[] && sse_recoverable_connection_error(e)
-                sse_emit_stream_interrupted!(f, assistant_message, started, ended, e)
-                stream_failed[] = true
-            else
-                rethrow()
-            end
+            handle_sse_stream_error(
+                e, f, assistant_message, started, ended, events_seen;
+                on_status_error = () -> (stream_failed[] = true),
+                on_interrupted = () -> (stream_failed[] = true),
+            )
         end
 
         if started[] && !ended[]
