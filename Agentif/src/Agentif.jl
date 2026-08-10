@@ -3,7 +3,7 @@ module Agentif
 using Base64, Dates, HTTP, InteractiveUtils, JSON, JSONSchema, Logging, LoggingExtras, PtySessions, ScopedValues, StructUtils
 using Encid: UID8
 using LLMProviders
-using LLMProviders: Model, getModel, getProviders, getModels, calculateCost, registerModel!
+using LLMProviders: Model, getModel, getProviders, getModels, registerModel!
 using LLMProviders: OpenAIResponses, OpenAICompletions, AnthropicMessages, GoogleGenerativeAI, GoogleGeminiCli
 
 const CURRENT_EVALUATION_ID = ScopedValue{Union{Nothing, UID8}}(nothing)
@@ -39,7 +39,7 @@ export CompactionConfig, CompactionSummaryMessage, compact!
 export with_prompt, with_tools
 export CURRENT_EVALUATION_ID
 export resolve_log_level, with_log_level, debug_logging_enabled
-export Model, getModel, getProviders, getModels, calculateCost, registerModel!
+export Model, getModel, getProviders, getModels, registerModel!
 export OpenAIResponses, OpenAICompletions, AnthropicMessages, GoogleGenerativeAI, GoogleGeminiCli
 export @tool, tool_name, AgentTool
 export SkillMetadata, SkillRegistry, default_skill_dirs, discover_skills, create_skill_registry, reload_skills!

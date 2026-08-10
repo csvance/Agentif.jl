@@ -30,33 +30,7 @@ function _generated_headers(data::AbstractDict)
     return result
 end
 
-function _generated_cost_tiers(cost::AbstractDict)
-    values = get(() -> Any[], cost, "tiers")
-    values isa AbstractVector || error("generated model cost tiers must be an array")
-    tiers = ModelCostTier[]
-    for value in values
-        value isa AbstractDict || error("generated model cost tier must be an object")
-        push!(
-            tiers,
-            ModelCostTier(;
-                inputTokensAbove = Int(value["inputTokensAbove"]),
-                input = Float64(value["input"]),
-                output = Float64(value["output"]),
-                cacheRead = Float64(value["cacheRead"]),
-                cacheWrite = Float64(value["cacheWrite"]),
-            ),
-        )
-    end
-    return tiers
-end
-
 function _generated_model(data::AbstractDict)
-    cost_data = data["cost"]
-    cost_data isa AbstractDict || error("generated model cost must be an object")
-    cost = Dict{String, Float64}(
-        key => Float64(cost_data[key])
-        for key in ("input", "output", "cacheRead", "cacheWrite")
-    )
     return Model(;
         id = String(data["id"]),
         name = String(data["name"]),
@@ -65,12 +39,10 @@ function _generated_model(data::AbstractDict)
         baseUrl = String(data["baseUrl"]),
         reasoning = Bool(data["reasoning"]),
         input = String[String(value) for value in data["input"]],
-        cost,
         contextWindow = Int(data["contextWindow"]),
         maxTokens = Int(data["maxTokens"]),
         headers = _generated_headers(data),
         compat = _generated_optional_dict(data, "compat"),
-        costTiers = _generated_cost_tiers(cost_data),
         thinkingLevelMap = _generated_optional_dict(data, "thinkingLevelMap"),
     )
 end

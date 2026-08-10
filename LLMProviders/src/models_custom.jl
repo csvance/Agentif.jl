@@ -10,7 +10,6 @@ function _init_custom_models!()
             baseUrl = "https://cloudcode-pa.googleapis.com",
             reasoning = false,
             input = ["text", "image"],
-            cost = Dict("input" => 0.0, "output" => 0.0, "cacheRead" => 0.0, "cacheWrite" => 0.0),
             contextWindow = 1048576,
             maxTokens = 8192,
             headers = nothing
@@ -23,7 +22,6 @@ function _init_custom_models!()
             baseUrl = "https://cloudcode-pa.googleapis.com",
             reasoning = true,
             input = ["text", "image"],
-            cost = Dict("input" => 0.0, "output" => 0.0, "cacheRead" => 0.0, "cacheWrite" => 0.0),
             contextWindow = 1048576,
             maxTokens = 65535,
             headers = nothing
@@ -36,7 +34,6 @@ function _init_custom_models!()
             baseUrl = "https://cloudcode-pa.googleapis.com",
             reasoning = true,
             input = ["text", "image"],
-            cost = Dict("input" => 0.0, "output" => 0.0, "cacheRead" => 0.0, "cacheWrite" => 0.0),
             contextWindow = 1048576,
             maxTokens = 65535,
             headers = nothing
@@ -49,7 +46,6 @@ function _init_custom_models!()
             baseUrl = "https://cloudcode-pa.googleapis.com",
             reasoning = true,
             input = ["text", "image"],
-            cost = Dict("input" => 0.0, "output" => 0.0, "cacheRead" => 0.0, "cacheWrite" => 0.0),
             contextWindow = 1048576,
             maxTokens = 65535,
             headers = nothing
@@ -62,7 +58,6 @@ function _init_custom_models!()
             baseUrl = "https://cloudcode-pa.googleapis.com",
             reasoning = true,
             input = ["text", "image"],
-            cost = Dict("input" => 0.0, "output" => 0.0, "cacheRead" => 0.0, "cacheWrite" => 0.0),
             contextWindow = 1048576,
             maxTokens = 65535,
             headers = nothing
@@ -85,7 +80,6 @@ function _init_custom_models!()
             baseUrl = "https://chatgpt.com/backend-api",
             reasoning = true,
             input = ["text", "image"],
-            cost = Dict("input" => 0.0, "output" => 0.0, "cacheRead" => 0.0, "cacheWrite" => 0.0),
             contextWindow = context_window,
             maxTokens = max_tokens,
             headers = nothing,
