@@ -243,13 +243,18 @@ end
 """
     filter_dispatchable(models) -> (kept, dropped_by_api)
 
-Keep only models whose `api` Agentif can dispatch. Returns the kept models and
-a count of dropped models per undispatchable api value.
+Validate every model, then keep only models whose `api` Agentif can dispatch.
+Returns the kept models and a count of dropped models per undispatchable api
+value.
 """
 function filter_dispatchable(models::Vector{ParsedModel})
     kept = ParsedModel[]
     dropped = Dict{String, Int}()
     for m in models
+        # Validate every upstream record before filtering. Otherwise a malformed
+        # model can disappear only because its api is not dispatchable, hiding
+        # catalog schema drift that the generator promises to reject.
+        validate_model(m)
         api_value = validate_string_field(m, "api").value
         if api_value in DISPATCHABLE_APIS
             push!(kept, m)

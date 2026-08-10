@@ -130,6 +130,18 @@ const MODEL_B = """
         malformed = replace(MODEL_A, "  \"api\": \"openai-responses\",\n" => "")
         write(missing_api, """{"a":{"a":$malformed},"z":{"b":$MODEL_B}}""")
         @test_throws ErrorException generate(missing_api, joinpath(dir, "missing-api.jl"))
+
+        malformed_dropped = joinpath(dir, "malformed-dropped.json")
+        dropped_model = replace(
+            MODEL_B,
+            "  \"name\": \"Model B\",\n" => "",
+            "\"api\": \"anthropic-messages\"" => "\"api\": \"bedrock-converse-stream\"",
+            "\"provider\": \"z\"" => "\"provider\": \"bedrock\"",
+            "\"id\": \"b\"" => "\"id\": \"m\"",
+        )
+        write(malformed_dropped, """{"a":{"a":$MODEL_A},"bedrock":{"m":$dropped_model}}""")
+        @test_throws ErrorException generate(
+            malformed_dropped, joinpath(dir, "malformed-dropped.jl"))
     end
 end
 
