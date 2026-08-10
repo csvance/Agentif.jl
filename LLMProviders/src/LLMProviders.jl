@@ -9,6 +9,7 @@ include("models.jl")
 include("providers/openai_responses.jl")
 include("providers/openai_completions.jl")
 include("providers/anthropic_messages.jl")
+include("providers/google_shared.jl")
 include("providers/google_generative_ai.jl")
 include("providers/google_gemini_cli.jl")
 
