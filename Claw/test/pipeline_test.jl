@@ -108,6 +108,13 @@ const FAST = (; scan_interval_s = 0.05, min_refire_gap_s = 0.05, lane_backlog_wa
     try
         @test Claw._get_user_version(a.db) == Claw.CLAW_SCHEMA_VERSION
         @test a._writer.owns_db     # real file ⇒ dedicated write connection
+        # Session writes must not run on the handle that serves Claw's reads: a
+        # lazy read cursor pins that connection to an old WAL snapshot, and a
+        # write from a pinned handle can no longer upgrade once another
+        # connection commits (it fails with "database is locked" even after
+        # waiting out busy_timeout).
+        @test a.session_store.db !== a.db
+        @test a.session_store.db !== a._writer.db
 
         tables = Set{String}()
         for row in SQLite.DBInterface.execute(a.db, "SELECT name FROM sqlite_master WHERE type='table'")

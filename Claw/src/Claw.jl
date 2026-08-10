@@ -1417,8 +1417,25 @@ function AgentAssistant(db_path::String="";
     db_path = isempty(db_path) ? joinpath(pwd(), "$(something(name, "claw")).sqlite") : db_path
     db = SQLite.DB(db_path)
     _init_claw_schema!(db)
-    search_store = LocalSearch.Store(db)
-    session_store = Agentif.SQLiteSessionStore(db, search_store)
+    # The session store writes (entry row + search index) must not share `db`
+    # with Claw's readers. Reads on the shared handle can leave a lazy cursor
+    # mid-step, which under WAL pins that connection to an old read snapshot;
+    # once the writer connection commits, a write from the pinned handle can no
+    # longer upgrade and fails with "database is locked" even after waiting out
+    # busy_timeout. A dedicated handle keeps session writes off that snapshot.
+    # Same ownership rule as SQLiteWriter: a private in-memory database cannot be
+    # reopened, so those keep sharing the handle.
+    session_db = db
+    if !_is_private_memory_path(db_path)
+        try
+            session_db = _apply_connection_pragmas!(SQLite.DB(db_path))
+        catch e
+            @warn "Claw: failed to open dedicated session connection; sharing the main handle" db_path exception = (e, catch_backtrace())
+            session_db = db
+        end
+    end
+    search_store = LocalSearch.Store(session_db)
+    session_store = Agentif.SQLiteSessionStore(session_db, search_store)
     tempus_store = Tempus.SQLiteStore(db)
     scheduler = Tempus.Scheduler(tempus_store)
     config = AgentConfig(; name, provider, model_id, apikey, timezone, base_dir, enable_web, enable_coding)
