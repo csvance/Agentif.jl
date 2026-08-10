@@ -116,10 +116,8 @@ skipws(s::AbstractString, i::Int) = (while i <= lastindex(s) && isspace(s[i]); i
 """
     parse_value(s, i) -> (value, nextindex)
 
-Parse one inline TS/JSON value (string, number, bool, null, array, object).
-Only used for values that upstream emits on a single line: `input`, `compat`,
-`headers`, and every scalar. Multi-line blocks (`cost`) are handled by the
-line-oriented reader below.
+Parse one JSON value (string, number, bool, null, array, or object).
+This function is the recursive value parser used by `parse_models_json`.
 """
 function parse_value(s::AbstractString, i::Int)
     i = skipws(s, i)
