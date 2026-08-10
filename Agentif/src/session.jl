@@ -44,6 +44,7 @@ function get_entry end
 function get_branch_leaf end
 function set_branch_leaf! end
 function lock_branch end
+function with_session_write end
 
 # ─── InMemorySessionStore implementations ───
 

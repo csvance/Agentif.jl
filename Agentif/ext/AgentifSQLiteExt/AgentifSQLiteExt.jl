@@ -77,23 +77,65 @@ end
 mutable struct SQLiteSessionStore <: Agentif.SessionStore
     db::SQLite.DB
     search_store::LocalSearch.Store
+    write_search_store::LocalSearch.Store
+    execute_write::Function
+    write_lock::ReentrantLock
     branch_locks::Dict{String, ReentrantLock}
     branch_locks_lock::ReentrantLock
 end
 
-function Agentif.SQLiteSessionStore(db::SQLite.DB, search_store::LocalSearch.Store)
+function Agentif.SQLiteSessionStore(
+        db::SQLite.DB,
+        search_store::LocalSearch.Store;
+        write_search_store::LocalSearch.Store = search_store,
+        execute_write::Union{Nothing, Function} = nothing,
+    )
     Agentif.init_sqlite_session_schema!(db)
-    return SQLiteSessionStore(db, search_store, Dict{String, ReentrantLock}(), ReentrantLock())
+    executor = execute_write === nothing ? (f -> f(write_search_store.db)) : execute_write
+    return SQLiteSessionStore(
+        db,
+        search_store,
+        write_search_store,
+        executor,
+        ReentrantLock(),
+        Dict{String, ReentrantLock}(),
+        ReentrantLock(),
+    )
 end
 
 function Agentif.SQLiteSessionStore(db_path::String; kw...)
     db = SQLite.DB(db_path)
-    Agentif.init_sqlite_session_schema!(db)
     store = LocalSearch.Store(db; kw...)
-    return SQLiteSessionStore(db, store, Dict{String, ReentrantLock}(), ReentrantLock())
+    return Agentif.SQLiteSessionStore(db, store)
 end
 
 # ─── Store method implementations ───
+
+function _write_transaction(f::Function, store::SQLiteSessionStore)
+    return lock(store.write_lock) do
+        return store.execute_write() do db
+            db === store.write_search_store.db || error("SQLiteSessionStore write executor returned the wrong connection")
+            SQLite.execute(db, "BEGIN IMMEDIATE")
+            try
+                result = f(db, store.write_search_store)
+                SQLite.execute(db, "COMMIT")
+                return result
+            catch
+                if SQLite.intransaction(db)
+                    try
+                        SQLite.execute(db, "ROLLBACK")
+                    catch
+                    end
+                end
+                rethrow()
+            end
+        end
+    end
+end
+
+function Agentif.with_session_write(f::Function, store::SQLiteSessionStore)
+    return _write_transaction(f, store)
+end
 
 function session_entry_tags(entry::Agentif.SessionEntry)
     tags = ["session_entry"]
@@ -108,30 +150,32 @@ end
 
 function Agentif.append_entry!(store::SQLiteSessionStore, entry::Agentif.SessionEntry)
     entry_json = JSON.json(entry)
-    SQLite.execute(
-        store.db,
-        """INSERT INTO session_entries
-           (entry_id, parent_id, created_at, entry, is_compaction, first_kept_entry_id,
-            is_deleted, user_id, channel_id, search_channel_id, channel_flags, post_id)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-        (
-            entry.id,
-            entry.parent_id,
-            entry.created_at,
-            entry_json,
-            entry.is_compaction ? 1 : 0,
-            entry.first_kept_entry_id,
-            entry.is_deleted ? 1 : 0,
-            entry.user_id,
-            entry.channel_id,
-            entry.search_channel_id,
-            entry.channel_flags,
-            entry.post_id,
-        ),
-    )
-    doc_id = "session:entry:$(entry.id)"
-    tags = session_entry_tags(entry)
-    LocalSearch.load!(store.search_store, entry_json; id=doc_id, title="session", tags=tags)
+    _write_transaction(store) do db, search_store
+        SQLite.execute(
+            db,
+            """INSERT INTO session_entries
+               (entry_id, parent_id, created_at, entry, is_compaction, first_kept_entry_id,
+                is_deleted, user_id, channel_id, search_channel_id, channel_flags, post_id)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                entry.id,
+                entry.parent_id,
+                entry.created_at,
+                entry_json,
+                entry.is_compaction ? 1 : 0,
+                entry.first_kept_entry_id,
+                entry.is_deleted ? 1 : 0,
+                entry.user_id,
+                entry.channel_id,
+                entry.search_channel_id,
+                entry.channel_flags,
+                entry.post_id,
+            ),
+        )
+        doc_id = "session:entry:$(entry.id)"
+        tags = session_entry_tags(entry)
+        LocalSearch.load!(search_store, entry_json; id=doc_id, title="session", tags=tags)
+    end
     return nothing
 end
 
@@ -157,11 +201,13 @@ function Agentif.get_branch_leaf(store::SQLiteSessionStore, branch_id::String)
 end
 
 function Agentif.set_branch_leaf!(store::SQLiteSessionStore, branch_id::String, entry_id::String)
-    SQLite.execute(
-        store.db,
-        "INSERT OR REPLACE INTO session_branches (branch_id, leaf_entry_id) VALUES (?, ?)",
-        (branch_id, entry_id),
-    )
+    _write_transaction(store) do db, _
+        SQLite.execute(
+            db,
+            "INSERT OR REPLACE INTO session_branches (branch_id, leaf_entry_id) VALUES (?, ?)",
+            (branch_id, entry_id),
+        )
+    end
     return nothing
 end
 
@@ -206,30 +252,31 @@ end
 # ─── Scrub ───
 
 function Agentif.scrub_post!(store::SQLiteSessionStore, post_id::String)
-    # `post_id` is the platform message id. Entries written before the column
-    # existed used it as the entry id, so match either.
-    rows = SQLite.DBInterface.execute(
-        store.db,
-        """SELECT entry_id, entry FROM session_entries
-           WHERE (post_id = ? OR (post_id IS NULL AND entry_id = ?)) AND is_deleted = 0""",
-        (post_id, post_id),
-    ) |> SQLite.rowtable
-    isempty(rows) && return nothing
-    for row in rows
-        entry = JSON.parse(String(row.entry), Agentif.SessionEntry)
-        # Rewrite the stored entry without its messages: flagging is_deleted is
-        # not enough, the lineage walk replays whatever the entry JSON holds.
-        # Delete the search document first. If that fails, leave the row active
-        # so the caller can retry instead of silently retaining searchable text.
-        scrubbed = Agentif.scrubbed_entry(entry)
-        Base.delete!(store.search_store, "session:entry:$(row.entry_id)")
-        SQLite.execute(
-            store.db,
-            "UPDATE session_entries SET entry = ?, is_deleted = 1, user_id = NULL WHERE entry_id = ?",
-            (JSON.json(scrubbed), row.entry_id),
-        )
+    count = _write_transaction(store) do db, search_store
+        # `post_id` is the platform message id. Entries written before the column
+        # existed used it as the entry id, so match either.
+        rows = SQLite.DBInterface.execute(
+            db,
+            """SELECT entry_id, entry FROM session_entries
+               WHERE (post_id = ? OR (post_id IS NULL AND entry_id = ?)) AND is_deleted = 0""",
+            (post_id, post_id),
+        ) |> SQLite.rowtable
+        for row in rows
+            entry = JSON.parse(String(row.entry), Agentif.SessionEntry)
+            # Rewrite the stored entry without its messages: flagging is_deleted is
+            # not enough, the lineage walk replays whatever the entry JSON holds.
+            scrubbed = Agentif.scrubbed_entry(entry)
+            Base.delete!(search_store, "session:entry:$(row.entry_id)")
+            SQLite.execute(
+                db,
+                "UPDATE session_entries SET entry = ?, is_deleted = 1, user_id = NULL WHERE entry_id = ?",
+                (JSON.json(scrubbed), row.entry_id),
+            )
+        end
+        return length(rows)
     end
-    @info "scrub_post!: scrubbed session entries" post_id count = length(rows)
+    count == 0 && return nothing
+    @info "scrub_post!: scrubbed session entries" post_id count
     return nothing
 end
 
