@@ -73,7 +73,8 @@ function guarded(label, f; timeout_s = 60.0)
     r = fetch(t)
     if r isa Exception
         # Clean, classified failures are fine; anything else is a finding.
-        if r isa ArgumentError || r isa SystemError || r isa Base.IOError
+        if r isa ArgumentError || r isa SystemError || r isa Base.IOError ||
+           r isa Agentif.ToolArgumentError
             println("    (clean throw) $label: ", first(sprint(showerror, r), 90))
         else
             finding("$label: threw $(typeof(r)): $(first(sprint(showerror, r), 160))")
@@ -176,10 +177,13 @@ res = guarded("exec(interactive cat)", () -> call_tool(exec_tool,
     Dict("cmd" => "cat", "yield_time_ms" => 300)); timeout_s = 60.0)
 sid = nothing
 if res isa AbstractString
-    try
-        sid = get(JSON.parse(res), "session_id", nothing)
+    # `try` is a soft scope: assigning inside the block would shadow the global
+    # `sid` and silently skip this whole section. Take the value out instead.
+    sid = try
+        get(JSON.parse(res), "session_id", nothing)
     catch e
         finding("exec result is not JSON: $(first(res, 120))")
+        nothing
     end
 end
 if sid === nothing

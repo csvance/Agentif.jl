@@ -170,6 +170,73 @@ end
     Claw.shutdown!(assistant; timeout_s=5)
 end
 
+@testset "DB tools reject NUL bytes and repair invalid UTF-8" begin
+    assistant = make_assistant()
+    Claw.CURRENT_ASSISTANT[] = assistant
+
+    dm = DBMockChannel("dm:hostile"; is_private=true, is_group=false, user=Agentif.ChannelUser("U7", "Hedy"), post_id="post-h")
+    nul = "a\0b"
+
+    # NUL bytes cannot cross into the search backend's tokenizer, so every tool
+    # names the offending argument instead of throwing an opaque C string error.
+    Agentif.with_channel(dm) do
+        @test occursin("db_store: `key` contains NUL bytes", Claw.db_store(nul, "nul value", "nul-tag"))
+        @test occursin("db_store: `value` contains NUL bytes", Claw.db_store("nul-key", nul, "nul-tag"))
+        @test occursin("db_store: `tags` contains NUL bytes", Claw.db_store("nul-key", "nul value", nul))
+        @test occursin("db_search: `query` contains NUL bytes", Claw.db_search(nul))
+        @test occursin("db_search: `tags` contains NUL bytes", Claw.db_search("nul value", nul))
+        @test occursin("db_search: `after` contains NUL bytes", Claw.db_search("nul value", nothing, nul))
+        @test occursin("db_search: `before` contains NUL bytes", Claw.db_search("nul value", nothing, nothing, nul))
+        @test occursin("db_list_keys: `tags` contains NUL bytes", Claw.db_list_keys(nul))
+        @test occursin("db_list_keys: `after` contains NUL bytes", Claw.db_list_keys(nothing, nul))
+        @test occursin("db_list_keys: `before` contains NUL bytes", Claw.db_list_keys(nothing, nothing, nul))
+        @test occursin("db_remove: `key` contains NUL bytes", Claw.db_remove(nul))
+    end
+    # A rejected store writes nothing at all, not a row missing its search index.
+    @test !has_row(assistant.db, "SELECT 1 FROM claw_agent_data WHERE key = ?", ("nul-key",))
+
+    # Invalid and truncated UTF-8 are repaired rather than rejected: the entry
+    # stores, round-trips under the same argument, and every tool returns a
+    # string the model can read back.
+    for (name, bad) in (("invalid", String(UInt8[0xff, 0xfe, 0x80, 0x80]) * "tail"),
+                        ("truncated", "ok" * String(UInt8[0xe2, 0x9c])))
+        stored = Agentif.with_channel(dm) do
+            Claw.db_store("bad-$name-$bad", "hostile payload $bad", "$bad,hostile")
+        end
+        @test occursin("Stored 'bad-$name-", stored)
+        @test isvalid(String, stored)
+
+        row = Claw._fetch_one(assistant.db, "SELECT key, value FROM claw_agent_data WHERE value LIKE ?", ("hostile payload%",))
+        @test row !== nothing
+        @test isvalid(String, row.key)
+        @test isvalid(String, row.value)
+
+        found = Agentif.with_channel(dm) do
+            Claw.db_search(bad)
+        end
+        @test isvalid(String, found)
+        tag_filtered = Agentif.with_channel(dm) do
+            Claw.db_search("hostile payload", bad)
+        end
+        @test occursin("[bad-$name-", tag_filtered)
+        listed = Agentif.with_channel(dm) do
+            Claw.db_list_keys(bad)
+        end
+        @test occursin("bad-$name-", listed)
+        @test isvalid(String, listed)
+        @test isvalid(String, Claw.db_list_tags())
+
+        # Repair is deterministic, so the same hostile key removes what it stored.
+        removed = Agentif.with_channel(dm) do
+            Claw.db_remove("bad-$name-$bad")
+        end
+        @test occursin("Removed 'bad-$name-", removed)
+        @test isvalid(String, removed)
+    end
+
+    Claw.shutdown!(assistant; timeout_s=5)
+end
+
 @testset "DB tools concurrent writes are stable" begin
     assistant = make_assistant()
     Claw.CURRENT_ASSISTANT[] = assistant

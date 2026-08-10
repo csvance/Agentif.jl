@@ -108,6 +108,13 @@ const FAST = (; scan_interval_s = 0.05, min_refire_gap_s = 0.05, lane_backlog_wa
     try
         @test Claw._get_user_version(a.db) == Claw.CLAW_SCHEMA_VERSION
         @test a._writer.owns_db     # real file ⇒ dedicated write connection
+        # Session writes must not run on the handle that serves Claw's reads: a
+        # lazy read cursor pins that connection to an old WAL snapshot, and a
+        # write from a pinned handle can no longer upgrade once another
+        # connection commits (it fails with "database is locked" even after
+        # waiting out busy_timeout).
+        @test a.session_store.db !== a.db
+        @test a.session_store.db !== a._writer.db
 
         tables = Set{String}()
         for row in SQLite.DBInterface.execute(a.db, "SELECT name FROM sqlite_master WHERE type='table'")
@@ -138,6 +145,85 @@ const FAST = (; scan_interval_s = 0.05, min_refire_gap_s = 0.05, lane_backlog_wa
 
         # Re-running migrations on an existing database is a no-op.
         @test Claw._migrate_claw_schema!(a.db) == Claw.CLAW_SCHEMA_VERSION
+    finally
+        Claw.shutdown!(a; timeout_s = 5)
+        rm(path; force = true)
+        rm(path * "-wal"; force = true)
+        rm(path * "-shm"; force = true)
+    end
+end
+
+@testset "session persistence shares the pipeline writer" begin
+    path = tempname() * ".sqlite"
+    a = make_assistant(path)
+    try
+        # Pause inside LocalSearch after it has read the document metadata and
+        # before it writes the embedding rows. With a second write connection,
+        # the journal commit below makes that read snapshot stale and the chunk
+        # insert fails with SQLITE_BUSY_SNAPSHOT (extended code 517).
+        embedding_started = Base.Event()
+        search_stores = Any[a.session_store.search_store]
+        if hasproperty(a.session_store, :write_search_store)
+            push!(search_stores, a.session_store.write_search_store)
+        end
+        unique!(search_stores)
+        for search_store in search_stores
+            dims = search_store.dimensions
+            search_store.embed = texts -> begin
+                notify(embedding_started)
+                sleep(0.15)
+                zeros(Float32, dims, length(texts))
+            end
+        end
+
+        n = 8
+        start = Base.Event()
+        session_errors = Any[]
+        session_errors_lock = ReentrantLock()
+        tasks = map(1:n) do i
+            Threads.@spawn begin
+                wait(start)
+                entry = Agentif.SessionEntry(;
+                    id = "contention-$i",
+                    messages = Agentif.AgentMessage[Agentif.UserMessage("message $i")],
+                )
+                try
+                    Agentif.append_entry!(a.session_store, entry)
+                catch e
+                    lock(session_errors_lock) do
+                        push!(session_errors, e)
+                    end
+                end
+            end
+        end
+        writer_errors = Any[]
+        writer_task = Threads.@spawn begin
+            wait(embedding_started)
+            for i in 1:32
+                try
+                    Claw.execute_write(a._writer,
+                        "INSERT INTO claw_source_journal (ts, source, action, detail) VALUES (?, ?, ?, ?)",
+                        (time(), "test", "session-contention", string(i)))
+                catch e
+                    push!(writer_errors, e)
+                end
+            end
+        end
+
+        notify(start)
+        foreach(wait, tasks)
+        wait(writer_task)
+
+        @test isempty(session_errors)
+        @test isempty(writer_errors)
+        @test hasproperty(a.session_store, :write_search_store)
+        @test a.session_store.write_search_store.db === a._writer.db
+        @test Int(Claw._fetch_one(a.db,
+            "SELECT COUNT(*) AS n FROM session_entries WHERE entry_id LIKE 'contention-%'").n) == n
+        @test Int(Claw._fetch_one(a.db,
+            "SELECT COUNT(*) AS n FROM documents WHERE key LIKE 'session:entry:contention-%'").n) == n
+        @test Int(Claw._fetch_one(a.db,
+            "SELECT COUNT(*) AS n FROM chunks WHERE hash IN (SELECT hash FROM documents WHERE key LIKE 'session:entry:contention-%')").n) == n
     finally
         Claw.shutdown!(a; timeout_s = 5)
         rm(path; force = true)

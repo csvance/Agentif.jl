@@ -874,6 +874,27 @@ const TEMPUS_TOOLS = Agentif.AgentTool[LIST_JOBS_TOOL, ADD_JOB_TOOL, REMOVE_JOB_
 
 # ─── Agent data (scratch space) tools ───
 
+# The db tools are model-facing, so their string arguments are arbitrary bytes:
+# JSON can encode a NUL escape, and the model can echo back invalid UTF-8 it saw
+# in another tool's output. Repair the encoding before anything else, so the
+# char-level work downstream (strip/lowercase in _parse_tags, the search
+# backend's tokenizer) is total instead of throwing InvalidCharError.
+_repair_db_arg(::Nothing) = nothing
+_repair_db_arg(s::String) = LLMTools.repair_utf8(s)
+
+# NUL bytes survive UTF-8 repair (they are valid UTF-8) but cannot cross the C
+# string boundary into the search backend's tokenizer, which reports them as an
+# opaque `embedded NULs are not allowed in C strings`. Reject them up front,
+# naming the offending argument, so the model gets something it can act on and
+# no half-written row is left behind.
+function _db_nul_error(tool::String, args::Pair{String, <:Union{Nothing, String}}...)
+    for (name, value) in args
+        value !== nothing && contains(value, '\0') &&
+            return "$tool: `$name` contains NUL bytes (0x00), which cannot be stored or searched; strip them and retry."
+    end
+    return nothing
+end
+
 function _parse_tags(s::Union{Nothing, String})
     s === nothing && return String[]
     return unique(sort([lowercase(strip(t)) for t in split(s, ",") if !isempty(strip(t))]))
@@ -963,26 +984,28 @@ Gotchas:
 - Value is indexed for semantic search, so descriptive text is more findable than raw IDs.""" function db_store(key::String, value::String, tags::Union{Nothing, String} = nothing)
     a = get_current_assistant()
     a === nothing && return "No assistant initialized"
+    key, value, tags = _repair_db_arg(key), _repair_db_arg(value), _repair_db_arg(tags)
+    err = _db_nul_error("db_store", "key" => key, "value" => value, "tags" => tags)
+    err === nothing || return err
     parsed_tags = _parse_tags(tags)
     user_id, ch_id, _sch_id, ch_flags = Agentif.current_session_entry_metadata()
     ch = Agentif.CURRENT_CHANNEL[]
     post_id = ch !== nothing ? Agentif.entry_id(ch) : nothing
     now = time()
     lock(AGENT_DATA_WRITE_LOCK) do
-        _with_busy_retry() do
+        Agentif.with_session_write(a.session_store) do db, search_store
             # Preserve original created_at on update
-            existing = _fetch_one(a.db, "SELECT created_at FROM claw_agent_data WHERE key = ?", (key,))
+            existing = _fetch_one(db, "SELECT created_at FROM claw_agent_data WHERE key = ?", (key,))
             created = existing !== nothing ? existing.created_at : now
-            _exec!(a.db,
+            _exec!(db,
                 "INSERT OR REPLACE INTO claw_agent_data (key, value, created_at, updated_at, channel_id, channel_flags, user_id, post_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 (key, value, created, now, ch_id, ch_flags, user_id, post_id))
             # Update tags
-            _exec!(a.db, "DELETE FROM claw_agent_data_tags WHERE key = ?", (key,))
+            _exec!(db, "DELETE FROM claw_agent_data_tags WHERE key = ?", (key,))
             for tag in parsed_tags
-                _exec!(a.db,
+                _exec!(db,
                     "INSERT INTO claw_agent_data_tags (key, tag) VALUES (?, ?)", (key, tag))
             end
-            search_store = _get_search_store(a)
             vis_tags = _agent_data_visibility_tags(ch_id, ch_flags)
             LocalSearch.load!(search_store, value; id="agent_data:$key", title=key, tags=vcat(parsed_tags, ["claw_agent_data"], vis_tags))
             return nothing
@@ -1010,6 +1033,9 @@ Gotchas:
 - Time filters apply to the entry's created_at timestamp, not updated_at.""" function db_search(query::String, tags::Union{Nothing, String} = nothing, after::Union{Nothing, String} = nothing, before::Union{Nothing, String} = nothing, limit::Union{Nothing, Int} = nothing)
     a = get_current_assistant()
     a === nothing && return "No assistant initialized"
+    query, tags, after, before = _repair_db_arg(query), _repair_db_arg(tags), _repair_db_arg(after), _repair_db_arg(before)
+    err = _db_nul_error("db_search", "query" => query, "tags" => tags, "after" => after, "before" => before)
+    err === nothing || return err
     n = limit === nothing ? 10 : limit
     search_store = _get_search_store(a)
     max_fetch = n * 3
@@ -1074,6 +1100,9 @@ Gotchas:
 - Shows keys and metadata only, not values. Use db_search to see content.""" function db_list_keys(tags::Union{Nothing, String} = nothing, after::Union{Nothing, String} = nothing, before::Union{Nothing, String} = nothing, limit::Union{Nothing, Int} = nothing)
     a = get_current_assistant()
     a === nothing && return "No assistant initialized"
+    tags, after, before = _repair_db_arg(tags), _repair_db_arg(after), _repair_db_arg(before)
+    err = _db_nul_error("db_list_keys", "tags" => tags, "after" => after, "before" => before)
+    err === nothing || return err
     n = limit === nothing ? 50 : limit
     filter_tags = _parse_tags(tags)
     after_ts = _parse_time_filter(after; timezone = a.config.timezone)
@@ -1158,12 +1187,14 @@ Arguments:
 Returns confirmation or "Key not found" if the key doesn't exist.""" function db_remove(key::String)
     a = get_current_assistant()
     a === nothing && return "No assistant initialized"
+    key = _repair_db_arg(key)
+    err = _db_nul_error("db_remove", "key" => key)
+    err === nothing || return err
     removed = lock(AGENT_DATA_WRITE_LOCK) do
-        _with_busy_retry() do
-            existing = _fetch_one(a.db, "SELECT 1 FROM claw_agent_data WHERE key = ?", (key,))
+        Agentif.with_session_write(a.session_store) do db, search_store
+            existing = _fetch_one(db, "SELECT 1 FROM claw_agent_data WHERE key = ?", (key,))
             existing === nothing && return false
-            _exec!(a.db, "DELETE FROM claw_agent_data WHERE key = ?", (key,))
-            search_store = _get_search_store(a)
+            _exec!(db, "DELETE FROM claw_agent_data WHERE key = ?", (key,))
             LocalSearch.delete!(search_store, "agent_data:$key")
             return true
         end
@@ -1226,13 +1257,11 @@ function scrub_post!(assistant::AgentAssistant, post_id::String)
     Agentif.scrub_post!(assistant.session_store, post_id)
     # 2. Hard-delete agent data matching this post_id
     lock(AGENT_DATA_WRITE_LOCK) do
-        _with_busy_retry() do
-            db = assistant.db
+        Agentif.with_session_write(assistant.session_store) do db, search_store
             rows = SQLite.DBInterface.execute(db,
                 "SELECT key FROM claw_agent_data WHERE post_id = ?", (post_id,))
             keys = String[String(r.key) for r in rows]
             if !isempty(keys)
-                search_store = _get_search_store(assistant)
                 for key in keys
                     try
                         Base.delete!(search_store, "agent_data:$key")
@@ -1417,8 +1446,32 @@ function AgentAssistant(db_path::String="";
     db_path = isempty(db_path) ? joinpath(pwd(), "$(something(name, "claw")).sqlite") : db_path
     db = SQLite.DB(db_path)
     _init_claw_schema!(db)
-    search_store = LocalSearch.Store(db)
-    session_store = Agentif.SQLiteSessionStore(db, search_store)
+    writer = SQLiteWriter(db_path, db)
+    # LocalSearch performs a read/embedding/write sequence for each session
+    # entry. Bind its mutation-side store to the writer connection so another
+    # connection cannot commit between the read snapshot and the write upgrade.
+    write_search_store = execute_write(writer) do writer_db
+        LocalSearch.Store(writer_db)
+    end
+
+    # Reads keep a separate connection. A private in-memory database cannot be
+    # reopened, so it uses the shared connection and store.
+    session_db = db
+    if !_is_private_memory_path(db_path)
+        try
+            session_db = _apply_connection_pragmas!(SQLite.DB(db_path))
+        catch e
+            @warn "Claw: failed to open dedicated session connection; sharing the main handle" db_path exception = (e, catch_backtrace())
+            session_db = db
+        end
+    end
+    search_store = session_db === writer.db ? write_search_store : LocalSearch.Store(session_db)
+    session_store = Agentif.SQLiteSessionStore(
+        session_db,
+        search_store;
+        write_search_store,
+        execute_write = f -> execute_write(f, writer),
+    )
     tempus_store = Tempus.SQLiteStore(db)
     scheduler = Tempus.Scheduler(tempus_store)
     config = AgentConfig(; name, provider, model_id, apikey, timezone, base_dir, enable_web, enable_coding)
@@ -1432,7 +1485,7 @@ function AgentAssistant(db_path::String="";
         log_level,
         watcher,
         pipeline,
-        _writer = SQLiteWriter(db_path, db),
+        _writer = writer,
         _readers = ReaderPool(db_path, db),
         _sem = Base.Semaphore(max(1, pipeline.max_concurrent_evals)),
     )

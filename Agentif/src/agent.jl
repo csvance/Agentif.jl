@@ -200,6 +200,86 @@ end
     return :(string(getfield(tool, :func)($(call_args...))))
 end
 
+# Raised when a tool call's argument JSON does not match the tool's parameter
+# schema. `call_function_tool!` renders it back to the model, so the message has
+# to name the offending field in JSON vocabulary the model can act on, not the
+# Julia conversion error JSON.jl raises.
+struct ToolArgumentError <: Exception
+    message::String
+end
+
+Base.showerror(io::IO, e::ToolArgumentError) = print(io, e.message)
+
+function _expected_json_type(::Type{T}) where {T}
+    T isa Union && Nothing <: T &&
+        return string(_expected_json_type(Base.nonnothingtype(T)), " or null")
+    T === Nothing && return "null"
+    T <: AbstractString && return "a string"
+    T === Bool && return "a boolean"
+    T <: Integer && return "an integer"
+    T <: Real && return "a number"
+    T <: AbstractVector && return "an array"
+    T <: Union{AbstractDict, NamedTuple} && return "an object"
+    return "a value of type $(T)"
+end
+
+_received_json_type(x) = "a value of type $(typeof(x))"
+_received_json_type(::Nothing) = "null"
+_received_json_type(::AbstractString) = "a string"
+_received_json_type(::Bool) = "a boolean"
+_received_json_type(::Integer) = "an integer"
+_received_json_type(::Real) = "a number"
+_received_json_type(::AbstractVector) = "an array"
+_received_json_type(::AbstractDict) = "an object"
+
+# Ask JSON.jl itself whether a value is usable for a field, so the diagnosis
+# always agrees with the parse that just failed.
+function _accepts_json_value(::Type{T}, value) where {T}
+    try
+        JSON.parse(JSON.json(value), T)
+        return true
+    catch
+        return false
+    end
+end
+
+function _tool_argument_problems(obj::AbstractDict, ::Type{T}) where {T<:NamedTuple}
+    problems = String[]
+    for (name, FT) in zip(fieldnames(T), fieldtypes(T))
+        key = String(name)
+        if !haskey(obj, key)
+            FT >: Nothing || push!(problems, "missing required argument `$(key)` (expected $(_expected_json_type(FT)))")
+            continue
+        end
+        value = obj[key]
+        _accepts_json_value(FT, value) && continue
+        push!(problems, "argument `$(key)` expects $(_expected_json_type(FT)), but received $(_received_json_type(value))")
+    end
+    return problems
+end
+
+function _describe_tool_argument_error(arguments::String, ::Type{T}, err) where {T<:NamedTuple}
+    parsed = try
+        JSON.parse(arguments)
+    catch parse_err
+        # JSON.jl v1.7.1 throws a BoundsError out of its own error-reporting path
+        # when the input ends mid-token, so only its ArgumentError carries a
+        # message worth forwarding; anything else means the input ran out.
+        reason = parse_err isa ArgumentError ? parse_err.msg :
+            "the input ends unexpectedly (truncated or malformed)"
+        return "the arguments are not valid JSON: $(reason)"
+    end
+    parsed isa AbstractDict ||
+        return "expected a JSON object of arguments, but received $(_received_json_type(parsed))"
+    problems = _tool_argument_problems(parsed, T)
+    isempty(problems) && return caught_exception_message(err, "the arguments do not match the tool schema")
+    return join(problems, "; ")
+end
+
 function parse_tool_arguments(arguments::String, ::Type{T})::T where {T<:NamedTuple}
-    return JSON.parse(arguments, T)
+    try
+        return JSON.parse(arguments, T)
+    catch e
+        throw(ToolArgumentError(_describe_tool_argument_error(arguments, T, e)))
+    end
 end
