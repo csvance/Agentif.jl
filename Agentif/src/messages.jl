@@ -75,17 +75,6 @@ const StoredAgentMessage = Union{
     CompactionSummaryMessage,
 }
 
-function stored_agent_messages(messages::Vector{AgentMessage})
-    stored = StoredAgentMessage[]
-    sizehint!(stored, length(messages))
-    for message in messages
-        message isa StoredAgentMessage ||
-            throw(ArgumentError("Unsupported agent message type: $(typeof(message))."))
-        push!(stored, message)
-    end
-    return stored
-end
-
 const AGENT_MESSAGE_TYPE_USER = "user"
 const AGENT_MESSAGE_TYPE_ASSISTANT = "assistant"
 const AGENT_MESSAGE_TYPE_TOOL_RESULT = "tool_result"
@@ -122,15 +111,6 @@ message_text(msg::ToolResultMessage) = content_text(msg.content)
 message_text(msg::CompactionSummaryMessage) = msg.summary
 
 message_thinking(msg::AssistantMessage) = content_thinking(msg.content)
-
-function message_has_images(msg::AgentMessage)
-    if msg isa UserMessage || msg isa ToolResultMessage
-        for block in msg.content
-            block isa ImageContent && return true
-        end
-    end
-    return false
-end
 
 function append_text!(msg::AssistantMessage, delta::String)
     if isempty(msg.content) || !(msg.content[end] isa TextContent)
@@ -303,17 +283,4 @@ end
     # kept boundary with index arithmetic.
     persisted_prefix_count::Int = 0
     persisted_prefix_start::Int = 1
-end
-
-function set!(dest::AgentState, source::AgentState)
-    dest.messages = source.messages
-    dest.response_id = source.response_id
-    dest.usage = source.usage
-    dest.pending_tool_calls = source.pending_tool_calls
-    dest.most_recent_stop_reason = source.most_recent_stop_reason
-    dest.last_compaction = source.last_compaction
-    dest.context_tokens = source.context_tokens
-    dest.persisted_prefix_count = source.persisted_prefix_count
-    dest.persisted_prefix_start = source.persisted_prefix_start
-    return
 end

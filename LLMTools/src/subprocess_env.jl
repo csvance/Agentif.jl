@@ -1,7 +1,7 @@
 # subprocess_env.jl — minimal allowlisted environment for child processes (§2.4)
 #
-# PTY sessions, Julia workers and the codex CLI used to inherit the *whole* parent
-# environment, which for an always-on assistant means every provider API key, every
+# PTY sessions and Julia workers used to inherit the *whole* parent environment,
+# which for an always-on assistant means every provider API key, every
 # OAuth refresh token and every database password. A prompt-injected `echo
 # $ANTHROPIC_API_KEY` therefore exfiltrated the key through ordinary tool output.
 #
@@ -77,8 +77,8 @@ string. That is for callers whose spawn path **merges** rather than replaces:
 `ConcurrentUtilities.Worker` builds its command with `addenv(cmd, env)`, which
 inherits the full parent environment and then overlays what you passed — so handing
 it an allowlist alone changes nothing. Shadowing each denied name with `""` is the
-only way to blank it out without an upstream change. `setenv`-based spawns
-(`PtySessions`, the codex `Cmd`) replace the environment outright and do not need it.
+only way to blank it out without an upstream change. `PtySessions` uses `setenv`,
+which replaces the environment outright and does not need this option.
 
 Caveat: this is environment scrubbing, not a filesystem sandbox. A child can still
 read files available to the current OS user, including files below `HOME`.

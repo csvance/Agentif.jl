@@ -82,7 +82,7 @@ function estimate_message_tokens(msg::AgentMessage)
 end
 
 """
-    find_cut_point(messages::Vector{<:AgentMessage}, keep_recent_tokens::Int) -> Int
+    find_cut_point(messages::Vector{StoredAgentMessage}, keep_recent_tokens::Int) -> Int
 
 Walk backwards from the end of messages, accumulating token estimates.
 Returns the index of the first message to KEEP (messages[1:idx-1] get compacted).
@@ -131,11 +131,8 @@ function find_cut_point(messages::Vector{StoredAgentMessage}, keep_recent_tokens
     return 0  # no valid cut point found
 end
 
-find_cut_point(messages::Vector{AgentMessage}, keep_recent_tokens::Int) =
-    find_cut_point(stored_agent_messages(messages), keep_recent_tokens)
-
 """
-    format_messages_for_summary(messages::Vector{<:AgentMessage}) -> String
+    format_messages_for_summary(messages::Vector{StoredAgentMessage}) -> String
 
 Format discarded messages as readable text for the summarization prompt.
 """
@@ -165,9 +162,6 @@ function format_messages_for_summary(messages::Vector{StoredAgentMessage})
     end
     return join(parts, "\n\n")
 end
-
-format_messages_for_summary(messages::Vector{AgentMessage}) =
-    format_messages_for_summary(stored_agent_messages(messages))
 
 """
     generate_summary(agent, to_discard, existing_summary, config, model, abort) -> Union{Nothing, String}

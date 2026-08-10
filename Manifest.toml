@@ -238,19 +238,19 @@ uuid = "ac6e5ff7-fb65-4e79-a425-ec3bc9c03011"
 version = "1.12.0"
 
 [[deps.LLMOAuth]]
-deps = ["Base64", "Dates", "HTTP", "JSON", "OAuth"]
+deps = ["Dates", "HTTP", "JSON", "OAuth"]
 path = "LLMOAuth"
 uuid = "f3f4c4b3-4b8a-4e8c-9b4f-7b8e4e6e5b2d"
 version = "1.0.0"
 
 [[deps.LLMProviders]]
-deps = ["HTTP", "JSON", "JSONSchema", "Logging", "StructUtils", "UUIDs"]
+deps = ["HTTP", "JSON", "JSONSchema", "StructUtils", "UUIDs"]
 path = "LLMProviders"
 uuid = "e1f4c4b3-4b8a-4e8c-9b4f-7b8e4e6e5b2a"
 version = "1.0.0"
 
 [[deps.LLMTools]]
-deps = ["Agentif", "Base64", "ConcurrentUtilities", "Dates", "HTTP", "JSON", "LLMProviders", "Logging", "LoggingExtras", "PtySessions", "ScopedValues", "Sockets", "UUIDs"]
+deps = ["Agentif", "ConcurrentUtilities", "HTTP", "JSON", "PtySessions", "ScopedValues", "Sockets", "UUIDs"]
 path = "LLMTools"
 uuid = "d2f4c4b3-4b8a-4e8c-9b4f-7b8e4e6e5b2c"
 version = "1.0.0"

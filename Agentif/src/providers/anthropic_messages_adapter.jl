@@ -15,8 +15,6 @@ function anthropic_build_tools(
     return provider_tools
 end
 
-const ANTHROPIC_TOOL_RESULT_PLACEHOLDER = "No result provided"
-
 function anthropic_sanitize_tool_call_id(id::String)
     return replace(id, r"[^A-Za-z0-9_-]" => "_")
 end
@@ -50,47 +48,6 @@ function anthropic_tool_result_block(result::ToolResultMessage)
         content = anthropic_tool_result_content(result.content),
         is_error = result.is_error,
     )
-end
-
-function anthropic_insert_missing_tool_results(messages::Vector{StoredAgentMessage})
-    normalized = StoredAgentMessage[]
-    pending = ToolCallContent[]
-    resolved = Set{String}()
-    function flush_pending!()
-        isempty(pending) && return
-        for call in pending
-            if !(call.id in resolved)
-                @warn "Inserted synthetic tool_result for orphaned tool_use" tool_name = call.name call_id = call.id
-                push!(
-                    normalized, ToolResultMessage(call.id, call.name, ANTHROPIC_TOOL_RESULT_PLACEHOLDER; is_error = true)
-                )
-            end
-        end
-        empty!(pending)
-        empty!(resolved)
-        return
-    end
-    for msg in messages
-        if msg isa AssistantMessage
-            flush_pending!()
-            push!(normalized, msg)
-            if !isempty(msg.content)
-                empty!(pending)
-                empty!(resolved)
-                for block in msg.content
-                    block isa ToolCallContent && push!(pending, block)
-                end
-            end
-        elseif msg isa ToolResultMessage
-            !isempty(pending) && push!(resolved, msg.call_id)
-            push!(normalized, msg)
-        else
-            flush_pending!()
-            push!(normalized, msg)
-        end
-    end
-    flush_pending!()
-    return normalized
 end
 
 function anthropic_tool_name_maps(tools::Vector{<:AgentTool}, is_oauth::Bool)

@@ -72,53 +72,6 @@ function truncate_head(content::String; max_lines::Int = DEFAULT_MAX_LINES, max_
     )
 end
 
-function truncate_tail(content::String; max_lines::Int = DEFAULT_MAX_LINES, max_bytes::Int = DEFAULT_MAX_BYTES)
-    total_bytes = ncodeunits(content)
-    lines = split(content, "\n"; keepempty = true)
-    total_lines = length(lines)
-    if total_lines <= max_lines && total_bytes <= max_bytes
-        return TruncationResult(content, false, nothing, total_lines, total_bytes, total_lines, total_bytes, false, false, max_lines, max_bytes)
-    end
-
-    output_lines = String[]
-    output_bytes = 0
-    truncated_by = :lines
-    last_line_partial = false
-
-    for idx in length(lines):-1:1
-        length(output_lines) >= max_lines && break
-        line = lines[idx]
-        line_bytes = ncodeunits(line) + (!isempty(output_lines) ? 1 : 0)
-        if output_bytes + line_bytes > max_bytes
-            truncated_by = :bytes
-            if isempty(output_lines)
-                truncated_line = truncate_string_to_bytes_from_end(line, max_bytes)
-                push!(output_lines, truncated_line)
-                output_bytes = ncodeunits(truncated_line)
-                last_line_partial = true
-            end
-            break
-        end
-        pushfirst!(output_lines, line)
-        output_bytes += line_bytes
-    end
-
-    output_content = join(output_lines, "\n")
-    return TruncationResult(
-        output_content,
-        true,
-        truncated_by,
-        total_lines,
-        total_bytes,
-        length(output_lines),
-        ncodeunits(output_content),
-        last_line_partial,
-        false,
-        max_lines,
-        max_bytes,
-    )
-end
-
 function truncate_tool_output(content::String; label::String = "Output", hint::Union{Nothing, String} = nothing)
     # Tool results are JSON-encoded for the provider, so they must be valid
     # UTF-8 even when the underlying source emitted arbitrary bytes.
@@ -139,16 +92,6 @@ function truncate_tool_output(content::String; label::String = "Output", hint::U
         end
     end
     return output
-end
-
-function truncate_string_to_bytes_from_end(text::String, max_bytes::Int)
-    bytes = Vector{UInt8}(codeunits(text))
-    length(bytes) <= max_bytes && return text
-    start = length(bytes) - max_bytes + 1
-    while start <= length(bytes) && (bytes[start] & 0xc0) == 0x80
-        start += 1
-    end
-    return String(bytes[start:end])
 end
 
 function truncate_line(line::AbstractString; max_chars::Int = GREP_MAX_LINE_LENGTH)
@@ -231,15 +174,6 @@ function glob_to_regex(pattern::String)
     print(out, "\$")
     return Regex(String(take!(out)))
 end
-
-function command_has_absolute_path(command::String)
-    return occursin(r"(^|\s)(/|~)", command)
-end
-
-function shell_escape(text::AbstractString)
-    return "'" * replace(text, "'" => raw"'\''") * "'"
-end
-
 
 function strip_dir_suffix(entry::String)
     # `end - 1` is byte arithmetic: with a multi-byte char right before the
@@ -417,168 +351,6 @@ Examples:
     )
 end
 
-
-function create_codex_tool()
-    function extract_branch_name(command::Union{Nothing, AbstractString}, output::Union{Nothing, AbstractString})
-        cmd = command === nothing ? "" : String(command)
-        if occursin("git worktree add", cmd)
-            tokens = split(cmd)
-            for i in 1:(length(tokens) - 1)
-                if tokens[i] == "-b" || tokens[i] == "--branch"
-                    branch = strip(tokens[i + 1])
-                    isempty(branch) || return branch
-                end
-            end
-        end
-        text = output === nothing ? "" : String(output)
-        for pattern in (
-                r"branch ['\"]?([A-Za-z0-9._/-]+)['\"]?",
-                r"/worktrees/([A-Za-z0-9._/-]+)",
-            )
-            m = match(pattern, text)
-            m === nothing && continue
-            branch = strip(String(m.captures[1]))
-            isempty(branch) || return branch
-        end
-        return nothing
-    end
-
-    return @tool(
-        """Delegate a coding task to an autonomous Codex CLI agent with full shell and git access.
-
-Use this tool to hand off substantial, self-contained code changes (bug fixes, new features, refactors) to a separate agent that works independently in a git worktree. Do NOT use this for quick lookups, questions, or tasks that need conversational back-and-forth — use `subagent` instead.
-
-The Codex agent automatically:
-1. Detects the repo's default branch (main/master).
-2. Creates a git worktree on a new branch under `/worktrees/<branch>`.
-3. Makes code changes, commits, and pushes the branch.
-4. Cleans up the worktree. It does NOT open a PR.
-
-Arguments:
-- `prompt` (String, required): The task description. Be specific — include file paths, expected behavior, and acceptance criteria. The agent has no prior context.
-- `directory` (String, required): Absolute path to the git repository to work in. Must exist and be a directory.
-- `timeout` (Int or nothing, default: nothing): Max seconds to wait. Use for potentially long-running tasks. `nothing` means no timeout.
-
-Returns a Dict with keys: "session_id", "directory", "summary" (work done), "branch" (branch name or nothing), "success" (Bool), and optionally "errors".
-
-Examples:
-- `codex("Fix the off-by-one error in src/parser.jl line 42. Add a test.", "/path/to/repo")`
-- `codex("Add a CLI flag --verbose that enables debug logging throughout the app.", "/path/to/repo", 300)`""",
-        codex(prompt::String, directory::String, timeout::Union{Nothing, Int} = nothing) = begin
-            isempty(prompt) && throw(ArgumentError("prompt is required"))
-            isempty(directory) && throw(ArgumentError("directory is required"))
-            isdir(directory) || throw(ArgumentError("directory not found: $(directory)"))
-            codex_preamble = join(
-                (
-                    "Workflow requirements:",
-                    "1) Identify the repo default branch (main/master) via `git symbolic-ref --short refs/remotes/origin/HEAD` (strip `origin/`; fallback to `git remote show origin`).",
-                    "2) Check out the default branch in the main repo.",
-                    "3) Create `/worktrees` if needed and add a worktree named after the new branch: `git worktree add -b <branch> /worktrees/<branch> <default-branch>`.",
-                    "4) Do all work inside `/worktrees/<branch>`.",
-                    "5) Push the branch to the remote, then remove the worktree: `git worktree remove /worktrees/<branch>`.",
-                ), "\n"
-            )
-            full_prompt = codex_preamble * "\n\n" * prompt
-            codex_executable = get(ENV, "LLMTOOLS_CODEX_EXECUTABLE", "codex")
-            # `--yolo` means this subprocess runs arbitrary commands on the operator's
-            # behalf, so it is exactly the process that must not inherit the parent's
-            # credentials (§2.4). Codex's own auth lives in its config file, not the
-            # environment; anything else it needs goes through LLMTOOLS_ENV_ALLOWLIST.
-            codex_env = subprocess_env(; extra_allow = ["CODEX_HOME", "LLMTOOLS_CODEX_EXECUTABLE"])
-            # Invoke Codex directly. A shell adds no value here and a login shell can
-            # re-source credentials after the environment has been scrubbed.
-            codex_cmd = Cmd([
-                codex_executable, "exec", "--json", "--enable", "skills", "--yolo",
-                "--cd", directory, "--skip-git-repo-check", full_prompt,
-            ])
-            cmd = Cmd(setenv(codex_cmd, codex_env), ignorestatus = true)
-            stderr_buf = IOBuffer()
-            process = open(pipeline(cmd, stderr = stderr_buf))
-            output_task = @async read(process, String)
-            timed_out = false
-            apply_timeout = timeout !== nothing && timeout > 0
-            if apply_timeout
-                status = timedwait(() -> istaskdone(output_task), timeout)
-                status == :timed_out && (
-                    timed_out = true; try
-                        Base.kill(process)
-                    catch
-                    end
-                )
-            end
-            stdout_text = fetch(output_task)
-            close(process)
-            stderr_text = String(take!(stderr_buf))
-            if timed_out
-                @warn "Codex tool timed out" directory timeout_s = timeout
-                error("Codex timed out after $(timeout) seconds")
-            end
-
-            session_id = nothing
-            agent_messages = String[]
-            branch_name = nothing
-            errors = String[]
-
-            for line in split(stdout_text, "\n"; keepempty = false)
-                try
-                    parsed = JSON.parse(line)
-                    event_type = get(() -> nothing, parsed, "type")
-                    if event_type == "thread.started"
-                        session_id = get(() -> nothing, parsed, "thread_id")
-                        session_id !== nothing && (session_id = String(session_id))
-                    elseif event_type == "item.completed"
-                        item = get(() -> nothing, parsed, "item")
-                        item isa AbstractDict || continue
-                        item_type = get(() -> nothing, item, "type")
-                        if item_type == "agent_message"
-                            msg = get(() -> nothing, item, "text")
-                            msg !== nothing && push!(agent_messages, String(msg))
-                        elseif item_type == "command_execution"
-                            cmd = get(() -> nothing, item, "command")
-                            output = get(() -> "", item, "aggregated_output")
-                            exit_code = get(() -> nothing, item, "exit_code")
-                            if branch_name === nothing
-                                extracted_branch = extract_branch_name(cmd, output)
-                                extracted_branch !== nothing && (branch_name = extracted_branch)
-                            end
-                            if exit_code !== nothing && exit_code != 0
-                                err = "Command failed: $(cmd)\nExit code: $(exit_code)\nOutput: $(output)"
-                                @warn "Codex command failed" directory command = cmd exit_code
-                                push!(errors, err)
-                            end
-                        end
-                    end
-                catch
-                end
-            end
-
-            if !isempty(stderr_text)
-                @warn "Codex stderr output" directory stderr_preview = truncate_tool_output(stderr_text; label = "stderr")
-                push!(errors, "Codex stderr: $(stderr_text)")
-            end
-
-            summary = join(agent_messages, "\n\n")
-            summary = truncate_tool_output(summary; label = "Summary")
-            if !isempty(errors)
-                truncated_errors = String[]
-                for err in errors
-                    push!(truncated_errors, truncate_tool_output(String(err); label = "Error"))
-                end
-                errors = truncated_errors
-            end
-            result = Dict{String, Any}(
-                "session_id" => session_id,
-                "directory" => directory,
-                "summary" => summary,
-                "branch" => branch_name,
-                "success" => isempty(errors),
-            )
-            !isempty(errors) && (result["errors"] = errors)
-            return result
-        end,
-    )
-end
-
 function subagent_evaluate(child::Agent, input_message::String)
     return evaluate(child, input_message)
 end
@@ -591,7 +363,7 @@ function create_subagent_tool(parent_provider::Function)
     return @tool(
         """Spawn a child agent to perform an isolated sub-task and return its text response synchronously.
 
-Use this tool when you need to delegate a well-defined task (research, analysis, summarization, focused reasoning) to a separate context window, keeping the parent conversation clean. The subagent inherits the parent's model, API key, and tools (except `subagent` itself by default). Do NOT use this for code changes that need git/shell access — use `codex` instead.
+Use this tool when you need to delegate a well-defined task (research, analysis, summarization, focused reasoning) to a separate context window, keeping the parent conversation clean. The subagent inherits the parent's model, API key, and tools (except `subagent` itself by default). Do NOT use this for code changes that need git/shell access.
 
 This call BLOCKS until the subagent finishes. The subagent's conversation history is discarded after it returns — only the final response text comes back to you.
 
@@ -872,16 +644,10 @@ function all_tools(base_dir::AbstractString = pwd(); parent::Union{Nothing, Agen
         "grep" => create_grep_tool(base_dir),
         "find" => create_find_tool(base_dir),
         "ls" => create_ls_tool(base_dir),
-        "codex" => create_codex_tool(),
     )
     parent !== nothing && (tools["subagent"] = create_subagent_tool(parent))
     insert_terminal_tools!(tools, base_dir)
     workers && insert_worker_tools!(tools)
-    return tools
-end
-
-function append_worker_tools!(tools::Vector{AgentTool})
-    append!(tools, create_worker_tools())
     return tools
 end
 
@@ -1640,104 +1406,6 @@ end
 #==============================================================================#
 
 const SEARCH_MAX_RESULTS = 20
-
-"""
-Parse DuckDuckGo HTML search results from html.duckduckgo.com.
-Returns a vector of (title, url, snippet) tuples.
-Filters out ads (URLs containing duckduckgo.com/y.js).
-"""
-function parse_duckduckgo_html_results(html::String)
-    results = Tuple{String, String, String}[]
-
-    # Find result__a links (title + URL)
-    result_links = collect(eachmatch(r"class=\"result__a\"[^>]*href=\"([^\"]+)\"[^>]*>([^<]+)</a>"si, html))
-
-    # Find result__snippet elements
-    snippets = collect(eachmatch(r"class=\"result__snippet\"[^>]*>([^<]*(?:<[^>]+>[^<]*)*)</a>"si, html))
-
-    for (i, link_match) in enumerate(result_links)
-        url = String(link_match.captures[1])
-        title = String(link_match.captures[2])
-
-        # Skip ads (DDG ad URLs contain /y.js or go through duckduckgo.com redirect)
-        occursin("duckduckgo.com/y.js", url) && continue
-        occursin("/y.js?", url) && continue
-
-        # Decode HTML entities in URL
-        url = replace(url, "&amp;" => "&")
-
-        # Clean title
-        title = strip(replace(title, r"\s+" => " "))
-
-        # Get snippet if available
-        snippet = ""
-        if i <= length(snippets)
-            raw_snippet = snippets[i].captures[1]
-            snippet = replace(raw_snippet, r"<[^>]+>" => "")  # Strip HTML tags
-            snippet = strip(replace(snippet, r"\s+" => " "))
-        end
-
-        push!(results, (title, url, snippet))
-    end
-
-    return results
-end
-
-"""
-Parse DuckDuckGo HTML search results (legacy parser).
-Returns a vector of (title, url, snippet) tuples.
-"""
-function parse_duckduckgo_results(html::String)
-    results = Tuple{String, String, String}[]
-
-    # DuckDuckGo uses class="result" for each result
-    # This is a simplified parser - DDG's HTML structure can vary
-    result_blocks = eachmatch(r"<div[^>]*class=\"[^\"]*result[^\"]*\"[^>]*>(.*?)</div>\s*(?=<div[^>]*class=\"[^\"]*result|$)"si, html)
-
-    for m in result_blocks
-        block = m.captures[1]
-
-        # Extract title and URL from the result link
-        title_match = match(r"<a[^>]*class=\"[^\"]*result__a[^\"]*\"[^>]*href=\"([^\"]+)\"[^>]*>([^<]*(?:<[^>]+>[^<]*)*)</a>"si, block)
-        if title_match === nothing
-            # Alternative pattern
-            title_match = match(r"<a[^>]*href=\"([^\"]+)\"[^>]*class=\"[^\"]*result[^\"]*\"[^>]*>([^<]*(?:<[^>]+>[^<]*)*)</a>"si, block)
-        end
-
-        title_match === nothing && continue
-
-        url = title_match.captures[1]
-        title = replace(title_match.captures[2], r"<[^>]+>" => "")  # Strip HTML tags
-
-        # Skip DDG internal links
-        startswith(url, "/") && continue
-        occursin("duckduckgo.com", url) && continue
-
-        # Extract snippet
-        snippet = ""
-        snippet_match = match(r"<a[^>]*class=\"[^\"]*result__snippet[^\"]*\"[^>]*>([^<]*(?:<[^>]+>[^<]*)*)</a>"si, block)
-        if snippet_match !== nothing
-            snippet = replace(snippet_match.captures[1], r"<[^>]+>" => "")
-        end
-
-        # Clean up text
-        title = strip(replace(title, r"\s+" => " "))
-        snippet = strip(replace(snippet, r"\s+" => " "))
-
-        # Decode URL if needed (DDG sometimes encodes URLs)
-        if startswith(url, "//duckduckgo.com/l/?uddg=")
-            # Extract actual URL from DDG redirect
-            url_match = match(r"uddg=([^&]+)", url)
-            if url_match !== nothing
-                url = HTTP.unescapeuri(url_match.captures[1])
-            end
-        end
-
-        push!(results, (title, url, snippet))
-    end
-
-    return results
-end
 
 """
 Parse DuckDuckGo Lite results (simpler HTML structure).

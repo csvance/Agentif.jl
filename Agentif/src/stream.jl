@@ -137,6 +137,51 @@ function sse_emit_stream_interrupted!(
     return
 end
 
+# Shared catch-block handling for a failed SSE stream request: expected aborts
+# are swallowed, an HTTP.StatusError is surfaced as an AgentErrorEvent carrying
+# the provider's error message, a recoverable connection drop after events
+# already flowed keeps the partial message, and anything else rethrows (this
+# helper must be called from inside the catch block). The per-arm failure
+# bookkeeping is injected via the two thunks.
+function handle_sse_stream_error(
+        e,
+        f::Function,
+        assistant_message::AssistantMessage,
+        started::Base.RefValue{Bool},
+        ended::Base.RefValue{Bool},
+        events_seen::Base.RefValue{Bool};
+        on_status_error::Function,
+        on_interrupted::Function,
+    )
+    if e isa StopStreaming
+        # Expected abort
+    elseif e isa HTTP.StatusError
+        if !started[]
+            started[] = true
+            f(MessageStartEvent(:assistant, assistant_message))
+        end
+        if !ended[]
+            ended[] = true
+            f(MessageEndEvent(:assistant, assistant_message))
+        end
+        error_body = String(e.response.body)
+        error_msg = try
+            err_json = JSON.parse(error_body)
+            get(get(() -> Dict(), err_json, "error"), "message", "HTTP $(e.status)")
+        catch
+            "HTTP $(e.status): $error_body"
+        end
+        f(AgentErrorEvent(ErrorException(error_msg)))
+        on_status_error()
+    elseif events_seen[] && sse_recoverable_connection_error(e)
+        sse_emit_stream_interrupted!(f, assistant_message, started, ended, e)
+        on_interrupted()
+    else
+        rethrow()
+    end
+    return
+end
+
 mutable struct ToolCallAccumulator
     id::Union{Nothing, String}
     name::Union{Nothing, String}
@@ -330,8 +375,7 @@ google_supports_multimodal_function_response(model_id::String) = occursin("gemin
 include("providers/openai_responses_adapter.jl")
 include("providers/openai_completions_adapter.jl")
 include("providers/anthropic_messages_adapter.jl")
-include("providers/google_generative_adapter.jl")
-include("providers/google_gemini_cli_adapter.jl")
+include("providers/google_adapter.jl")
 include("providers/openai_codex.jl")
 
 
@@ -356,30 +400,19 @@ const OAUTH_BACKEND = Ref{AbstractOAuthBackend}(MissingOAuthBackend())
 get_codex_token(::AbstractOAuthBackend) = throw(ArgumentError("Codex OAuth token provider unavailable; load `LLMOAuth` and run `LLMOAuth.codex_login()` first, or pass an explicit `apikey`"))
 get_anthropic_token(::AbstractOAuthBackend) = throw(ArgumentError("Anthropic OAuth token provider unavailable; load `LLMOAuth` and run `LLMOAuth.anthropic_login()` first, or pass an explicit `apikey`"))
 
-if TRIMMED_BUILD
-    model_request_kw(::Model) = (;)
-else
-    model_request_kw(model::Model) = model.kw
-end
+model_request_kw(model::Model) = model.kw
 
-if TRIMMED_BUILD
-    function resolve_oauth_apikey(provider::Symbol, apikey::AbstractString)
-        apikey != "OAUTH" && return apikey
-        throw(ArgumentError("OAuth token extensions are unavailable in a trimmed Agentif build for provider $(provider)."))
+function resolve_oauth_apikey(provider::Symbol, apikey::AbstractString; backend::AbstractOAuthBackend = OAUTH_BACKEND[])
+    apikey != "OAUTH" && return apikey
+    if provider == :codex
+        token = get_codex_token(backend)
+    elseif provider == :anthropic
+        token = get_anthropic_token(backend)
+    else
+        throw(ArgumentError("Unsupported OAuth provider: $(provider)"))
     end
-else
-    function resolve_oauth_apikey(provider::Symbol, apikey::AbstractString; backend::AbstractOAuthBackend = OAUTH_BACKEND[])
-        apikey != "OAUTH" && return apikey
-        if provider == :codex
-            token = get_codex_token(backend)
-        elseif provider == :anthropic
-            token = get_anthropic_token(backend)
-        else
-            throw(ArgumentError("Unsupported OAuth provider: $(provider)"))
-        end
-        token isa AbstractString && !isempty(token) || throw(ArgumentError("OAuth token provider for $(provider) must return a non-empty String token"))
-        return token
-    end
+    token isa AbstractString && !isempty(token) || throw(ArgumentError("OAuth token provider for $(provider) must return a non-empty String token"))
+    return token
 end
 
 function stream(
@@ -520,32 +553,11 @@ function stream(
                 )
             end
         catch e
-            if e isa StopStreaming
-                # Expected abort
-            elseif e isa HTTP.StatusError
-                if !started[]
-                    started[] = true
-                    f(MessageStartEvent(:assistant, assistant_message))
-                end
-                if !ended[]
-                    ended[] = true
-                    f(MessageEndEvent(:assistant, assistant_message))
-                end
-                error_body = String(e.response.body)
-                error_msg = try
-                    err_json = JSON.parse(error_body)
-                    get(get(() -> Dict(), err_json, "error"), "message", "HTTP $(e.status)")
-                catch
-                    "HTTP $(e.status): $error_body"
-                end
-                f(AgentErrorEvent(ErrorException(error_msg)))
-                response_status[] = "failed"
-            elseif events_seen[] && sse_recoverable_connection_error(e)
-                sse_emit_stream_interrupted!(f, assistant_message, started, ended, e)
-                response_status[] = "failed"
-            else
-                rethrow()
-            end
+            handle_sse_stream_error(
+                e, f, assistant_message, started, ended, events_seen;
+                on_status_error = () -> (response_status[] = "failed"),
+                on_interrupted = () -> (response_status[] = "failed"),
+            )
         end
 
         if started[] && !ended[]
@@ -679,32 +691,11 @@ function stream(
                     )
                 end
             catch e
-                if e isa StopStreaming
-                    # Expected abort
-                elseif e isa HTTP.StatusError
-                    if !started[]
-                        started[] = true
-                        f(MessageStartEvent(:assistant, assistant_message))
-                    end
-                    if !ended[]
-                        ended[] = true
-                        f(MessageEndEvent(:assistant, assistant_message))
-                    end
-                    error_body = String(e.response.body)
-                    error_msg = try
-                        err_json = JSON.parse(error_body)
-                        get(get(() -> Dict(), err_json, "error"), "message", "HTTP $(e.status)")
-                    catch
-                        "HTTP $(e.status): $error_body"
-                    end
-                    f(AgentErrorEvent(ErrorException(error_msg)))
-                    latest_finish[] = "error"
-                elseif events_seen[] && sse_recoverable_connection_error(e)
-                    sse_emit_stream_interrupted!(f, assistant_message, started, ended, e)
-                    stream_failed[] = true
-                else
-                    rethrow()
-                end
+                handle_sse_stream_error(
+                    e, f, assistant_message, started, ended, events_seen;
+                    on_status_error = () -> (latest_finish[] = "error"),
+                    on_interrupted = () -> (stream_failed[] = true),
+                )
             end
 
             if started[] && !ended[]
@@ -1087,32 +1078,11 @@ function stream(
                         )
                     end
                 catch e
-                    if e isa StopStreaming
-                    elseif e isa HTTP.StatusError
-                        if !started[]
-                            started[] = true
-                            f(MessageStartEvent(:assistant, assistant_message))
-                        end
-                        if !ended[]
-                            ended[] = true
-                            f(MessageEndEvent(:assistant, assistant_message))
-                        end
-                        error_body = String(e.response.body)
-                        error_msg = try
-                            err_json = JSON.parse(error_body)
-                            err_obj = get(() -> Dict(), err_json, "error")
-                            get(() -> "HTTP $(e.status)", err_obj, "message")
-                        catch
-                            "HTTP $(e.status): $error_body"
-                        end
-                        f(AgentErrorEvent(ErrorException(error_msg)))
-                        stop_reason[] = "error"
-                    elseif events_seen[] && sse_recoverable_connection_error(e)
-                        sse_emit_stream_interrupted!(f, assistant_message, started, ended, e)
-                        stream_failed[] = true
-                    else
-                        rethrow()
-                    end
+                    handle_sse_stream_error(
+                        e, f, assistant_message, started, ended, events_seen;
+                        on_status_error = () -> (stop_reason[] = "error"),
+                        on_interrupted = () -> (stream_failed[] = true),
+                    )
                 end
 
                 add_usage!(total_usage, anthropic_usage_from_response(latest_usage[]))
@@ -1201,32 +1171,11 @@ function stream(
                 )
             end
         catch e
-            if e isa StopStreaming
-                # Expected abort
-            elseif e isa HTTP.StatusError
-                if !started[]
-                    started[] = true
-                    f(MessageStartEvent(:assistant, assistant_message))
-                end
-                if !ended[]
-                    ended[] = true
-                    f(MessageEndEvent(:assistant, assistant_message))
-                end
-                error_body = String(e.response.body)
-                error_msg = try
-                    err_json = JSON.parse(error_body)
-                    get(get(() -> Dict(), err_json, "error"), "message", "HTTP $(e.status)")
-                catch
-                    "HTTP $(e.status): $error_body"
-                end
-                f(AgentErrorEvent(ErrorException(error_msg)))
-                stream_failed[] = true
-            elseif events_seen[] && sse_recoverable_connection_error(e)
-                sse_emit_stream_interrupted!(f, assistant_message, started, ended, e)
-                stream_failed[] = true
-            else
-                rethrow()
-            end
+            handle_sse_stream_error(
+                e, f, assistant_message, started, ended, events_seen;
+                on_status_error = () -> (stream_failed[] = true),
+                on_interrupted = () -> (stream_failed[] = true),
+            )
         end
 
         if started[] && !ended[]
@@ -1310,32 +1259,11 @@ function stream(
                 )
             end
         catch e
-            if e isa StopStreaming
-                # Expected abort
-            elseif e isa HTTP.StatusError
-                if !started[]
-                    started[] = true
-                    f(MessageStartEvent(:assistant, assistant_message))
-                end
-                if !ended[]
-                    ended[] = true
-                    f(MessageEndEvent(:assistant, assistant_message))
-                end
-                error_body = String(e.response.body)
-                error_msg = try
-                    err_json = JSON.parse(error_body)
-                    get(get(() -> Dict(), err_json, "error"), "message", "HTTP $(e.status)")
-                catch
-                    "HTTP $(e.status): $error_body"
-                end
-                f(AgentErrorEvent(ErrorException(error_msg)))
-                stream_failed[] = true
-            elseif events_seen[] && sse_recoverable_connection_error(e)
-                sse_emit_stream_interrupted!(f, assistant_message, started, ended, e)
-                stream_failed[] = true
-            else
-                rethrow()
-            end
+            handle_sse_stream_error(
+                e, f, assistant_message, started, ended, events_seen;
+                on_status_error = () -> (stream_failed[] = true),
+                on_interrupted = () -> (stream_failed[] = true),
+            )
         end
 
         if started[] && !ended[]
@@ -1351,16 +1279,10 @@ function stream(
     elseif api isa Val{Symbol("openai-codex-responses")}
         apikey isa AbstractString || throw(ArgumentError("apikey must be a String for provider $(model.provider)"))
         apikey = resolve_oauth_apikey(:codex, apikey)
-        if TRIMMED_BUILD
-            codex_options = trimmed_codex_options(kw_nt)
-            account_id = resolve_codex_account_id(
-                codex_options.account_id, String(apikey))
-        else
-            account_id = get(() -> nothing, kw_nt, :account_id)
-            account_id === nothing &&
-                (account_id = get(() -> nothing, kw_nt, :accountId))
-            account_id = resolve_codex_account_id(account_id, String(apikey))
-        end
+        account_id = get(() -> nothing, kw_nt, :account_id)
+        account_id === nothing &&
+            (account_id = get(() -> nothing, kw_nt, :accountId))
+        account_id = resolve_codex_account_id(account_id, String(apikey))
         account_id === nothing && throw(ArgumentError("Missing `account_id` for openai-codex provider and unable to infer it from access token"))
 
         assistant_message = assistant_message_for_model(model; response_id = state.response_id)
@@ -1370,47 +1292,35 @@ function stream(
         response_status = Ref{Union{Nothing, String}}(nothing)
         tool_call_accumulators = Dict{String, ToolCallAccumulator}()
 
-        if TRIMMED_BUILD
-            codex_kw = (;)
-            session_id = codex_options.session_id
-            reasoning_effort = codex_options.reasoning_effort
-            reasoning_summary = codex_options.reasoning_summary
-            text_verbosity = codex_options.text_verbosity
-            include_opt = codex_options.include_opt
-            max_tokens = codex_options.max_tokens
-            transport = codex_options.transport
-            retry_settings = codex_options.retry_settings
-        else
-            codex_kw = Dict{Symbol, Any}(pairs(kw_nt))
-            haskey(codex_kw, :instructions) && delete!(codex_kw, :instructions)
-            haskey(codex_kw, :account_id) && delete!(codex_kw, :account_id)
-            haskey(codex_kw, :accountId) && delete!(codex_kw, :accountId)
+        codex_kw = Dict{Symbol, Any}(pairs(kw_nt))
+        haskey(codex_kw, :instructions) && delete!(codex_kw, :instructions)
+        haskey(codex_kw, :account_id) && delete!(codex_kw, :account_id)
+        haskey(codex_kw, :accountId) && delete!(codex_kw, :accountId)
 
-            session_id = pop!(codex_kw, :session_id, nothing)
-            session_id === nothing &&
-                (session_id = pop!(codex_kw, :sessionId, nothing))
+        session_id = pop!(codex_kw, :session_id, nothing)
+        session_id === nothing &&
+            (session_id = pop!(codex_kw, :sessionId, nothing))
 
-            reasoning_effort = pop!(codex_kw, :reasoning_effort, nothing)
-            reasoning_effort === nothing &&
-                (reasoning_effort = pop!(codex_kw, :reasoningEffort, nothing))
-            if reasoning_effort === nothing && haskey(codex_kw, :reasoning)
-                reasoning_effort = pop!(codex_kw, :reasoning, nothing)
-            end
-            reasoning_summary = pop!(codex_kw, :reasoning_summary, nothing)
-            reasoning_summary === nothing &&
-                (reasoning_summary = pop!(codex_kw, :reasoningSummary, nothing))
-            text_verbosity = pop!(codex_kw, :textVerbosity, nothing)
-            text_verbosity === nothing &&
-                (text_verbosity = pop!(codex_kw, :text_verbosity, nothing))
-            include_opt = pop!(codex_kw, :include, nothing)
-            max_tokens = pop!(codex_kw, :maxTokens, nothing)
-            transport = normalize_codex_transport(codex_pop_option!(
-                codex_kw, :transport, :transportMode, :websocket, :websockets))
-            retry_settings = codex_retry_settings!(codex_kw)
+        reasoning_effort = pop!(codex_kw, :reasoning_effort, nothing)
+        reasoning_effort === nothing &&
+            (reasoning_effort = pop!(codex_kw, :reasoningEffort, nothing))
+        if reasoning_effort === nothing && haskey(codex_kw, :reasoning)
+            reasoning_effort = pop!(codex_kw, :reasoning, nothing)
         end
+        reasoning_summary = pop!(codex_kw, :reasoning_summary, nothing)
+        reasoning_summary === nothing &&
+            (reasoning_summary = pop!(codex_kw, :reasoningSummary, nothing))
+        text_verbosity = pop!(codex_kw, :textVerbosity, nothing)
+        text_verbosity === nothing &&
+            (text_verbosity = pop!(codex_kw, :text_verbosity, nothing))
+        include_opt = pop!(codex_kw, :include, nothing)
+        max_tokens = pop!(codex_kw, :maxTokens, nothing)
+        transport = normalize_codex_transport(codex_pop_option!(
+            codex_kw, :transport, :transportMode, :websocket, :websockets))
+        retry_settings = codex_retry_settings!(codex_kw)
 
         tools = build_codex_tools(agent.tools)
-        current_input = codex_build_input(agent, state, input, model)
+        current_input = openai_responses_build_full_input(agent, state, input, model)
         system_prompt = agent_system_prompt(agent)
 
         request_body = Dict{String, Any}(
@@ -1431,10 +1341,8 @@ function stream(
                 request_body[string(k)] = v
             end
         end
-        if !TRIMMED_BUILD
-            for (k, v) in codex_kw
-                request_body[string(k)] = v
-            end
+        for (k, v) in codex_kw
+            request_body[string(k)] = v
         end
 
         transform_request_body!(

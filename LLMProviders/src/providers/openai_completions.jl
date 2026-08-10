@@ -129,17 +129,6 @@ end
     created::Union{Nothing, Int} = nothing
     model::Union{Nothing, String} = nothing
     object::Union{Nothing, String} = nothing
-    input_sensitive::Union{Nothing, Bool} = nothing
-    output_sensitive::Union{Nothing, Bool} = nothing
-    input_sensitive_type::Union{Nothing, Int} = nothing
-    output_sensitive_type::Union{Nothing, Int} = nothing
-    output_sensitive_int::Union{Nothing, Int} = nothing
-end
-
-struct StreamDoneEvent end
-
-@omit_null @kwarg struct StreamErrorEvent
-    message::String
 end
 
 @omit_null @kwarg struct Request

@@ -1,22 +1,12 @@
-const TRIMMED_BUILD = get(ENV, "LE_TRIMMED_BUILD", "") == "1"
-const ToolArguments =
-    TRIMMED_BUILD ? Dict{String, JSON.JSONText} : Dict{String, Any}
+const ToolArguments = Dict{String, Any}
 
-if TRIMMED_BUILD
-    caught_exception(::Any, message::String)::ErrorException = ErrorException(message)
-    caught_exception_message(::Any, message::String)::String = message
-    caught_backtrace() = nothing
-    capture_caught_exception(::Any)::ErrorException =
-        ErrorException("Asynchronous agent operation failed.")
-else
-    caught_exception(value, message::String)::Exception =
-        value isa Exception ? value : ErrorException(message)
-    caught_exception_message(value, message::String)::String =
-        value isa Exception ? sprint(showerror, value) : message
-    caught_backtrace() = Base.catch_backtrace()
-    capture_caught_exception(value)::CapturedException =
-        capture(caught_exception(value, "Asynchronous agent operation failed."))
-end
+caught_exception(value, message::String)::Exception =
+    value isa Exception ? value : ErrorException(message)
+caught_exception_message(value, message::String)::String =
+    value isa Exception ? sprint(showerror, value) : message
+caught_backtrace() = Base.catch_backtrace()
+capture_caught_exception(value)::CapturedException =
+    capture(caught_exception(value, "Asynchronous agent operation failed."))
 
 mutable struct Future{T}
     const notify::Threads.Condition
@@ -26,9 +16,6 @@ mutable struct Future{T}
 end
 
 Future() = Future{Nothing}() # default future type
-Base.pointer(f::Future) = pointer_from_objref(f)
-Future(ptr::Ptr) = unsafe_pointer_to_objref(ptr)::Future
-Future{T}(ptr::Ptr) where {T} = unsafe_pointer_to_objref(ptr)::Future{T}
 
 function Future{T}(f) where {T}
     fut = Future{T}()

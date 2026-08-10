@@ -807,12 +807,12 @@ end
 
     @testset "find_cut_point" begin
         # Empty / single message: no cut point
-        @test Agentif.find_cut_point(AgentMessage[], 100) == 0
-        @test Agentif.find_cut_point(AgentMessage[UserMessage("hi")], 100) == 0
+        @test Agentif.find_cut_point(Agentif.StoredAgentMessage[], 100) == 0
+        @test Agentif.find_cut_point(Agentif.StoredAgentMessage[UserMessage("hi")], 100) == 0
 
         # Build messages: User → Assistant → ToolResult → User → Assistant
         # Each ~100 chars ≈ 25 tokens
-        msgs = AgentMessage[
+        msgs = Agentif.StoredAgentMessage[
             UserMessage("a" ^ 100),           # ~25 tokens
             AssistantMessage(; provider = "t", api = "t", model = "t"),
             ToolResultMessage("c1", "tool1", "b" ^ 100),  # ~25 tokens
@@ -839,7 +839,7 @@ end
         @test Agentif.find_cut_point(msgs, 100000) == 0
 
         # Cut point can land on UserMessage or AssistantMessage (at valid boundary)
-        msgs2 = AgentMessage[
+        msgs2 = Agentif.StoredAgentMessage[
             UserMessage("a" ^ 100),
             AssistantMessage(; provider = "t", api = "t", model = "t"),
             UserMessage("b" ^ 100),
@@ -852,7 +852,7 @@ end
     end
 
     @testset "format_messages_for_summary" begin
-        msgs = AgentMessage[
+        msgs = Agentif.StoredAgentMessage[
             UserMessage("What is 2+2?"),
             AssistantMessage(; provider = "t", api = "t", model = "t"),
             ToolResultMessage("c1", "calculator", "4"),
@@ -868,13 +868,13 @@ end
 
         # Truncation of long tool results
         long_result = ToolResultMessage("c2", "read_file", "z" ^ 1000)
-        text2 = Agentif.format_messages_for_summary(AgentMessage[long_result])
+        text2 = Agentif.format_messages_for_summary(Agentif.StoredAgentMessage[long_result])
         @test occursin("(truncated)", text2)
         @test length(text2) < 1000
 
         # Error tool result
         err_result = ToolResultMessage("c3", "bad_tool", "file not found"; is_error = true)
-        text3 = Agentif.format_messages_for_summary(AgentMessage[err_result])
+        text3 = Agentif.format_messages_for_summary(Agentif.StoredAgentMessage[err_result])
         @test occursin("Tool bad_tool error:", text3)
     end
 
@@ -1725,19 +1725,6 @@ end
     @test Agentif.normalize_codex_transport("auto") == :auto
     @test Agentif.normalize_codex_transport(true) == :websocket
     @test_throws ArgumentError Agentif.normalize_codex_transport("bogus")
-
-    empty_options = Agentif.trimmed_codex_options((
-        account_id = nothing,
-        sessionId = nothing,
-        reasoning = nothing,
-        reasoningSummary = nothing,
-        textVerbosity = nothing,
-    ))
-    @test empty_options.account_id === nothing
-    @test empty_options.session_id === nothing
-    @test empty_options.reasoning_effort === nothing
-    @test empty_options.reasoning_summary === nothing
-    @test empty_options.text_verbosity === nothing
 end
 
 @testset "oauth apikey resolution" begin
@@ -1798,9 +1785,9 @@ end
     end
 
     @test Agentif._responses_split_compound_id("café|élément") == ("café", "élément")
-    @test Agentif._split_compound_id("appel-é|élément") == ("appel-é", "élément")
+    @test Agentif._responses_split_compound_id("appel-é|élément") == ("appel-é", "élément")
     @test Agentif._responses_split_compound_id("|élément") == ("", "élément")
-    @test Agentif._split_compound_id("appel|") == ("appel", "")
+    @test Agentif._responses_split_compound_id("appel|") == ("appel", "")
 
     let
         prior = AssistantMessage(
@@ -1810,7 +1797,7 @@ end
         )
         push!(prior.content, Agentif.ToolCallContent(; id = "bad+call|item/with=chars__", name = "read", arguments = Dict("path" => "README.md")))
         state = AgentState(messages = AgentMessage[prior])
-        items = Agentif.codex_build_input(make_agent(), state, "continue", codex_model)
+        items = Agentif.openai_responses_build_full_input(make_agent(), state, "continue", codex_model)
 
         function_calls = [item for item in items if item isa AbstractDict && get(() -> nothing, item, "type") == "function_call"]
         tool_outputs = [item for item in items if item isa AbstractDict && get(() -> nothing, item, "type") == "function_call_output"]
@@ -1833,7 +1820,7 @@ end
         )
         push!(prior.content, Agentif.ThinkingContent(; thinking = "cross-provider reasoning"))
         state = AgentState(messages = AgentMessage[prior])
-        items = Agentif.codex_build_input(make_agent(), state, "continue", codex_model)
+        items = Agentif.openai_responses_build_full_input(make_agent(), state, "continue", codex_model)
 
         assistant_messages = [item for item in items if item isa AbstractDict && get(() -> nothing, item, "role") == "assistant"]
         reasoning_items = [item for item in items if item isa AbstractDict && get(() -> nothing, item, "type") == "reasoning"]

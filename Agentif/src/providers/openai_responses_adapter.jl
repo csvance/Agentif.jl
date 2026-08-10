@@ -19,58 +19,6 @@ function openai_responses_build_tools(tools::Vector{<:AgentTool})
     return provider_tools
 end
 
-function openai_responses_input_content(blocks::Vector{UserContentBlock})
-    content = OpenAIResponses.InputContent[]
-    for block in blocks
-        if block isa TextContent
-            push!(content, OpenAIResponses.InputTextContent(; text = block.text))
-        elseif block isa ImageContent
-            url = "data:$(block.mimeType);base64,$(block.data)"
-            push!(content, OpenAIResponses.InputImageContent(; image_url = url))
-        end
-    end
-    return content
-end
-
-function openai_responses_tool_output_content(blocks::Vector{ToolResultContentBlock})
-    content = OpenAIResponses.InputContent[]
-    for block in blocks
-        if block isa TextContent
-            push!(content, OpenAIResponses.InputTextContent(; text = block.text))
-        elseif block isa ImageContent
-            url = "data:$(block.mimeType);base64,$(block.data)"
-            push!(content, OpenAIResponses.InputImageContent(; image_url = url))
-        end
-    end
-    return content
-end
-
-function openai_responses_build_input(input::AgentTurnInput)
-    if input isa String
-        return input
-    elseif input isa UserMessage
-        content = openai_responses_input_content(input.content)
-        return OpenAIResponses.InputItem[OpenAIResponses.Message(; role = "user", content = content)]
-    elseif input isa Vector{UserContentBlock}
-        content = openai_responses_input_content(input)
-        return OpenAIResponses.InputItem[OpenAIResponses.Message(; role = "user", content = content)]
-    elseif input isa Vector{ToolResultMessage}
-        outputs = OpenAIResponses.FunctionToolCallOutput[]
-        for result in input
-            output_blocks = openai_responses_tool_output_content(result.content)
-            if isempty(output_blocks)
-                push!(outputs, OpenAIResponses.FunctionToolCallOutput(; call_id = result.call_id, output = ""))
-            elseif length(output_blocks) == 1 && output_blocks[1] isa OpenAIResponses.InputTextContent
-                push!(outputs, OpenAIResponses.FunctionToolCallOutput(; call_id = result.call_id, output = output_blocks[1].text))
-            else
-                push!(outputs, OpenAIResponses.FunctionToolCallOutput(; call_id = result.call_id, output = output_blocks))
-            end
-        end
-        return OpenAIResponses.InputItem[outputs...]
-    end
-    throw(ArgumentError("unsupported turn input: $(typeof(input))"))
-end
-
 function _responses_split_compound_id(id::AbstractString)
     idx = findfirst('|', id)
     if idx === nothing

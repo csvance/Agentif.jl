@@ -114,80 +114,6 @@ function codex_retry_settings!(kw::Dict{Symbol, Any})
     return (; max_retries, retry_base_ms, retry_max_ms)
 end
 
-codex_optional_string(value)::Union{Nothing, String} =
-    value === nothing ? nothing : string(value)
-
-function trimmed_codex_options(kw::NamedTuple)
-    account_id = if hasproperty(kw, :account_id)
-        codex_optional_string(getproperty(kw, :account_id))
-    elseif hasproperty(kw, :accountId)
-        codex_optional_string(getproperty(kw, :accountId))
-    else
-        nothing
-    end
-    session_id = if hasproperty(kw, :session_id)
-        codex_optional_string(getproperty(kw, :session_id))
-    elseif hasproperty(kw, :sessionId)
-        codex_optional_string(getproperty(kw, :sessionId))
-    else
-        nothing
-    end
-    reasoning_effort = if hasproperty(kw, :reasoning_effort)
-        codex_optional_string(getproperty(kw, :reasoning_effort))
-    elseif hasproperty(kw, :reasoningEffort)
-        codex_optional_string(getproperty(kw, :reasoningEffort))
-    elseif hasproperty(kw, :reasoning)
-        codex_optional_string(getproperty(kw, :reasoning))
-    else
-        nothing
-    end
-    reasoning_summary = if hasproperty(kw, :reasoning_summary)
-        codex_optional_string(getproperty(kw, :reasoning_summary))
-    elseif hasproperty(kw, :reasoningSummary)
-        codex_optional_string(getproperty(kw, :reasoningSummary))
-    else
-        nothing
-    end
-    text_verbosity = if hasproperty(kw, :text_verbosity)
-        codex_optional_string(getproperty(kw, :text_verbosity))
-    elseif hasproperty(kw, :textVerbosity)
-        codex_optional_string(getproperty(kw, :textVerbosity))
-    else
-        nothing
-    end
-    transport_value = if hasproperty(kw, :transport)
-        getproperty(kw, :transport)
-    elseif hasproperty(kw, :transportMode)
-        getproperty(kw, :transportMode)
-    elseif hasproperty(kw, :websocket)
-        getproperty(kw, :websocket)
-    elseif hasproperty(kw, :websockets)
-        getproperty(kw, :websockets)
-    else
-        nothing
-    end
-    transport = normalize_codex_transport(transport_value)
-    retry_settings = (
-        max_retries = codex_env_int(
-            "AGENTIF_CODEX_MAX_RETRIES", CODEX_DEFAULT_MAX_RETRIES),
-        retry_base_ms = codex_env_int(
-            "AGENTIF_CODEX_RETRY_BASE_MS", CODEX_DEFAULT_RETRY_BASE_MS),
-        retry_max_ms = codex_env_int(
-            "AGENTIF_CODEX_RETRY_MAX_MS", CODEX_DEFAULT_RETRY_MAX_MS),
-    )
-    return (;
-        account_id,
-        session_id,
-        reasoning_effort,
-        reasoning_summary,
-        text_verbosity,
-        include_opt = nothing,
-        max_tokens = nothing,
-        transport,
-        retry_settings,
-    )
-end
-
 function build_codex_tools(tools::Vector{<:AgentTool})
     isempty(tools) && return nothing
     provider_tools = Vector{Dict{String, Any}}()
@@ -348,129 +274,6 @@ function transform_request_body!(
     return body
 end
 
-"""
-    _split_compound_id(id::String) -> (call_id, item_id_or_nothing)
-
-Split a compound `callId|itemId` tool call ID into its parts.
-Returns (call_id, nothing) if no `|` separator is present.
-"""
-function _split_compound_id(id::AbstractString)
-    idx = findfirst('|', id)
-    if idx === nothing
-        return (String(id), nothing)
-    end
-    return (
-        String(id[1:prevind(id, idx)]),
-        String(id[nextind(id, idx):end]),
-    )
-end
-
-function codex_input_from_message(msg::AgentMessage, model::Model)
-    if msg isa UserMessage
-        content = Any[]
-        for block in msg.content
-            if block isa TextContent
-                push!(content, Dict("type" => "input_text", "text" => block.text))
-            elseif block isa ImageContent
-                push!(content, Dict("type" => "input_image", "image_url" => "data:$(block.mimeType);base64,$(block.data)"))
-            end
-        end
-        isempty(content) && return Any[]
-        return Any[Dict("role" => "user", "content" => content)]
-    elseif msg isa AssistantMessage
-        different_model = openai_responses_is_different_model(msg, model)
-        parts = Any[]
-        # Iterate content blocks in order to preserve signatures
-        for block in msg.content
-            if block isa ThinkingContent
-                if block.thinkingSignature !== nothing
-                    # Send back the entire opaque reasoning item (includes encrypted_content)
-                    try
-                        push!(parts, JSON.parse(block.thinkingSignature))
-                        continue
-                    catch
-                    end
-                end
-                # Fallback: reconstruct from summary text
-                !isempty(block.thinking) && push!(
-                    parts, Dict(
-                        "type" => "reasoning",
-                        "summary" => [Dict("type" => "summary_text", "text" => block.thinking)],
-                        "status" => "completed",
-                    )
-                )
-            elseif block isa TextContent
-                !isempty(block.text) || continue
-                msg_item = Dict{String, Any}(
-                    "type" => "message",
-                    "role" => "assistant",
-                    "content" => [Dict("type" => "output_text", "text" => block.text)],
-                    "status" => "completed",
-                )
-                # Include id from textSignature for prompt cache pairing
-                if block.textSignature !== nothing
-                    sig = block.textSignature
-                    msg_item["id"] = length(sig) > 64 ? first(sig, 64) : sig
-                end
-                push!(parts, msg_item)
-            elseif block isa ToolCallContent
-                call_id_raw, item_id = _split_compound_id(block.id)
-                if different_model && item_id !== nothing && startswith(item_id, "fc_")
-                    item_id = nothing
-                end
-                fc = Dict{String, Any}(
-                    "type" => "function_call",
-                    "call_id" => call_id_raw,
-                    "name" => block.name,
-                    "arguments" => JSON.json(block.arguments),
-                )
-                item_id !== nothing && (fc["id"] = item_id)
-                push!(parts, fc)
-            end
-        end
-        # Fallback: if no ToolCallContent blocks, use tool_calls field
-        has_tc_blocks = any(b -> b isa ToolCallContent, msg.content)
-        if !has_tc_blocks
-            for tc in msg.tool_calls
-                call_id_raw, item_id = _split_compound_id(tc.call_id)
-                if different_model && item_id !== nothing && startswith(item_id, "fc_")
-                    item_id = nothing
-                end
-                fc = Dict{String, Any}(
-                    "type" => "function_call",
-                    "call_id" => call_id_raw,
-                    "name" => tc.name,
-                    "arguments" => tc.arguments,
-                )
-                item_id !== nothing && (fc["id"] = item_id)
-                push!(parts, fc)
-            end
-        end
-        return parts
-    elseif msg isa ToolResultMessage
-        output = provider_tool_result_output(msg)
-        # Use only the callId portion (before |) for function_call_output
-        call_id_raw, _ = _split_compound_id(msg.call_id)
-        return Any[
-            Dict(
-                "type" => "function_call_output",
-                "call_id" => call_id_raw,
-                "output" => output,
-            ),
-        ]
-    elseif msg isa CompactionSummaryMessage
-        return Any[Dict("role" => "user", "content" => [Dict("type" => "input_text", "text" => "[Previous conversation summary]\n\n$(msg.summary)")])]
-    end
-    return Any[]
-end
-
-function codex_build_input(agent::Agent, state::AgentState, input::AgentTurnInput, model::Model)
-    items = Any[]
-    for msg in openai_responses_transformed_messages(state, input, model)
-        append!(items, codex_input_from_message(msg, model))
-    end
-    return items
-end
 
 function codex_usage_from_response(u)
     u === nothing && return Usage()
@@ -937,22 +740,18 @@ function codex_retryable_message(message::AbstractString)
     return occursin(CODEX_RETRYABLE_ERROR_REGEX, lowercase(message))
 end
 
-if TRIMMED_BUILD
-    codex_nested_retryable_exception(::Exception) = false
-else
-    function codex_nested_retryable_exception(err::Exception)
-        if err isa TaskFailedException
-            task = getfield(err, :task)
-            for (nested, _) in Base.current_exceptions(task)
-                nested isa Exception && codex_retryable_exception(nested) && return true
-            end
-        elseif err isa CompositeException
-            for nested in getfield(err, :exceptions)
-                nested isa Exception && codex_retryable_exception(nested) && return true
-            end
+function codex_nested_retryable_exception(err::Exception)
+    if err isa TaskFailedException
+        task = getfield(err, :task)
+        for (nested, _) in Base.current_exceptions(task)
+            nested isa Exception && codex_retryable_exception(nested) && return true
         end
-        return false
+    elseif err isa CompositeException
+        for nested in getfield(err, :exceptions)
+            nested isa Exception && codex_retryable_exception(nested) && return true
+        end
     end
+    return false
 end
 
 function codex_retryable_exception(err::Exception)

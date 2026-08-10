@@ -1,6 +1,6 @@
 module LLMOAuth
 
-using Base64, Dates, HTTP, JSON, OAuth
+using Dates, HTTP, JSON, OAuth
 
 # Include OAuth functionality
 include("oauth.jl")

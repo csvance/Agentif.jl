@@ -20,14 +20,6 @@ struct DummyUsage
     cacheWrite::Int
 end
 
-@testset "Future" begin
-    f = LLMProviders.Future{Int}(() -> 42)
-    @test wait(f) == 42
-
-    f_err = LLMProviders.Future{Int}(() -> error("boom"))
-    @test_throws CapturedException wait(f_err)
-end
-
 @testset "OpenAICompletions" begin
     msg = OpenAICompletions.Message(
         ; role = "assistant",
@@ -95,12 +87,6 @@ end
     event = JSON.parse("{\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}", OpenAIResponses.StreamEvent)
     @test event isa OpenAIResponses.StreamOutputTextDeltaEvent
     @test event.delta == "hi"
-
-    user_item = OpenAIResponses.Message(; role = "user", content = OpenAIResponses.Content[OpenAIResponses.InputTextContent(; text = "hello")])
-    req = OpenAIResponses.Request(; model = "gpt-test", input = OpenAIResponses.InputItem[user_item], stream = true)
-    roundtrip = JSON.parse(JSON.json(req))
-    @test roundtrip["model"] == "gpt-test"
-    @test roundtrip["stream"] == true
 
     unknown_content = JSON.parse("{\"type\":\"output_audio\",\"audio\":\"...\"}", OpenAIResponses.Content)
     @test unknown_content isa OpenAIResponses.UnknownContent
@@ -350,25 +336,6 @@ end
     @test cost["cacheWrite"] == 0.0
     @test cost["total"] == 0.005
 
-    # Keep the public pre-tier positional constructor working.
-    positional = LLMProviders.Model(
-        model.id,
-        model.name,
-        model.api,
-        model.provider,
-        model.baseUrl,
-        model.reasoning,
-        model.input,
-        model.cost,
-        model.contextWindow,
-        model.maxTokens,
-        model.headers,
-        model.compat,
-        model.kw,
-    )
-    @test isempty(positional.costTiers)
-    @test positional.thinkingLevelMap === nothing
-
     tiered = LLMProviders.Model(;
         id = "tiered",
         name = "Tiered",
@@ -443,40 +410,23 @@ end
     end
 end
 
-@testset "OpenAI Codex model registry" begin
-    spark = LLMProviders.getModel("openai-codex", "gpt-5.3-codex-spark")
-    @test spark !== nothing
-    @test spark.id == "gpt-5.3-codex-spark"
-    @test spark.api == "openai-codex-responses"
-    @test spark.provider == "openai-codex"
-    @test spark.maxTokens == 32000
-
-    v51 = LLMProviders.getModel("openai-codex", "gpt-5.1-codex")
-    @test v51 !== nothing
-    @test v51.id == "gpt-5.1-codex"
-
-    v54 = LLMProviders.getModel("openai-codex", "gpt-5.4")
-    @test v54 !== nothing
-    @test v54.id == "gpt-5.4"
-end
-
 @testset "Generated model registry" begin
     # Roster shipped by models_generated.json plus models_custom.jl. Keep this
     # explicit so providers registered by earlier testsets do not enter the sweep.
     registry_providers = [
-        "amazon-bedrock", "ant-ling", "anthropic", "azure-openai-responses",
+        "ant-ling", "anthropic", "baseten",
         "cerebras", "cloudflare-ai-gateway", "cloudflare-workers-ai", "deepseek",
         "fireworks", "github-copilot", "google", "google-gemini-cli",
-        "google-vertex", "groq", "huggingface", "kimi-coding", "minimax",
-        "minimax-cn", "mistral", "moonshotai", "moonshotai-cn", "nvidia",
+        "groq", "huggingface", "kimi-coding", "minimax",
+        "minimax-cn", "moonshotai", "moonshotai-cn", "nvidia",
         "openai", "openai-codex", "opencode", "opencode-go", "openrouter",
-        "qwen-token-plan", "qwen-token-plan-cn", "together",
-        "vercel-ai-gateway", "xai", "xiaomi", "xiaomi-token-plan-ams",
+        "qwen-token-plan", "qwen-token-plan-cn", "qwen-token-plan-individual",
+        "together", "vercel-ai-gateway", "xai", "xiaomi", "xiaomi-token-plan-ams",
         "xiaomi-token-plan-cn", "xiaomi-token-plan-sgp", "zai", "zai-coding-cn",
     ]
     @test issubset(registry_providers, LLMProviders.getProviders())
     all_models = [m for p in registry_providers for m in LLMProviders.getModels(p)]
-    @test length(all_models) >= 1168
+    @test length(all_models) >= 1020
 
     # Current upstream examples, including the active Sonnet 5 introductory rate.
     for (provider, id, input, output) in [
@@ -548,13 +498,7 @@ end
         @test model !== nothing
         @test model !== nothing && all(==(0.0), values(model.cost))
     end
-    @test LLMProviders.getModel("openai-codex", "gpt-codex-5.3") !== nothing
-
     @test LLMProviders.getModel("minimax", "MiniMax-M2.7") !== nothing
-    m21 = LLMProviders.getModel("minimax", "minimax/minimax-m2.1")
-    @test m21 !== nothing
-    @test m21 !== nothing && m21.baseUrl == "https://api.minimax.io/v1"
-    @test m21 !== nothing && m21.id == "MiniMax-M2.1"
 
     for model in LLMProviders.getModels("google-gemini-cli")
         @test model.api == "google-gemini-cli"

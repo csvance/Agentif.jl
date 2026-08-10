@@ -161,11 +161,6 @@ println("=" ^ 60)
         watcher = watcher_cfg(; check_interval_s = 0.0))
     @test_throws ArgumentError make_watcher_assistant(;
         watcher = watcher_cfg(; on_track_every_turns = 0))
-    a = make_watcher_assistant()
-    compat = AgentAssistant(
-        a.config, a.db, a._channels, a.event_queue, a.session_store, a.tools,
-        a.scheduler, a.log_level)
-    @test compat.watcher === nothing
 end
 
 @testset "classify_eval_failure" begin

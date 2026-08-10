@@ -302,13 +302,13 @@ headers. Untrusted handlers therefore do not receive `web_fetch` by default.
 
 ## 2.4 Subprocess environment scrubbing
 
-PTY/worker/codex subprocesses inherit the full parent environment including every API
+PTY and worker subprocesses inherit the full parent environment including every API
 key. Pass a minimal allowlisted environment instead. (Full container sandboxing — the
 OpenClaw model — is noted as future work; env scrubbing plus the tool policy is the
 80% for a single-user instance.)
 
 > **Corrected after implementation.** "An allowlist makes the key unreadable" is only
-> true for `setenv`-based spawns (PtySessions, codex). `ConcurrentUtilities.Worker`
+> true for `setenv`-based spawns (`PtySessions`). `ConcurrentUtilities.Worker`
 > spawns with `addenv`, which **merges onto the parent environment rather than
 > replacing it**, so an allowlist alone was a complete no-op and the worker still
 > returned the key — caught by the test, not by reading the code. Denied names must be

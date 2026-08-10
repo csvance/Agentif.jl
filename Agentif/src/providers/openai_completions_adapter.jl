@@ -72,16 +72,6 @@ function openai_completions_has_tool_history(messages::Vector{StoredAgentMessage
     return false
 end
 
-function openai_completions_is_zai(model::Model)
-    compat = openai_completions_resolve_compat(model)
-    return compat.thinkingFormat == "zai"
-end
-
-function openai_completions_supports_reasoning_effort(model::Model)
-    compat = openai_completions_resolve_compat(model)
-    return compat.supportsReasoningEffort
-end
-
 function openai_completions_use_reasoning_split(model::Model)
     base_url = model.baseUrl
     return model.provider == "minimax" || occursin("minimax.io", base_url) || occursin("minimaxi.com", base_url)

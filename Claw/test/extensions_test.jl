@@ -45,9 +45,7 @@ if HAS_GITHUB
     ext = Base.get_extension(Claw, :ClawGitHubExt)
     @test ext !== nothing
 
-    source = ext.GitHubEventSource(; secret="test-secret", port=19876, app_id=12345, private_key_path="/tmp/fake.pem")
-    @test source.app_id == 12345
-    @test source.private_key_path == "/tmp/fake.pem"
+    source = ext.GitHubEventSource(; secret="test-secret", port=19876)
     event_types = Claw.get_event_types(source)
     et_names = Set(et.name for et in event_types)
 

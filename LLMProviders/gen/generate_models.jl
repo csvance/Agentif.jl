@@ -8,8 +8,7 @@
 #
 # Defaults:
 #     SOURCE     $PI_MONO_MODELS_JSON, else
-#                $PI_MONO/.artifacts/model-catalog/models.json,
-#                with legacy monolithic models.generated.ts support
+#                $PI_MONO/.artifacts/model-catalog/models.json
 #     OUTPUT_JL  <this file>/../../src/models_generated.jl
 #
 # The script is dependency-free (Base only). pi-mono owns network discovery and
@@ -17,7 +16,14 @@
 # that snapshot. See gen/README.md.
 
 const DEFAULT_JSON_RELPATH = joinpath(".artifacts", "model-catalog", "models.json")
-const LEGACY_TS_RELPATH = joinpath("packages", "ai", "src", "models.generated.ts")
+
+# Only APIs Agentif's stream() can dispatch. Models with any other `api` value
+# could never be evaluated through the stack, so they are filtered at
+# generation time instead of shipping as dead catalog weight.
+const DISPATCHABLE_APIS = Set([
+    "openai-responses", "openai-completions", "anthropic-messages",
+    "google-generative-ai", "google-gemini-cli", "openai-codex-responses",
+])
 
 # ---------------------------------------------------------------------------
 # Value model
@@ -110,10 +116,8 @@ skipws(s::AbstractString, i::Int) = (while i <= lastindex(s) && isspace(s[i]); i
 """
     parse_value(s, i) -> (value, nextindex)
 
-Parse one inline TS/JSON value (string, number, bool, null, array, object).
-Only used for values that upstream emits on a single line: `input`, `compat`,
-`headers`, and every scalar. Multi-line blocks (`cost`) are handled by the
-line-oriented reader below.
+Parse one JSON value (string, number, bool, null, array, or object).
+This function is the recursive value parser used by `parse_models_json`.
 """
 function parse_value(s::AbstractString, i::Int)
     i = skipws(s, i)
@@ -205,138 +209,10 @@ function parse_complete_value(s::AbstractString; context::AbstractString)
     return value
 end
 
-function parse_line_value(s::AbstractString; context::AbstractString)
-    value, i = parse_value(s, firstindex(s))
-    i = skipws(s, i)
-    if i <= lastindex(s) && s[i] == ','
-        i = skipws(s, nextind(s, i))
-    end
-    i > lastindex(s) || error("$context: unexpected trailing content: $(first(SubString(s, i), 80))")
-    return value
-end
-
-# ---------------------------------------------------------------------------
-# Line-oriented TS reader
-# ---------------------------------------------------------------------------
-
 struct ParsedModel
     provider::String
     id::String
     fields::TSObject
-end
-
-"""
-    parse_models_ts(path) -> Vector{ParsedModel}
-
-Read `models.generated.ts` and return every model literal it declares.
-
-Structure relied upon (upstream is machine-generated, so indentation is exact):
-
-    export const MODELS = {
-    \\t"<provider>": {
-    \\t\\t"<model-id>": {
-    \\t\\t\\t<key>: <inline value>,
-    \\t\\t\\tcost: {
-    \\t\\t\\t\\t<key>: <number>,
-    \\t\\t\\t},
-    \\t\\t} satisfies Model<"...">,
-    \\t},
-    } as const;
-
-Anything unexpected raises rather than being silently skipped, so upstream
-shape drift surfaces as a generator failure instead of a truncated registry.
-"""
-function parse_models_ts(path::AbstractString)
-    lines = readlines(path)
-    models = ParsedModel[]
-
-    start = findfirst(l -> startswith(l, "export const MODELS"), lines)
-    start === nothing && error("could not find `export const MODELS` in $path")
-    any(occursin("readonly "), lines[start:min(length(lines), start + 5)]) &&
-        error(
-        "$path uses pi-mono's split JSON catalog format. " *
-            "Run `npm --prefix packages/ai run generate-model-catalog` in pi-mono, " *
-            "then pass `.artifacts/model-catalog/models.json` to this script."
-    )
-
-    provider = ""
-    id = ""
-    fields = TSObject()
-    nested_key = ""
-    nested = TSObject()
-    # depth: 1 = inside MODELS, 2 = inside a provider, 3 = inside a model, 4 = inside a nested block
-    depth = 1
-
-    terminated = false
-    for lineno in (start + 1):length(lines)
-        raw = lines[lineno]
-        line = rstrip(raw)
-        isempty(strip(line)) && continue
-        if line == "} as const;"
-            terminated = true
-            break
-        end
-
-        indent = something(findfirst(c -> c != '\t', line), length(line) + 1) - 1
-        body = lstrip(line, '\t')
-
-        if depth == 1
-            if indent == 1 && endswith(body, ": {")
-                provider, _ = parse_js_string(body, 1)
-                depth = 2
-            else
-                error("$path:$lineno: expected a provider key, got: $line")
-            end
-        elseif depth == 2
-            if indent == 2 && endswith(body, ": {")
-                id, _ = parse_js_string(body, 1)
-                fields = TSObject()
-                depth = 3
-            elseif indent == 1 && (body == "}," || body == "}")
-                depth = 1
-            else
-                error("$path:$lineno: expected a model key or provider close, got: $line")
-            end
-        elseif depth == 3
-            if indent == 2 && (startswith(body, "} satisfies") || body == "}," || body == "}")
-                push!(models, ParsedModel(provider, id, fields))
-                depth = 2
-            elseif indent == 3
-                colon = findfirst(==(':'), body)
-                colon === nothing && error("$path:$lineno: missing ':' in field line: $line")
-                key = strip(body[1:(colon - 1)], ['"', ' '])
-                rest = strip(body[(colon + 1):end])
-                if rest == "{"
-                    nested_key = key
-                    nested = TSObject()
-                    depth = 4
-                else
-                    v = parse_line_value(rest; context = "$path:$lineno")
-                    push!(fields, key => v)
-                end
-            else
-                error("$path:$lineno: unexpected line inside model \"$id\": $line")
-            end
-        else # depth == 4
-            if indent == 3 && (body == "}," || body == "}")
-                push!(fields, nested_key => nested)
-                depth = 3
-            elseif indent == 4
-                colon = findfirst(==(':'), body)
-                colon === nothing && error("$path:$lineno: missing ':' in nested field line: $line")
-                key = strip(body[1:(colon - 1)], ['"', ' '])
-                v = parse_line_value(strip(body[(colon + 1):end]); context = "$path:$lineno")
-                push!(nested, key => v)
-            else
-                error("$path:$lineno: unexpected line inside \"$id\".$nested_key: $line")
-            end
-        end
-    end
-
-    terminated || error("$path: missing closing `} as const;`")
-    depth == 1 || error("$path: unbalanced literal (ended at depth $depth)")
-    isempty(models) && error("$path: parsed zero models")
-    return models
 end
 
 """
@@ -364,8 +240,30 @@ function parse_models_json(path::AbstractString)
     return models
 end
 
-function parse_models(path::AbstractString)
-    return endswith(lowercase(path), ".json") ? parse_models_json(path) : parse_models_ts(path)
+"""
+    filter_dispatchable(models) -> (kept, dropped_by_api)
+
+Validate every model, then keep only models whose `api` Agentif can dispatch.
+Returns the kept models and a count of dropped models per undispatchable api
+value.
+"""
+function filter_dispatchable(models::Vector{ParsedModel})
+    kept = ParsedModel[]
+    dropped = Dict{String, Int}()
+    for m in models
+        # Validate every upstream record before filtering. Otherwise a malformed
+        # model can disappear only because its api is not dispatchable, hiding
+        # catalog schema drift that the generator promises to reject.
+        validate_model(m)
+        api_value = validate_string_field(m, "api").value
+        if api_value in DISPATCHABLE_APIS
+            push!(kept, m)
+        else
+            dropped[api_value] = get(dropped, api_value, 0) + 1
+        end
+    end
+    isempty(kept) && error("no models remain after api filtering")
+    return kept, dropped
 end
 
 # ---------------------------------------------------------------------------
@@ -738,7 +636,8 @@ function generate(
         describe::AbstractString = git_describe(source_path),
         date::AbstractString = string(Dates_today()),
     )
-    models = parse_models(source_path)
+    models = parse_models_json(source_path)
+    models, dropped = filter_dispatchable(models)
     catalog = canonical_catalog(models)
     loader_path = abspath(out_path)
     endswith(lowercase(loader_path), ".jl") ||
@@ -753,6 +652,7 @@ function generate(
     return (
         providers = length(catalog),
         models = length(models),
+        dropped,
         loader_path,
         json_path,
     )
@@ -790,16 +690,8 @@ end
 function default_source_path()
     json_env = get(ENV, "PI_MONO_MODELS_JSON", "")
     isempty(json_env) || return json_env
-    legacy_env = get(ENV, "PI_MONO_MODELS_TS", "")
-    isempty(legacy_env) || return legacy_env
     root = get(ENV, "PI_MONO", joinpath(homedir(), "pi-mono"))
-    json_path = joinpath(root, DEFAULT_JSON_RELPATH)
-    isfile(json_path) && return json_path
-    legacy_path = joinpath(root, LEGACY_TS_RELPATH)
-    if isfile(legacy_path) && occursin("export const MODELS = {", read(legacy_path, String))
-        return legacy_path
-    end
-    return json_path
+    return joinpath(root, DEFAULT_JSON_RELPATH)
 end
 
 function main(args::Vector{String})
@@ -817,6 +709,9 @@ function main(args::Vector{String})
     println("wrote $(result.json_path)")
     println("  providers: $(result.providers)")
     println("  models:    $(result.models)")
+    for (api, count) in sort!(collect(result.dropped))
+        println("  dropped:   $count models (undispatchable api: $api)")
+    end
     return nothing
 end
 

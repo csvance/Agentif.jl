@@ -1,4 +1,4 @@
-using OAuth, Dates, HTTP, Base64
+using OAuth, Dates, HTTP
 
 const ANTHROPIC_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
 const ANTHROPIC_AUTHORIZE_URL = "https://claude.ai/oauth/authorize"
@@ -191,11 +191,7 @@ function codex_decode_jwt(token::String)
     parts = split(token, ".")
     length(parts) == 3 || return Dict{String, Any}()
     try
-        payload = replace(parts[2], '-' => '+', '_' => '/')
-        padding = mod(4 - mod(length(payload), 4), 4)
-        padding > 0 && (payload *= repeat("=", padding))
-        decoded = Base64.base64decode(payload)
-        return JSON.parse(decoded)
+        return OAuth.decode_jwt_json_segment(parts[2], "payload")
     catch
         return Dict{String, Any}()
     end

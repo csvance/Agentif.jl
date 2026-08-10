@@ -107,54 +107,9 @@ function _init_custom_models!()
             max_tokens = 32000,
         ),
         "gpt-5.4" => codex_model("gpt-5.4", "GPT-5.4"),
-        # Friendly aliases: keep lookup compatibility while using canonical API ids.
-        "gpt-codex-5.3" => codex_model("gpt-5.3-codex", "GPT Codex 5.3"; context_window = 400000),
     )
     merge!(get!(() -> Dict{String, Model}(), _model_registry, "openai-codex"), openai_codex_models)
-
-    if !haskey(_model_registry, "minimax")
-        openrouter_models = get(() -> nothing, _model_registry, "openrouter")
-        if openrouter_models !== nothing
-            minimax = Dict{String, Model}()
-            m21 = get(() -> nothing, openrouter_models, "minimax/minimax-m2.1")
-            m21 !== nothing && (minimax["minimax/minimax-m2.1"] = m21)
-            m21l = get(() -> nothing, openrouter_models, "minimax/minimax-m2.1-lightning")
-            m21l !== nothing && (minimax["minimax/minimax-m2.1-lightning"] = m21l)
-            !isempty(minimax) && (_model_registry["minimax"] = minimax)
-        end
-    end
-
-    # Add direct MiniMax OpenAI-compatible entries under the minimax provider.
-    minimax_models = get(() -> nothing, _model_registry, "minimax")
-    openrouter_models = get(() -> nothing, _model_registry, "openrouter")
-    return if minimax_models !== nothing && openrouter_models !== nothing
-        function minimax_openai_model(openrouter_id::String, minimax_id::String)
-            base = get(() -> nothing, openrouter_models, openrouter_id)
-            base === nothing && return nothing
-            return Model(
-                id = minimax_id,
-                name = base.name,
-                api = "openai-completions",
-                provider = "minimax",
-                baseUrl = "https://api.minimax.io/v1",
-                reasoning = base.reasoning,
-                input = base.input,
-                cost = base.cost,
-                contextWindow = base.contextWindow,
-                maxTokens = base.maxTokens,
-                headers = base.headers,
-                kw = base.kw,
-            )
-        end
-        if !haskey(minimax_models, "minimax/minimax-m2.1")
-            m21_direct = minimax_openai_model("minimax/minimax-m2.1", "MiniMax-M2.1")
-            m21_direct !== nothing && (minimax_models["minimax/minimax-m2.1"] = m21_direct)
-        end
-        if !haskey(minimax_models, "minimax/minimax-m2.1-lightning")
-            m21l_direct = minimax_openai_model("minimax/minimax-m2.1-lightning", "MiniMax-M2.1-lightning")
-            m21l_direct !== nothing && (minimax_models["minimax/minimax-m2.1-lightning"] = m21l_direct)
-        end
-    end
+    return nothing
 end
 
 _init_custom_models!()
