@@ -227,7 +227,7 @@ end
     @test "claw_agent_metadata" in tables
     @test "session_entries" in tables  # from AgentifSQLiteExt
     @test "session_branches" in tables  # from AgentifSQLiteExt
-    @test "tempus_jobs" in tables  # from TempusSQLiteExt
+    @test "tempus_state" in tables  # Tempus 3 SQLite-backed store table
     println("  Tables: $tables")
 
     metadata_row = iterate(SQLite.DBInterface.execute(a.db,
@@ -238,8 +238,9 @@ end
     # Verify session store is SQLite-backed
     @test nameof(typeof(a.session_store)) === :SQLiteSessionStore
 
-    # Verify scheduler uses SQLite store
-    @test a.scheduler.store isa Tempus.SQLiteStore
+    # Verify scheduler uses SQLite store (Tempus 3: SQLiteStore is a compat
+    # constructor returning a Store over an AbstractStores.SQLStore backend)
+    @test a.scheduler.store isa Tempus.Store
 
     println("  ✓ SQLite schema & constructor passed")
 end
