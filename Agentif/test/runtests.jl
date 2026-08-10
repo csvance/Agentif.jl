@@ -19,6 +19,12 @@ function dummy_model()
         baseUrl = "http://localhost",
         reasoning = false,
         input = ["text"],
+        cost = Dict(
+            "input" => 0.0,
+            "output" => 0.0,
+            "cacheRead" => 0.0,
+            "cacheWrite" => 0.0,
+        ),
         contextWindow = 1,
         maxTokens = 1,
         headers = nothing,
@@ -161,6 +167,7 @@ function compaction_test_model(port::Integer; contextWindow::Int)
         id = "test-model", name = "test-model", api = "openai-completions",
         provider = "test", baseUrl = "http://127.0.0.1:$port", reasoning = false,
         input = ["text"],
+        cost = Dict("input" => 0.0, "output" => 0.0, "cacheRead" => 0.0, "cacheWrite" => 0.0),
         contextWindow = contextWindow, maxTokens = 4096,
     )
 end
@@ -1007,6 +1014,7 @@ end
             id = "test-model", name = "test-model", api = "openai-completions",
             provider = "test", baseUrl = "http://localhost", reasoning = false,
             input = ["text"],
+            cost = Dict("input" => 0.0, "output" => 0.0, "cacheRead" => 0.0, "cacheWrite" => 0.0),
             contextWindow = 100000, maxTokens = 4096,
         )
         agent = Agent(; id = "a", prompt = "test", model, apikey = "k")
@@ -1052,6 +1060,12 @@ end
                 baseUrl = "http://127.0.0.1:$port/v1",
                 reasoning = false,
                 input = ["text"],
+                cost = Dict(
+                    "input" => 0.0,
+                    "output" => 0.0,
+                    "cacheRead" => 0.0,
+                    "cacheWrite" => 0.0,
+                ),
                 contextWindow = 100000,
                 maxTokens = 4096,
             )
@@ -1063,6 +1077,12 @@ end
                 baseUrl = "http://127.0.0.1:$port/v1",
                 reasoning = false,
                 input = ["text"],
+                cost = Dict(
+                    "input" => 0.0,
+                    "output" => 0.0,
+                    "cacheRead" => 0.0,
+                    "cacheWrite" => 0.0,
+                ),
                 contextWindow = 100000,
                 maxTokens = 4096,
             )
@@ -1737,6 +1757,7 @@ end
         baseUrl = "https://api.openai.com/v1",
         reasoning = true,
         input = ["text"],
+        cost = Dict("input" => 0.0, "output" => 0.0, "cacheRead" => 0.0, "cacheWrite" => 0.0),
         contextWindow = 128000,
         maxTokens = 32000,
     )
@@ -1748,6 +1769,7 @@ end
         baseUrl = "https://chatgpt.com/backend-api",
         reasoning = true,
         input = ["text"],
+        cost = Dict("input" => 0.0, "output" => 0.0, "cacheRead" => 0.0, "cacheWrite" => 0.0),
         contextWindow = 128000,
         maxTokens = 32000,
     )
@@ -1870,6 +1892,7 @@ end
         id = "test-model", name = "test-model", api = "openai-completions",
         provider = "test", baseUrl = "http://localhost", reasoning = false,
         input = ["text"],
+        cost = Dict("input" => 0.0, "output" => 0.0, "cacheRead" => 0.0, "cacheWrite" => 0.0),
         contextWindow = 100000, maxTokens = 4096,
     )
     agent = Agent(; id = "a", prompt = "p", model, apikey = "k")
@@ -1925,6 +1948,7 @@ end
             baseUrl = "http://127.0.0.1:$port",
             reasoning = true,
             input = ["text"],
+            cost = Dict("input" => 0.0, "output" => 0.0, "cacheRead" => 0.0, "cacheWrite" => 0.0),
             contextWindow = 128000,
             maxTokens = 32000,
         )
@@ -1980,6 +2004,7 @@ end
             baseUrl = "http://127.0.0.1:$port",
             reasoning = true,
             input = ["text"],
+            cost = Dict("input" => 0.0, "output" => 0.0, "cacheRead" => 0.0, "cacheWrite" => 0.0),
             contextWindow = 128000,
             maxTokens = 32000,
         )
@@ -2028,6 +2053,7 @@ end
             baseUrl = "http://127.0.0.1:$port",
             reasoning = false,
             input = ["text"],
+            cost = Dict("input" => 0.0, "output" => 0.0, "cacheRead" => 0.0, "cacheWrite" => 0.0),
             contextWindow = 200000,
             maxTokens = 8192,
         )
@@ -2080,6 +2106,7 @@ end
             baseUrl = "http://127.0.0.1:$port",
             reasoning = true,
             input = ["text"],
+            cost = Dict("input" => 0.0, "output" => 0.0, "cacheRead" => 0.0, "cacheWrite" => 0.0),
             contextWindow = 200000,
             maxTokens = 8192,
         )
@@ -2159,6 +2186,7 @@ end
             baseUrl = "http://127.0.0.1:$port",
             reasoning = false,
             input = ["text"],
+            cost = Dict("input" => 0.0, "output" => 0.0, "cacheRead" => 0.0, "cacheWrite" => 0.0),
             contextWindow = 200000,
             maxTokens = 8192,
         )
@@ -2195,6 +2223,7 @@ function anthropic_test_model(;
         baseUrl = baseUrl,
         reasoning = reasoning,
         input = ["text"],
+        cost = Dict("input" => 0.0, "output" => 0.0, "cacheRead" => 0.0, "cacheWrite" => 0.0),
         contextWindow = 200000,
         maxTokens = maxTokens,
         compat = compat,
@@ -2957,6 +2986,7 @@ end
             baseUrl = "http://127.0.0.1:$port",
             reasoning = true,
             input = ["text"],
+            cost = Dict("input" => 0.0, "output" => 0.0, "cacheRead" => 0.0, "cacheWrite" => 0.0),
             contextWindow = 128000,
             maxTokens = 32000,
         )
@@ -3004,6 +3034,7 @@ end
             baseUrl = "http://127.0.0.1:$port",
             reasoning = true,
             input = ["text"],
+            cost = Dict("input" => 0.0, "output" => 0.0, "cacheRead" => 0.0, "cacheWrite" => 0.0),
             contextWindow = 128000,
             maxTokens = 32000,
         )
@@ -3064,6 +3095,7 @@ end
             baseUrl = "http://127.0.0.1:$port",
             reasoning = true,
             input = ["text"],
+            cost = Dict("input" => 0.0, "output" => 0.0, "cacheRead" => 0.0, "cacheWrite" => 0.0),
             contextWindow = 128000,
             maxTokens = 32000,
         )
@@ -3126,6 +3158,7 @@ end
             baseUrl = "http://127.0.0.1:$port",
             reasoning = true,
             input = ["text"],
+            cost = Dict("input" => 0.0, "output" => 0.0, "cacheRead" => 0.0, "cacheWrite" => 0.0),
             contextWindow = 128000,
             maxTokens = 32000,
         )
@@ -3259,6 +3292,7 @@ end
             baseUrl = "http://127.0.0.1:$port",
             reasoning = false,
             input = ["text"],
+            cost = Dict("input" => 0.0, "output" => 0.0, "cacheRead" => 0.0, "cacheWrite" => 0.0),
             contextWindow = 128000,
             maxTokens = 32000,
         )
@@ -3311,6 +3345,7 @@ end
             baseUrl = "http://127.0.0.1:$port",
             reasoning = false,
             input = ["text"],
+            cost = Dict("input" => 0.0, "output" => 0.0, "cacheRead" => 0.0, "cacheWrite" => 0.0),
             contextWindow = 128000,
             maxTokens = 32000,
         )
@@ -3367,6 +3402,7 @@ end
             baseUrl = "http://127.0.0.1:$port",
             reasoning = true,
             input = ["text"],
+            cost = Dict("input" => 0.0, "output" => 0.0, "cacheRead" => 0.0, "cacheWrite" => 0.0),
             contextWindow = 128000,
             maxTokens = 32000,
         )
@@ -3425,6 +3461,7 @@ end
             baseUrl = "http://127.0.0.1:$port",
             reasoning = false,
             input = ["text"],
+            cost = Dict("input" => 0.0, "output" => 0.0, "cacheRead" => 0.0, "cacheWrite" => 0.0),
             contextWindow = 128000,
             maxTokens = 32000,
         )
@@ -3483,6 +3520,7 @@ end
             baseUrl = "http://127.0.0.1:$port",
             reasoning = true,
             input = ["text"],
+            cost = Dict("input" => 0.0, "output" => 0.0, "cacheRead" => 0.0, "cacheWrite" => 0.0),
             contextWindow = 128000,
             maxTokens = 32000,
         )
@@ -3568,6 +3606,7 @@ end
             baseUrl = "http://127.0.0.1:$port",
             reasoning = true,
             input = ["text"],
+            cost = Dict("input" => 0.0, "output" => 0.0, "cacheRead" => 0.0, "cacheWrite" => 0.0),
             contextWindow = 128000,
             maxTokens = 32000,
         )
