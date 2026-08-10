@@ -1,9 +1,9 @@
 # This file is auto-generated from pi-mono's model catalog
 # Do not edit manually -- run `julia LLMProviders/gen/generate_models.jl` to refresh.
 #
-# Source:    pi-mono/.artifacts/model-catalog/models.json
-# Source rev: v0.0.2-4947-gdfe47d3fb
-# Generated: 2026-07-30
+# Source:    ~/pi-mono/.artifacts/model-catalog/models.json
+# Source rev: v0.0.2-5326-g3059b8131
+# Generated: 2026-08-10
 
 const _GENERATED_MODELS_PATH = joinpath(@__DIR__, "models_generated.json")
 Base.include_dependency(_GENERATED_MODELS_PATH)
