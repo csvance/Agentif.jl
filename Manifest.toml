@@ -250,7 +250,7 @@ uuid = "e1f4c4b3-4b8a-4e8c-9b4f-7b8e4e6e5b2a"
 version = "1.0.0"
 
 [[deps.LLMTools]]
-deps = ["Agentif", "Base64", "ConcurrentUtilities", "Dates", "HTTP", "JSON", "LLMProviders", "Logging", "LoggingExtras", "PtySessions", "ScopedValues", "Sockets", "UUIDs"]
+deps = ["Agentif", "ConcurrentUtilities", "HTTP", "JSON", "PtySessions", "ScopedValues", "Sockets", "UUIDs"]
 path = "LLMTools"
 uuid = "d2f4c4b3-4b8a-4e8c-9b4f-7b8e4e6e5b2c"
 version = "1.0.0"

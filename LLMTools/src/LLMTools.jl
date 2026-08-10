@@ -1,10 +1,8 @@
 module LLMTools
 
 using Agentif
-using Agentif: Agent, AgentState, AgentTool, AgentToolCall, PendingToolCall
-using Agentif: UserMessage, AssistantMessage, ToolResultMessage, ToolCallContent
-using Agentif: message_text, evaluate
-using Base64, Dates, HTTP, JSON, Logging, PtySessions, UUIDs
+using Agentif: Agent, AgentTool, AssistantMessage, message_text, evaluate
+using HTTP, JSON, PtySessions, UUIDs
 using ConcurrentUtilities: Workers, Worker, remote_eval, remote_fetch
 using ScopedValues: ScopedValue, @with
 

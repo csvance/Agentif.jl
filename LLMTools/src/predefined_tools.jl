@@ -72,53 +72,6 @@ function truncate_head(content::String; max_lines::Int = DEFAULT_MAX_LINES, max_
     )
 end
 
-function truncate_tail(content::String; max_lines::Int = DEFAULT_MAX_LINES, max_bytes::Int = DEFAULT_MAX_BYTES)
-    total_bytes = ncodeunits(content)
-    lines = split(content, "\n"; keepempty = true)
-    total_lines = length(lines)
-    if total_lines <= max_lines && total_bytes <= max_bytes
-        return TruncationResult(content, false, nothing, total_lines, total_bytes, total_lines, total_bytes, false, false, max_lines, max_bytes)
-    end
-
-    output_lines = String[]
-    output_bytes = 0
-    truncated_by = :lines
-    last_line_partial = false
-
-    for idx in length(lines):-1:1
-        length(output_lines) >= max_lines && break
-        line = lines[idx]
-        line_bytes = ncodeunits(line) + (!isempty(output_lines) ? 1 : 0)
-        if output_bytes + line_bytes > max_bytes
-            truncated_by = :bytes
-            if isempty(output_lines)
-                truncated_line = truncate_string_to_bytes_from_end(line, max_bytes)
-                push!(output_lines, truncated_line)
-                output_bytes = ncodeunits(truncated_line)
-                last_line_partial = true
-            end
-            break
-        end
-        pushfirst!(output_lines, line)
-        output_bytes += line_bytes
-    end
-
-    output_content = join(output_lines, "\n")
-    return TruncationResult(
-        output_content,
-        true,
-        truncated_by,
-        total_lines,
-        total_bytes,
-        length(output_lines),
-        ncodeunits(output_content),
-        last_line_partial,
-        false,
-        max_lines,
-        max_bytes,
-    )
-end
-
 function truncate_tool_output(content::String; label::String = "Output", hint::Union{Nothing, String} = nothing)
     # Tool results are JSON-encoded for the provider, so they must be valid
     # UTF-8 even when the underlying source emitted arbitrary bytes.
@@ -231,15 +184,6 @@ function glob_to_regex(pattern::String)
     print(out, "\$")
     return Regex(String(take!(out)))
 end
-
-function command_has_absolute_path(command::String)
-    return occursin(r"(^|\s)(/|~)", command)
-end
-
-function shell_escape(text::AbstractString)
-    return "'" * replace(text, "'" => raw"'\''") * "'"
-end
-
 
 function strip_dir_suffix(entry::String)
     # `end - 1` is byte arithmetic: with a multi-byte char right before the
@@ -714,11 +658,6 @@ function all_tools(base_dir::AbstractString = pwd(); parent::Union{Nothing, Agen
     parent !== nothing && (tools["subagent"] = create_subagent_tool(parent))
     insert_terminal_tools!(tools, base_dir)
     workers && insert_worker_tools!(tools)
-    return tools
-end
-
-function append_worker_tools!(tools::Vector{AgentTool})
-    append!(tools, create_worker_tools())
     return tools
 end
 
@@ -1477,104 +1416,6 @@ end
 #==============================================================================#
 
 const SEARCH_MAX_RESULTS = 20
-
-"""
-Parse DuckDuckGo HTML search results from html.duckduckgo.com.
-Returns a vector of (title, url, snippet) tuples.
-Filters out ads (URLs containing duckduckgo.com/y.js).
-"""
-function parse_duckduckgo_html_results(html::String)
-    results = Tuple{String, String, String}[]
-
-    # Find result__a links (title + URL)
-    result_links = collect(eachmatch(r"class=\"result__a\"[^>]*href=\"([^\"]+)\"[^>]*>([^<]+)</a>"si, html))
-
-    # Find result__snippet elements
-    snippets = collect(eachmatch(r"class=\"result__snippet\"[^>]*>([^<]*(?:<[^>]+>[^<]*)*)</a>"si, html))
-
-    for (i, link_match) in enumerate(result_links)
-        url = String(link_match.captures[1])
-        title = String(link_match.captures[2])
-
-        # Skip ads (DDG ad URLs contain /y.js or go through duckduckgo.com redirect)
-        occursin("duckduckgo.com/y.js", url) && continue
-        occursin("/y.js?", url) && continue
-
-        # Decode HTML entities in URL
-        url = replace(url, "&amp;" => "&")
-
-        # Clean title
-        title = strip(replace(title, r"\s+" => " "))
-
-        # Get snippet if available
-        snippet = ""
-        if i <= length(snippets)
-            raw_snippet = snippets[i].captures[1]
-            snippet = replace(raw_snippet, r"<[^>]+>" => "")  # Strip HTML tags
-            snippet = strip(replace(snippet, r"\s+" => " "))
-        end
-
-        push!(results, (title, url, snippet))
-    end
-
-    return results
-end
-
-"""
-Parse DuckDuckGo HTML search results (legacy parser).
-Returns a vector of (title, url, snippet) tuples.
-"""
-function parse_duckduckgo_results(html::String)
-    results = Tuple{String, String, String}[]
-
-    # DuckDuckGo uses class="result" for each result
-    # This is a simplified parser - DDG's HTML structure can vary
-    result_blocks = eachmatch(r"<div[^>]*class=\"[^\"]*result[^\"]*\"[^>]*>(.*?)</div>\s*(?=<div[^>]*class=\"[^\"]*result|$)"si, html)
-
-    for m in result_blocks
-        block = m.captures[1]
-
-        # Extract title and URL from the result link
-        title_match = match(r"<a[^>]*class=\"[^\"]*result__a[^\"]*\"[^>]*href=\"([^\"]+)\"[^>]*>([^<]*(?:<[^>]+>[^<]*)*)</a>"si, block)
-        if title_match === nothing
-            # Alternative pattern
-            title_match = match(r"<a[^>]*href=\"([^\"]+)\"[^>]*class=\"[^\"]*result[^\"]*\"[^>]*>([^<]*(?:<[^>]+>[^<]*)*)</a>"si, block)
-        end
-
-        title_match === nothing && continue
-
-        url = title_match.captures[1]
-        title = replace(title_match.captures[2], r"<[^>]+>" => "")  # Strip HTML tags
-
-        # Skip DDG internal links
-        startswith(url, "/") && continue
-        occursin("duckduckgo.com", url) && continue
-
-        # Extract snippet
-        snippet = ""
-        snippet_match = match(r"<a[^>]*class=\"[^\"]*result__snippet[^\"]*\"[^>]*>([^<]*(?:<[^>]+>[^<]*)*)</a>"si, block)
-        if snippet_match !== nothing
-            snippet = replace(snippet_match.captures[1], r"<[^>]+>" => "")
-        end
-
-        # Clean up text
-        title = strip(replace(title, r"\s+" => " "))
-        snippet = strip(replace(snippet, r"\s+" => " "))
-
-        # Decode URL if needed (DDG sometimes encodes URLs)
-        if startswith(url, "//duckduckgo.com/l/?uddg=")
-            # Extract actual URL from DDG redirect
-            url_match = match(r"uddg=([^&]+)", url)
-            if url_match !== nothing
-                url = HTTP.unescapeuri(url_match.captures[1])
-            end
-        end
-
-        push!(results, (title, url, snippet))
-    end
-
-    return results
-end
 
 """
 Parse DuckDuckGo Lite results (simpler HTML structure).
