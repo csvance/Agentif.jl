@@ -250,8 +250,7 @@ function filter_dispatchable(models::Vector{ParsedModel})
     kept = ParsedModel[]
     dropped = Dict{String, Int}()
     for m in models
-        api = getfieldval(m.fields, "api")
-        api_value = api isa TSStr ? api.value : ""
+        api_value = validate_string_field(m, "api").value
         if api_value in DISPATCHABLE_APIS
             push!(kept, m)
         else

@@ -124,6 +124,12 @@ const MODEL_B = """
         @test filtered.providers == 1
         @test filtered.dropped == Dict("bedrock-converse-stream" => 1)
         @test !occursin("bedrock", read(joinpath(dir, "filtered.json"), String))
+
+        # Filtering must not hide malformed model records.
+        missing_api = joinpath(dir, "missing-api.json")
+        malformed = replace(MODEL_A, "  \"api\": \"openai-responses\",\n" => "")
+        write(missing_api, """{"a":{"a":$malformed},"z":{"b":$MODEL_B}}""")
+        @test_throws ErrorException generate(missing_api, joinpath(dir, "missing-api.jl"))
     end
 end
 
