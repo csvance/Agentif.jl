@@ -382,36 +382,8 @@ Base.@kwdef mutable struct GitHubEventSource <: Claw.EventSource
     # away from being the internet's event source.
     host::String = get(ENV, "GITHUB_WEBHOOK_HOST", "127.0.0.1")
     port::Int = parse(Int, get(ENV, "GITHUB_WEBHOOK_PORT", "8080"))
-    app_id::Union{Nothing, Int} = let v = get(ENV, "GITHUB_APP_ID", ""); isempty(v) ? nothing : parse(Int, v) end
-    private_key_path::Union{Nothing, String} = let v = get(ENV, "GITHUB_PRIVATE_KEY_PATH", ""); isempty(v) ? nothing : v end
     repos::Union{Nothing, Vector{String}} = nothing
     events::Union{Nothing, Vector{String}} = nothing
-    # populated lazily by _get_jwt_auth
-    _jwt_auth::Any = nothing
-end
-
-function _get_jwt_auth(source::GitHubEventSource)
-    source._jwt_auth !== nothing && return source._jwt_auth::GitHub.JWTAuth
-    source.app_id === nothing && return nothing
-    source.private_key_path === nothing && return nothing
-    auth = GitHub.JWTAuth(source.app_id, source.private_key_path)
-    source._jwt_auth = auth
-    return auth
-end
-
-function _get_installation_auth(source::GitHubEventSource, payload::AbstractDict)
-    jwt = _get_jwt_auth(source)
-    jwt === nothing && return nothing
-    inst_data = get(() -> nothing, payload, "installation")
-    inst_data isa AbstractDict || return nothing
-    inst_id = get(() -> nothing, inst_data, "id")
-    inst_id === nothing && return nothing
-    try
-        return GitHub.create_access_token(GitHub.Installation(; id=inst_id); auth=jwt)
-    catch e
-        @warn "ClawGitHubExt: failed to create installation access token" exception=(e, catch_backtrace())
-        return nothing
-    end
 end
 
 # Issue bodies, PR descriptions and comments are written by anyone with a GitHub

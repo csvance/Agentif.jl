@@ -2,28 +2,9 @@
 # Provides EventSource integration so async operations notify the parent via events.
 # PtySessions and ConcurrentUtilities accessed through LLMTools (already a dep).
 
-# ─── ParentAgentChannel ───
-# Sink channel for event handler evaluations. The parent's response
-# is captured in session (via session middleware) but not streamed externally.
-
-struct ParentAgentChannel <: Agentif.AbstractChannel end
-
-Agentif.channel_id(::ParentAgentChannel) = "parent"
-Agentif.channel_name(::ParentAgentChannel) = "Parent Agent (internal)"
-Agentif.start_streaming(::ParentAgentChannel) = nothing
-Agentif.append_to_stream(::ParentAgentChannel, ::AbstractString) = nothing
-Agentif.finish_streaming(::ParentAgentChannel) = nothing
-Agentif.send_message(::ParentAgentChannel, _) = nothing
-Agentif.close_channel(::ParentAgentChannel) = nothing
-Agentif.is_group(::ParentAgentChannel) = false
-Agentif.is_private(::ParentAgentChannel) = true
-
 # ─── AsyncSessionChannel ───
-# Async completions used to evaluate into the shared `ParentAgentChannel`, which is
-# a no-op sink on channel "parent": the user was told "you'll be notified" and never
-# was, and every async session shared one branch. This channel captures the
-# originating channel at spawn time and delegates sends to it, while keeping a
-# per-session `channel_id` so each async session gets its own branch.
+# Captures the originating channel at spawn time and delegates sends to it, while
+# keeping a per-session `channel_id` so each async session gets its own branch.
 
 mutable struct AsyncSessionChannel <: Agentif.AbstractChannel
     session_name::String
@@ -196,7 +177,7 @@ end
 
 LLMToolsEventSource(config::AgentConfig) = LLMToolsEventSource(config, Dict{String, ClawLLMSession}(), ReentrantLock())
 
-get_channels(::LLMToolsEventSource) = Agentif.AbstractChannel[ParentAgentChannel()]
+get_channels(::LLMToolsEventSource) = Agentif.AbstractChannel[]
 get_event_types(::LLMToolsEventSource) = EventType[]
 get_event_handlers(::LLMToolsEventSource) = EventHandler[]
 

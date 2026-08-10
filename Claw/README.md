@@ -179,7 +179,6 @@ Useful starting points in the repo:
 - `Claw/ext/slack_run.jl`
 - `Claw/ext/mattermost_run.jl`
 - `Claw/examples/mattermost_live_test.jl`
-- `Claw/examples/heartbeat_poll_source.jl`
 
 Examples live in `Claw/examples/`.
 

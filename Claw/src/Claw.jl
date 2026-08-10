@@ -309,36 +309,6 @@ function _new_agent_assistant(;
     )
 end
 
-# Preserve the pre-watcher positional constructor. The durable pipeline needs
-# additional runtime state, which is initialized with safe shared-DB defaults.
-function AgentAssistant(
-        config::AgentConfig,
-        db::SQLite.DB,
-        channels::Dict{String, Agentif.AbstractChannel},
-        event_queue::Base.Channel,
-        session_store::Agentif.SessionStore,
-        tools::Vector{Agentif.AgentTool},
-        scheduler::Tempus.Scheduler,
-        log_level::Union{Nothing, LogLevel},
-    )
-    pipeline = PipelineConfig()
-    wakeups = event_queue isa Base.Channel{Int} ? event_queue : Base.Channel{Int}(Inf)
-    return _new_agent_assistant(;
-        config,
-        db,
-        _channels = channels,
-        event_queue = wakeups,
-        session_store,
-        tools,
-        scheduler,
-        log_level,
-        pipeline,
-        _writer = SQLiteWriter("", db),
-        _readers = ReaderPool("", db),
-        _sem = Base.Semaphore(pipeline.max_concurrent_evals),
-    )
-end
-
 # ─── SQLite schema ───
 
 function _init_claw_schema!(db::SQLite.DB)
