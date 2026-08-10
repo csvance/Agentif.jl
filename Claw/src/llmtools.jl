@@ -377,6 +377,12 @@ Keep the tail (the part a caller actually needs) and cut on a valid character
 boundary so a truncated multi-byte sequence never reaches the model.
 """
 function _truncate_pty_output(text::String, max_bytes::Int)
+    # PTY output is arbitrary bytes, but it lands in event payloads that are
+    # JSON-encoded for the model and persisted to SQLite, so it must be valid
+    # UTF-8. Repairing here also keeps the index arithmetic below well-defined.
+    # This is the point at which the captured output is complete, so a character
+    # split across two reads is already rejoined.
+    text = LLMTools.repair_utf8(text)
     max_bytes <= 0 && return text
     ncodeunits(text) <= max_bytes && return text
     dropped = ncodeunits(text) - max_bytes
