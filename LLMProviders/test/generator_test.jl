@@ -107,16 +107,23 @@ const MODEL_B = """
         write(trailing, """{"a":{"a":$MODEL_A}} trailing""")
         @test_throws ErrorException parse_models_json(trailing)
 
-        split_ts = joinpath(dir, "models.generated.ts")
+        # Undispatchable apis are filtered out of the emitted catalog.
+        mixed = joinpath(dir, "mixed.json")
         write(
-            split_ts,
-            """
-            export const MODELS: {
-            \treadonly "anthropic": typeof ANTHROPIC_MODELS;
-            } = {};
-            """,
+            mixed,
+            """{"a":{"a":$MODEL_A},"bedrock":{"m":$(replace(MODEL_B, "\"api\": \"anthropic-messages\"" => "\"api\": \"bedrock-converse-stream\"", "\"provider\": \"z\"" => "\"provider\": \"bedrock\"", "\"id\": \"b\"" => "\"id\": \"m\""))}}""",
         )
-        @test_throws ErrorException parse_models_ts(split_ts)
+        filtered = generate(
+            mixed,
+            joinpath(dir, "filtered.jl");
+            source_label = "fixture/mixed.json",
+            describe = "fixture-rev",
+            date = "2026-07-30",
+        )
+        @test filtered.models == 1
+        @test filtered.providers == 1
+        @test filtered.dropped == Dict("bedrock-converse-stream" => 1)
+        @test !occursin("bedrock", read(joinpath(dir, "filtered.json"), String))
     end
 end
 

@@ -414,19 +414,19 @@ end
     # Roster shipped by models_generated.json plus models_custom.jl. Keep this
     # explicit so providers registered by earlier testsets do not enter the sweep.
     registry_providers = [
-        "amazon-bedrock", "ant-ling", "anthropic", "azure-openai-responses",
+        "ant-ling", "anthropic", "baseten",
         "cerebras", "cloudflare-ai-gateway", "cloudflare-workers-ai", "deepseek",
         "fireworks", "github-copilot", "google", "google-gemini-cli",
-        "google-vertex", "groq", "huggingface", "kimi-coding", "minimax",
-        "minimax-cn", "mistral", "moonshotai", "moonshotai-cn", "nvidia",
+        "groq", "huggingface", "kimi-coding", "minimax",
+        "minimax-cn", "moonshotai", "moonshotai-cn", "nvidia",
         "openai", "openai-codex", "opencode", "opencode-go", "openrouter",
-        "qwen-token-plan", "qwen-token-plan-cn", "together",
-        "vercel-ai-gateway", "xai", "xiaomi", "xiaomi-token-plan-ams",
+        "qwen-token-plan", "qwen-token-plan-cn", "qwen-token-plan-individual",
+        "together", "vercel-ai-gateway", "xai", "xiaomi", "xiaomi-token-plan-ams",
         "xiaomi-token-plan-cn", "xiaomi-token-plan-sgp", "zai", "zai-coding-cn",
     ]
     @test issubset(registry_providers, LLMProviders.getProviders())
     all_models = [m for p in registry_providers for m in LLMProviders.getModels(p)]
-    @test length(all_models) >= 1168
+    @test length(all_models) >= 1020
 
     # Current upstream examples, including the active Sonnet 5 introductory rate.
     for (provider, id, input, output) in [

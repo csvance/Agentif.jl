@@ -41,12 +41,12 @@ Source resolution order:
 3. `$PI_MONO/.artifacts/model-catalog/models.json`;
 4. `~/pi-mono/.artifacts/model-catalog/models.json`.
 
-`$PI_MONO_MODELS_TS` and the old monolithic TypeScript format remain supported
-for older pi-mono checkouts. The current split TypeScript format fails with an
-instruction to generate the JSON catalog.
-
 Positional argument 2 overrides the Julia loader path. The JSON path uses the
 same stem with a `.json` extension.
+
+Models whose `api` value Agentif cannot dispatch (see `DISPATCHABLE_APIS` in
+`generate_models.jl`) are dropped at generation time; the run summary reports
+the per-api drop counts.
 
 The loader header records the source path, pi-mono revision, and generation
 date. The catalog comes from live provider APIs. The same pi-mono commit can
