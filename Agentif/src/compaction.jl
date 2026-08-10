@@ -82,7 +82,7 @@ function estimate_message_tokens(msg::AgentMessage)
 end
 
 """
-    find_cut_point(messages::Vector{<:AgentMessage}, keep_recent_tokens::Int) -> Int
+    find_cut_point(messages::Vector{StoredAgentMessage}, keep_recent_tokens::Int) -> Int
 
 Walk backwards from the end of messages, accumulating token estimates.
 Returns the index of the first message to KEEP (messages[1:idx-1] get compacted).
@@ -132,7 +132,7 @@ function find_cut_point(messages::Vector{StoredAgentMessage}, keep_recent_tokens
 end
 
 """
-    format_messages_for_summary(messages::Vector{<:AgentMessage}) -> String
+    format_messages_for_summary(messages::Vector{StoredAgentMessage}) -> String
 
 Format discarded messages as readable text for the summarization prompt.
 """
