@@ -3,7 +3,7 @@ using JSON
 
 const OPENAI_RESPONSES_TOOL_CALL_PROVIDERS = Set(["openai", "openai-codex", "opencode"])
 
-function openai_responses_build_tools(tools::Vector{AgentTool})
+function openai_responses_build_tools(tools::Vector{<:AgentTool})
     isempty(tools) && return nothing
     provider_tools = OpenAIResponses.Tool[]
     for tool in tools
@@ -19,64 +19,15 @@ function openai_responses_build_tools(tools::Vector{AgentTool})
     return provider_tools
 end
 
-function openai_responses_input_content(blocks::Vector{UserContentBlock})
-    content = OpenAIResponses.InputContent[]
-    for block in blocks
-        if block isa TextContent
-            push!(content, OpenAIResponses.InputTextContent(; text = block.text))
-        elseif block isa ImageContent
-            url = "data:$(block.mimeType);base64,$(block.data)"
-            push!(content, OpenAIResponses.InputImageContent(; image_url = url))
-        end
-    end
-    return content
-end
-
-function openai_responses_tool_output_content(blocks::Vector{ToolResultContentBlock})
-    content = OpenAIResponses.InputContent[]
-    for block in blocks
-        if block isa TextContent
-            push!(content, OpenAIResponses.InputTextContent(; text = block.text))
-        elseif block isa ImageContent
-            url = "data:$(block.mimeType);base64,$(block.data)"
-            push!(content, OpenAIResponses.InputImageContent(; image_url = url))
-        end
-    end
-    return content
-end
-
-function openai_responses_build_input(input::AgentTurnInput)
-    if input isa String
-        return input
-    elseif input isa UserMessage
-        content = openai_responses_input_content(input.content)
-        return OpenAIResponses.InputItem[OpenAIResponses.Message(; role = "user", content = content)]
-    elseif input isa Vector{UserContentBlock}
-        content = openai_responses_input_content(input)
-        return OpenAIResponses.InputItem[OpenAIResponses.Message(; role = "user", content = content)]
-    elseif input isa Vector{ToolResultMessage}
-        outputs = OpenAIResponses.FunctionToolCallOutput[]
-        for result in input
-            output_blocks = openai_responses_tool_output_content(result.content)
-            if isempty(output_blocks)
-                push!(outputs, OpenAIResponses.FunctionToolCallOutput(; call_id = result.call_id, output = ""))
-            elseif length(output_blocks) == 1 && output_blocks[1] isa OpenAIResponses.InputTextContent
-                push!(outputs, OpenAIResponses.FunctionToolCallOutput(; call_id = result.call_id, output = output_blocks[1].text))
-            else
-                push!(outputs, OpenAIResponses.FunctionToolCallOutput(; call_id = result.call_id, output = output_blocks))
-            end
-        end
-        return OpenAIResponses.InputItem[outputs...]
-    end
-    throw(ArgumentError("unsupported turn input: $(typeof(input))"))
-end
-
 function _responses_split_compound_id(id::AbstractString)
     idx = findfirst('|', id)
     if idx === nothing
         return (String(id), nothing)
     end
-    return (String(id[1:idx-1]), String(id[idx+1:end]))
+    return (
+        String(id[1:prevind(id, idx)]),
+        String(id[nextind(id, idx):end]),
+    )
 end
 
 function openai_responses_normalize_tool_call_id(id::String, model::Model)
@@ -100,7 +51,7 @@ function openai_responses_normalize_tool_call_id(id::String, model::Model)
 end
 
 function openai_responses_transformed_messages(state::AgentState, input::AgentTurnInput, model::Model)
-    raw_messages = AgentMessage[]
+    raw_messages = StoredAgentMessage[]
     for msg in state.messages
         include_in_context(msg) || continue
         push!(raw_messages, msg)
@@ -252,7 +203,7 @@ function openai_responses_stop_reason(status::Union{Nothing, String}, tool_calls
 end
 
 function openai_responses_event_callback(
-        f::Function,
+        f::F,
         agent::Agent,
         assistant_message::AssistantMessage,
         started::Base.RefValue{Bool},
@@ -260,7 +211,7 @@ function openai_responses_event_callback(
         response_usage::Base.RefValue{Union{Nothing, OpenAIResponses.Usage}},
         response_status::Base.RefValue{Union{Nothing, String}},
         abort::Abort,
-    )
+    ) where {F <: Function}
     return function (stream, event)
         maybe_abort!(abort, stream)
         data = String(event.data)
@@ -414,6 +365,10 @@ function openai_responses_event_callback(
             if response_id !== nothing
                 assistant_message.response_id = response_id
             end
+            if started[] && !ended[]
+                ended[] = true
+                f(MessageEndEvent(:assistant, assistant_message))
+            end
         elseif parsed isa OpenAIResponses.StreamResponseFailedEvent
             response_status[] = parsed.response.status
             response_usage[] = parsed.response.usage
@@ -435,11 +390,6 @@ function openai_responses_event_callback(
         elseif parsed isa OpenAIResponses.StreamResponseIncompleteEvent
             response_status[] = parsed.response.status
             response_usage[] = parsed.response.usage
-            if started[] && !ended[]
-                ended[] = true
-                f(MessageEndEvent(:assistant, assistant_message))
-            end
-        elseif parsed isa OpenAIResponses.StreamOutputDoneEvent || parsed isa OpenAIResponses.StreamDoneEvent
             if started[] && !ended[]
                 ended[] = true
                 f(MessageEndEvent(:assistant, assistant_message))

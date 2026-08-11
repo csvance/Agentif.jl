@@ -272,21 +272,101 @@ Keep your response concise."""
 Base.@kwdef mutable struct TelegramEventSource <: Claw.EventSource
     use_polling::Bool = true
     timeout::Int = 30
-    host::String = "0.0.0.0"
+    # Loopback by default in webhook mode (§2.1), same rule as the other
+    # HTTP-listening sources: bind wider only behind a proxy you chose.
+    host::String = get(ENV, "TELEGRAM_WEBHOOK_HOST", "127.0.0.1")
     port::Int = 8080
     path::String = "/webhook"
-    secret_token::Union{String, Nothing} = nothing
+    secret_token::Union{String, Nothing} = let
+        token = strip(get(ENV, "TELEGRAM_WEBHOOK_SECRET_TOKEN", ""))
+        isempty(token) ? nothing : token
+    end
     # Runtime state (set during start!)
     client::Union{Nothing, Telegram.Client} = nothing
 end
 
 Claw.get_event_types(::TelegramEventSource) = Claw.EventType[MESSAGE_EVENT_TYPE, REACTION_EVENT_TYPE]
 
+function Claw.validate_source(source::TelegramEventSource)
+    if !source.use_polling
+        token = source.secret_token
+        (token isa String && !isempty(strip(token))) || error(
+            "Telegram webhook mode requires a secret token. Set " *
+            "TELEGRAM_WEBHOOK_SECRET_TOKEN or pass secret_token explicitly.")
+    end
+    return nothing
+end
+
 function Claw.get_event_handlers(::TelegramEventSource)
     Claw.EventHandler[
         Claw.EventHandler("telegram_message_default", ["telegram_message"], "", nothing),
         Claw.EventHandler("telegram_reaction_default", ["telegram_reaction"], REACTION_HANDLER_PROMPT, nothing),
     ]
+end
+
+# Telegram chats (groups especially) carry content the owner did not write, and
+# their channels are minted per chat at runtime, so the group/public-channel rule
+# can never see them at startup — declare it at the source level (§2.2).
+Claw.third_party_content(::TelegramEventSource) = true
+
+Claw.event_source_tag(::TelegramMessageEvent) = "telegram"
+Claw.event_source_tag(::TelegramReactionEvent) = "telegram"
+function _telegram_event_extra(ch::TelegramChannel)
+    return Dict{String, Any}(
+        "message_id" => ch.message_id,
+        "user_id" => ch.user_id,
+        "user_name" => ch.user_name,
+        "chat_type" => ch.chat_type,
+    )
+end
+function Claw.event_extra(ev::TelegramMessageEvent)
+    extra = _telegram_event_extra(ev.channel)
+    extra["direct_ping"] = ev.direct_ping
+    return extra
+end
+function Claw.event_extra(ev::TelegramReactionEvent)
+    extra = _telegram_event_extra(ev.channel)
+    extra["emoji"] = ev.emoji
+    return extra
+end
+
+# "telegram:<chat_id>" round-trips, so a replayed event rebuilds its channel from
+# the live client (group chat ids are negative — the sign must be accepted).
+function _rehydrate_telegram_event(source::TelegramEventSource, row)
+    row.channel_id === nothing && return Claw.ReplayedEvent(row.name, row.content)
+    client = source.client
+    client === nothing && return nothing
+    m = match(r"^telegram:(-?\d+)$", row.channel_id)
+    m === nothing && return nothing
+    raw_message_id = get(() -> nothing, row.extra, "message_id")
+    message_id = raw_message_id isa Integer ? Int64(raw_message_id) : nothing
+    user_id = let value = get(() -> "", row.extra, "user_id")
+        value isa AbstractString ? String(value) : ""
+    end
+    user_name = let value = get(() -> "", row.extra, "user_name")
+        value isa AbstractString ? String(value) : ""
+    end
+    chat_type = let value = get(() -> "private", row.extra, "chat_type")
+        value isa AbstractString ? String(value) : "private"
+    end
+    ch = TelegramChannel(
+        parse(Int64, m.captures[1]),
+        message_id,
+        client,
+        IOBuffer(),
+        user_id,
+        user_name,
+        chat_type,
+    )
+    return Claw.ReplayedChannelEvent(row.name, row.content, ch)
+end
+
+function _register_telegram_rehydrator!(source::TelegramEventSource)
+    Claw.register_rehydrator!(
+        "telegram",
+        row -> _rehydrate_telegram_event(source, row),
+    )
+    return nothing
 end
 
 # ─── Update handling ───
@@ -325,7 +405,10 @@ function _handle_message(update, bot_user_id, bot_username, assistant)
     @info "ClawTelegramExt: message" chat_id message_id direct_ping
 
     ch = TelegramChannel(chat_id, message_id, Telegram._get_client(), IOBuffer(), user_id, user_name, chat_type)
-    put!(assistant.event_queue, TelegramMessageEvent(ch, text, direct_ping))
+    # Telegram redelivers an update until it is confirmed; `update_id` is the
+    # delivery id, so a redelivery collides on the UNIQUE dedup_key.
+    Claw.submit_event!(assistant, TelegramMessageEvent(ch, text, direct_ping);
+        dedup_key = "telegram:update:$(update.update_id):message")
 end
 
 function _handle_reaction(update, bot_user_id, assistant)
@@ -363,7 +446,8 @@ function _handle_reaction(update, bot_user_id, assistant)
     @info "ClawTelegramExt: reaction" emoji chat_id message_id user_id
 
     ch = TelegramChannel(chat_id, message_id, Telegram._get_client(), IOBuffer(), user_id, user_name, chat_type)
-    put!(assistant.event_queue, TelegramReactionEvent(ch, emoji, user_name, message_id))
+    Claw.submit_event!(assistant, TelegramReactionEvent(ch, emoji, user_name, message_id);
+        dedup_key = "telegram:update:$(update.update_id):reaction")
 end
 
 function _handle_update(update, bot_user_id::String, bot_username::String, assistant::Claw.AgentAssistant)
@@ -375,6 +459,7 @@ end
 # ─── start! ───
 
 function Claw.start!(source::TelegramEventSource, assistant::Claw.AgentAssistant)
+    Claw.validate_source(source)
     errormonitor(Threads.@spawn begin
         Telegram.with_telegram(ENV["TELEGRAM_BOT_TOKEN"]) do
             me = Telegram.get_me()
@@ -384,6 +469,7 @@ function Claw.start!(source::TelegramEventSource, assistant::Claw.AgentAssistant
 
             # Store client for on-demand channel construction
             source.client = Telegram._get_client()
+            _register_telegram_rehydrator!(source)
 
             # Seed channels from persisted handler/job channel_ids so that
             # non-ChannelEvents (e.g. JMAP email) can route to Telegram
@@ -392,7 +478,9 @@ function Claw.start!(source::TelegramEventSource, assistant::Claw.AgentAssistant
             for row in Claw.SQLite.DBInterface.execute(assistant.db,
                 "SELECT DISTINCT channel_id FROM claw_event_handlers WHERE channel_id LIKE 'telegram:%'")
                 cid = row.channel_id === missing ? "" : String(row.channel_id)
-                m = match(r"^telegram:(\d+)$", cid)
+                # Group/supergroup chat ids are negative — the sign must be accepted
+                # or persisted group handlers silently resolve to a sink after restart.
+                m = match(r"^telegram:(-?\d+)$", cid)
                 m !== nothing && push!(seed_channels, TelegramChannel(
                     parse(Int64, m.captures[1]), nothing, source.client, IOBuffer(), "", "", "private"))
             end

@@ -2,21 +2,75 @@
 # Provides EventSource integration so async operations notify the parent via events.
 # PtySessions and ConcurrentUtilities accessed through LLMTools (already a dep).
 
-# ─── ParentAgentChannel ───
-# Sink channel for event handler evaluations. The parent's response
-# is captured in session (via session middleware) but not streamed externally.
+# ─── AsyncSessionChannel ───
+# Captures the originating channel at spawn time and delegates sends to it, while
+# keeping a per-session `channel_id` so each async session gets its own branch.
 
-struct ParentAgentChannel <: Agentif.AbstractChannel end
+mutable struct AsyncSessionChannel <: Agentif.AbstractChannel
+    session_name::String
+    origin_channel_id::Union{Nothing, String}
+    io::Union{Nothing, IOBuffer}
+end
 
-Agentif.channel_id(::ParentAgentChannel) = "parent"
-Agentif.channel_name(::ParentAgentChannel) = "Parent Agent (internal)"
-Agentif.start_streaming(::ParentAgentChannel) = nothing
-Agentif.append_to_stream(::ParentAgentChannel, ::AbstractString) = nothing
-Agentif.finish_streaming(::ParentAgentChannel) = nothing
-Agentif.send_message(::ParentAgentChannel, _) = nothing
-Agentif.close_channel(::ParentAgentChannel) = nothing
-Agentif.is_group(::ParentAgentChannel) = false
-Agentif.is_private(::ParentAgentChannel) = true
+AsyncSessionChannel(name::String, origin::Union{Nothing, String}) = AsyncSessionChannel(name, origin, nothing)
+
+async_channel_id(name::AbstractString) = "async:$(name)"
+
+Agentif.channel_id(ch::AsyncSessionChannel) = async_channel_id(ch.session_name)
+Agentif.channel_name(ch::AsyncSessionChannel) = "Async session $(ch.session_name)"
+
+function _async_origin(ch::AsyncSessionChannel)
+    ch.origin_channel_id === nothing && return nothing
+    a = get_current_assistant()
+    a === nothing && return nothing
+    origin = get(a._channels, ch.origin_channel_id, nothing)
+    origin isa AsyncSessionChannel && return nothing   # never chain async channels
+    return origin
+end
+
+# Buffer rather than stream: the origin channel object is shared, and a rehydrated
+# or long-idle channel has lost its streaming context anyway.
+Agentif.start_streaming(ch::AsyncSessionChannel) = (ch.io === nothing && (ch.io = IOBuffer()); nothing)
+function Agentif.append_to_stream(ch::AsyncSessionChannel, delta::AbstractString)
+    ch.io === nothing && (ch.io = IOBuffer())
+    write(ch.io, String(delta))
+    return nothing
+end
+Agentif.finish_streaming(::AsyncSessionChannel) = nothing
+
+function Agentif.send_message(ch::AsyncSessionChannel, msg)
+    origin = _async_origin(ch)
+    if origin === nothing
+        @debug "Claw: async session has no reachable origin channel; dropping message" session = ch.session_name origin = ch.origin_channel_id
+        return nothing
+    end
+    return Agentif.send_message(origin, msg)
+end
+
+function Agentif.close_channel(ch::AsyncSessionChannel)
+    io = ch.io
+    ch.io = nothing
+    io === nothing && return nothing
+    text = String(take!(io))
+    isempty(strip(text)) && return nothing
+    Agentif.send_message(ch, text)
+    return nothing
+end
+
+function Agentif.is_group(ch::AsyncSessionChannel)
+    origin = _async_origin(ch)
+    return origin === nothing ? false : Agentif.is_group(origin)
+end
+
+function Agentif.is_private(ch::AsyncSessionChannel)
+    origin = _async_origin(ch)
+    return origin === nothing ? true : Agentif.is_private(origin)
+end
+
+# Session entries for async completions belong to the async session's own branch,
+# not the originating conversation's.
+Agentif.search_channel_id(ch::AsyncSessionChannel) =
+    ch.origin_channel_id === nothing ? Agentif.channel_id(ch) : ch.origin_channel_id
 
 # ─── Session tracking ───
 
@@ -49,11 +103,20 @@ struct PtyOutputEvent <: Event
     name::String
     output::String
     exit_code::Union{Nothing, Int}
+    exited::Bool
 end
+PtyOutputEvent(event_type, name, output, exit_code) =
+    PtyOutputEvent(event_type, name, output, exit_code, exit_code !== nothing)
 get_name(ev::PtyOutputEvent) = ev.event_type
 function event_content(ev::PtyOutputEvent)
     parts = [ev.output]
-    ev.exit_code !== nothing && push!(parts, "\n[Process exited with code $(ev.exit_code)]")
+    if ev.exited
+        # Report the *real* status: telling the agent a failing build exited 0 is
+        # worse than telling it the status could not be read.
+        push!(parts, ev.exit_code === nothing ?
+            "\n[Process exited (status unavailable)]" :
+            "\n[Process exited with code $(ev.exit_code)]")
+    end
     return join(parts)
 end
 
@@ -65,6 +128,45 @@ end
 get_name(ev::WorkerOutputEvent) = ev.event_type
 event_content(ev::WorkerOutputEvent) = ev.output
 
+# Async completions all share one lane so a chatty process produces a queue, not
+# 1200 concurrent LLM calls (§1.4).
+event_source_tag(::SubagentOutputEvent) = "llmtools"
+event_source_tag(::PtyOutputEvent) = "llmtools"
+event_source_tag(::WorkerOutputEvent) = "llmtools"
+event_lane(::SubagentOutputEvent) = "async"
+event_lane(::PtyOutputEvent) = "async"
+event_lane(::WorkerOutputEvent) = "async"
+
+function _async_event_extra(name::String)
+    extra = Dict{String, Any}("session" => name)
+    assistant = get_current_assistant()
+    assistant === nothing && return extra
+    ch = get(assistant._channels, async_channel_id(name), nothing)
+    if ch isa AsyncSessionChannel && ch.origin_channel_id !== nothing
+        extra["origin_channel_id"] = ch.origin_channel_id
+    end
+    return extra
+end
+
+function event_extra(ev::PtyOutputEvent)
+    extra = _async_event_extra(ev.name)
+    extra["exit_code"] = ev.exit_code
+    extra["exited"] = ev.exited
+    return extra
+end
+event_extra(ev::SubagentOutputEvent) = _async_event_extra(ev.name)
+event_extra(ev::WorkerOutputEvent) = _async_event_extra(ev.name)
+
+function _rehydrate_llmtools_event(row)
+    name = get(() -> "", row.extra, "session")
+    origin = get(() -> nothing, row.extra, "origin_channel_id")
+    if name isa AbstractString && !isempty(name) && origin isa AbstractString
+        ch = AsyncSessionChannel(String(name), String(origin))
+        row.assistant._channels[Agentif.channel_id(ch)] = ch
+    end
+    return ReplayedEvent(row.name, row.content)
+end
+
 # ─── LLMToolsEventSource ───
 
 mutable struct LLMToolsEventSource <: EventSource
@@ -75,7 +177,7 @@ end
 
 LLMToolsEventSource(config::AgentConfig) = LLMToolsEventSource(config, Dict{String, ClawLLMSession}(), ReentrantLock())
 
-get_channels(::LLMToolsEventSource) = Agentif.AbstractChannel[ParentAgentChannel()]
+get_channels(::LLMToolsEventSource) = Agentif.AbstractChannel[]
 get_event_types(::LLMToolsEventSource) = EventType[]
 get_event_handlers(::LLMToolsEventSource) = EventHandler[]
 
@@ -91,6 +193,34 @@ function get_tools(es::LLMToolsEventSource)
 end
 
 start!(::LLMToolsEventSource, ::AgentAssistant) = nothing
+
+function stop!(es::LLMToolsEventSource)
+    sessions = lock(es.lock) do
+        snapshot = collect(values(es.sessions))
+        empty!(es.sessions)
+        snapshot
+    end
+    for session in sessions
+        session.status = "killed"
+        if session.kind === :pty && session.registry_id > 0
+            LLMTools.remove_session!(LLMTools.PTY_REGISTRY, session.registry_id;
+                mark_status = LLMTools.SESSION_STATUS_KILLED, close_session = true)
+        elseif session.kind === :worker && session.registry_id > 0
+            LLMTools.remove_session!(LLMTools.WORKER_REGISTRY, session.registry_id;
+                mark_status = LLMTools.SESSION_STATUS_KILLED, close_session = true)
+        end
+        task = session.task
+        if task !== nothing && !istaskdone(task)
+            try
+                schedule(task, InterruptException(); error = true)
+            catch
+            end
+        end
+    end
+    tasks = Task[s.task for s in sessions if s.task !== nothing]
+    isempty(tasks) || timedwait(() -> all(istaskdone, tasks), 5.0; pollint = 0.05)
+    return nothing
+end
 
 # ─── Helpers ───
 
@@ -144,6 +274,27 @@ function _get_session(es::LLMToolsEventSource, name::String, kind::Symbol)
     return session
 end
 
+function _async_session_cancelled(
+        es::LLMToolsEventSource,
+        assistant::AgentAssistant,
+        name::String,
+        err::Union{Nothing, Exception} = nothing,
+    )
+    err isa InterruptException && return true
+    assistant._state[] in (:stopping, :stopped) && return true
+    return lock(es.lock) do
+        session = get(es.sessions, name, nothing)
+        session === nothing || session.status == "killed"
+    end
+end
+
+function _current_channel_id()
+    ch = Agentif.CURRENT_CHANNEL[]
+    ch === nothing && return nothing
+    ch isa AsyncSessionChannel && return ch.origin_channel_id
+    return Agentif.channel_id(ch)
+end
+
 function _register_async_session!(
     es::LLMToolsEventSource,
     name::String,
@@ -153,22 +304,28 @@ function _register_async_session!(
     registry_id::Int = 0,
     agent::Union{Nothing, Agentif.Agent} = nothing,
     state::Union{Nothing, Agentif.AgentState} = nothing,
+    origin_channel_id::Union{Nothing, String} = _current_channel_id(),
 )
     a = get_current_assistant()
     a === nothing && error("No assistant initialized")
     _with_busy_retry() do
-        SQLite.DBInterface.execute(a.db,
+        _exec!(a.db,
             "INSERT OR IGNORE INTO claw_event_types (name, description) VALUES (?, ?)",
             (event_type, "LLMTools $kind: $name"))
     end
-    eh = EventHandler(event_type, [event_type], prompt, "parent")
+    # Capture the originating channel at spawn time so the completion actually
+    # reaches the human who asked for it, on this session's own branch.
+    session_channel = AsyncSessionChannel(name, origin_channel_id)
+    channel_id = Agentif.channel_id(session_channel)
+    a._channels[channel_id] = session_channel
+    eh = EventHandler(event_type, [event_type], prompt, channel_id)
     register_event_handler!(a, eh)
     now = time()
     session = ClawLLMSession(name, kind, registry_id, agent, state, nothing, event_type, prompt, now, now, "running")
     lock(es.lock) do
         es.sessions[name] = session
     end
-    @info "LLMTools async session registered" name kind registry_id event_type
+    @info "LLMTools async session registered" name kind registry_id event_type origin_channel_id
     return session
 end
 
@@ -181,14 +338,120 @@ function _cleanup_session!(es::LLMToolsEventSource, name::String)
     if a !== nothing
         try
             unregister_event_handler!(a, session.event_type)
+            Base.delete!(a._channels, async_channel_id(name))
             _with_busy_retry() do
-                SQLite.DBInterface.execute(a.db, "DELETE FROM claw_event_types WHERE name = ?", (session.event_type,))
+                _exec!(a.db, "DELETE FROM claw_event_types WHERE name = ?", (session.event_type,))
             end
         catch
         end
     end
     @info "LLMTools async session cleaned up" name kind = session.kind status = session.status
     return session
+end
+
+# ─── PTY output coalescing helpers (§1.4) ───
+
+"""
+    _truncate_pty_output(text, max_bytes) -> String
+
+Keep the tail (the part a caller actually needs) and cut on a valid character
+boundary so a truncated multi-byte sequence never reaches the model.
+"""
+function _truncate_pty_output(text::String, max_bytes::Int)
+    # PTY output is arbitrary bytes, but it lands in event payloads that are
+    # JSON-encoded for the model and persisted to SQLite, so it must be valid
+    # UTF-8. Repairing here also keeps the index arithmetic below well-defined.
+    # This is the point at which the captured output is complete, so a character
+    # split across two reads is already rejoined.
+    text = LLMTools.repair_utf8(text)
+    max_bytes <= 0 && return text
+    ncodeunits(text) <= max_bytes && return text
+    dropped = ncodeunits(text) - max_bytes
+    idx = thisind(text, min(lastindex(text), dropped + 1))
+    idx < firstindex(text) && (idx = firstindex(text))
+    idx = nextind(text, idx, 0)
+    tail = SubString(text, idx)
+    return string("[... ", ncodeunits(text) - ncodeunits(tail), " bytes of earlier output truncated ...]\n", tail)
+end
+
+function _drain_pty_buffer!(buffer::IOBuffer, max_bytes::Int)
+    text = String(take!(buffer))
+    return _truncate_pty_output(text, max_bytes)
+end
+
+"""
+    _pty_exit_code(session) -> Union{Nothing, Int}
+
+Real exit status of the PTY's process, or `nothing` when it cannot be read. The
+previous code hardcoded `0`, which told the agent a failing build had succeeded.
+"""
+function _pty_exit_code(session)
+    try
+        proc = session.process
+        Base.process_exited(proc) || return nothing
+        return Int(proc.exitcode)
+    catch e
+        @debug "Claw: could not read PTY exit code" exception = (e,)
+        return nothing
+    end
+end
+
+function _pty_shell_command(shell::AbstractString, cmd::AbstractString)
+    command = LLMTools.subprocess_shell_command(shell, cmd)
+    Sys.iswindows() && return (command, nothing)
+
+    # PtySessions starts the child before its constructor returns. A command such
+    # as `printf x; exit` can therefore finish before Claw can start its reader,
+    # and macOS can discard those unread master-side bytes when the slave closes.
+    # The outer non-login shell waits for one silent input line. The capture task
+    # sends that line only after the PTY is fully constructed.
+    gate = "IFS= read -r -s _; exec \"\$@\""
+    gated = Cmd(vcat(
+        String[String(shell), "-c", gate, "claw-pty-gate"],
+        String[String(arg) for arg in command.exec],
+    ))
+    return (gated, "\n")
+end
+
+function _start_pty_capture(session; release::Union{Nothing, String} = nothing)
+    buffer = IOBuffer()
+    buffer_lock = ReentrantLock()
+    stop = Threads.Atomic{Bool}(false)
+    started = Channel{Any}(1)
+    task = errormonitor(Threads.@spawn begin
+        try
+            release === nothing || LLMTools.PtySessions.write(session, release)
+            put!(started, nothing)
+        catch e
+            put!(started, e)
+            return
+        end
+        while !stop[]
+            # Bounded wait keeps stop[] responsive; at_eof is a deterministic
+            # completion signal (process exited AND every output byte drained),
+            # which replaces the old EAGAIN-vs-EOF quiescence heuristic that the
+            # pre-Base.TTY PtySessions forced on this loop.
+            output, at_eof = LLMTools.read_pty_output(session, 0.25)
+            if !isempty(output)
+                lock(buffer_lock) do
+                    write(buffer, output)
+                end
+            end
+            at_eof && break
+        end
+    end)
+    start_error = take!(started)
+    start_error === nothing || begin
+        wait(task)
+        throw(start_error)
+    end
+    return buffer, buffer_lock, stop, task
+end
+
+function _take_pty_capture!(buffer::IOBuffer, buffer_lock::ReentrantLock)
+    return lock(buffer_lock) do
+        String(take!(buffer))
+    end
 end
 
 function _build_subagent_tools(config::AgentConfig)
@@ -266,8 +529,10 @@ Examples:
                             s.status = "completed"
                         end
                     end
-                    put!(a.event_queue, SubagentOutputEvent(event_type, name, output))
+                    _async_session_cancelled(es, a, name) && return nothing
+                    submit_event!(a, SubagentOutputEvent(event_type, name, output))
                 catch e
+                    _async_session_cancelled(es, a, name, e) && return nothing
                     bt = catch_backtrace()
                     lock(es.lock) do
                         s = get(es.sessions, name, nothing)
@@ -284,7 +549,7 @@ Examples:
                         bt,
                         suggested_fix = "Inspect message/error_kind and retry by adjusting the prompt or input_message.",
                     )
-                    put!(a.event_queue, SubagentOutputEvent(event_type, name, payload))
+                    submit_event!(a, SubagentOutputEvent(event_type, name, payload))
                 end
             end
             return "Sub-agent '$name' started asynchronously. You'll be notified when it completes."
@@ -349,8 +614,10 @@ Example:
                             s.status = "completed"
                         end
                     end
-                    put!(a.event_queue, SubagentOutputEvent(event_type, name, output))
+                    _async_session_cancelled(es, a, name) && return nothing
+                    submit_event!(a, SubagentOutputEvent(event_type, name, output))
                 catch e
+                    _async_session_cancelled(es, a, name, e) && return nothing
                     bt = catch_backtrace()
                     lock(es.lock) do
                         s = get(es.sessions, name, nothing)
@@ -367,7 +634,7 @@ Example:
                         bt,
                         suggested_fix = "Inspect session status and the error payload, then retry with corrected input or create a fresh sub-agent.",
                     )
-                    put!(a.event_queue, SubagentOutputEvent(event_type, name, payload))
+                    submit_event!(a, SubagentOutputEvent(event_type, name, payload))
                 end
             end
             return "Message sent to sub-agent '$name'. You'll be notified when it responds."
@@ -421,11 +688,11 @@ function _create_pty_tools(es::LLMToolsEventSource)
 
 Use this for shell commands, especially long-running ones like servers, builds, test suites, or interactive processes. For quick one-shot commands, set run_sync=true. For pure Julia computation, prefer start_worker. For tasks needing LLM reasoning, prefer start_subagent.
 
-Runs ASYNC by default: returns immediately, you receive notification events as terminal output becomes available (polled every 0.5s). When the process exits, you get a final notification with the exit code. Set run_sync=true to block ~0.5s and return the initial output directly.
+Runs ASYNC by default: returns immediately, you receive coalesced notification events as terminal output becomes available. When the process exits, you get a final notification with the exit code. Set run_sync=true to block ~0.5s and return the initial output directly.
 
 Arguments:
 - name (String, required): Unique session identifier. MUST be kebab-case matching ^[a-z0-9]+(-[a-z0-9]+)*\$ — e.g. "test-run", "dev-server", "build1". No uppercase, spaces, or underscores.
-- cmd (String, required): The shell command to execute (run via bash -l -c on Unix, powershell on Windows).
+- cmd (String, required): The shell command to execute (run via a non-login bash shell on Unix, or PowerShell with profiles disabled on Windows).
 - prompt (String, optional): Notification context prepended to async output events. Use to label what this terminal is doing — e.g. "Test suite output". Ignored when run_sync=true.
 - workdir (String, optional): Working directory for the command. Defaults to the agent's configured base_dir.
 - run_sync (Bool, optional): If true, blocks ~0.5s and returns initial output. Default: false (async).
@@ -450,61 +717,139 @@ Examples:
             @info "Starting PTY session" name cmd work_dir sync
 
             shell_cmd = Sys.iswindows() ? "powershell" : "bash"
-            full_cmd = Sys.iswindows() ? Cmd([shell_cmd, "-Command", cmd]) : Cmd([shell_cmd, "-l", "-c", cmd])
+            full_cmd, release = _pty_shell_command(shell_cmd, cmd)
 
             LLMTools.ensure_cleanup_task_running!(LLMTools.PTY_REGISTRY)
             LLMTools.cleanup_exited_sessions!(LLMTools.PTY_REGISTRY)
             registry_id = LLMTools.next_session_id!(LLMTools.PTY_REGISTRY)
-            pty_session = LLMTools.PtySessions.PtySession(full_cmd; dir = work_dir)
-            now = time()
-            meta = LLMTools.PtySessionMetadata(pty_session, now, now, cmd, work_dir, LLMTools.SESSION_STATUS_RUNNING, nothing)
-            LLMTools.register_session!(LLMTools.PTY_REGISTRY, registry_id, meta)
+            # Allowlisted environment only (§2.4): this PTY is reachable from an
+            # inbound message, so it must not carry the assistant's own API keys.
+            pty_session = LLMTools.PtySessions.PtySession(full_cmd; dir = work_dir,
+                env = LLMTools.subprocess_env())
+            capture_buffer, capture_lock, capture_stop, capture_task = try
+                _start_pty_capture(pty_session; release)
+            catch
+                try; close(pty_session); catch; end
+                rethrow()
+            end
 
             if sync
-                sleep(0.5)
-                output = try; LLMTools.PtySessions.readavailable(pty_session); catch; ""; end
+                # Start draining before the process can exit. On macOS, unread
+                # PTY bytes can disappear when the slave closes, so sleeping
+                # first loses output from short commands.
+                timedwait(() -> istaskdone(capture_task), 0.5; pollint = 0.01)
                 is_running = try; LLMTools.PtySessions.isactive(pty_session); catch; false; end
-                if !is_running
-                    sleep(0.05)
-                    output *= try; LLMTools.PtySessions.readavailable(pty_session); catch; ""; end
-                    LLMTools.remove_session!(LLMTools.PTY_REGISTRY, registry_id;
-                        mark_status = LLMTools.SESSION_STATUS_EXITED, close_session = true)
+                if is_running
+                    # A synchronous call returns after its initial window. Stop
+                    # its private reader, then leave the live process available
+                    # to the normal registry cleanup path.
+                    capture_stop[] = true
+                    wait(capture_task)
+                else
+                    wait(capture_task)
+                end
+                output = _take_pty_capture!(capture_buffer, capture_lock)
+                if is_running
+                    now = time()
+                    LLMTools.register_session!(LLMTools.PTY_REGISTRY, registry_id,
+                        LLMTools.PtySessionMetadata(
+                            pty_session,
+                            now,
+                            now,
+                            cmd,
+                            work_dir,
+                            LLMTools.SESSION_STATUS_RUNNING,
+                            nothing,
+                            true,
+                        ))
+                else
+                    try; close(pty_session); catch; end
                 end
                 return LLMTools.truncate_tool_output(output; label = "PTY output")
             end
 
+            now = time()
+            # Claw owns the polling lifecycle. The generic LLMTools cleanup task
+            # must not close the PTY after process exit but before this task drains
+            # its final bytes.
+            meta = LLMTools.PtySessionMetadata(
+                pty_session,
+                now,
+                now,
+                cmd,
+                work_dir,
+                LLMTools.SESSION_STATUS_RUNNING,
+                nothing,
+                false,
+            )
+            LLMTools.register_session!(LLMTools.PTY_REGISTRY, registry_id, meta)
             event_type = "pty:$name"
             handler_prompt = something(prompt, "")
             session = _register_async_session!(es, name, :pty, event_type, handler_prompt;
                 registry_id = registry_id)
+            notify_interval = a.pipeline.pty_notify_interval_s
+            max_event_bytes = a.pipeline.pty_max_event_bytes
             session.task = Threads.@spawn begin
                 try
+                    # Coalesce output: a 0.5s poll used to trigger a full LLM
+                    # evaluation per chunk. Accumulate instead and emit at most one
+                    # event per `pty_notify_interval`, capped in size.
+                    buffer = IOBuffer()
+                    last_emit = time()
+                    last_output = ""
                     while true
-                        sleep(0.5)
+                        # A dedicated reader starts before handler registration and
+                        # owns PTY reads. This loop only drains its capture buffer
+                        # and coalesces model-facing events.
                         pty_meta = LLMTools.get_session(LLMTools.PTY_REGISTRY, registry_id)
-                        pty_meta === nothing && break
-                        is_active = try; LLMTools.PtySessions.isactive(pty_meta.session); catch; false; end
-                        output = try; LLMTools.PtySessions.readavailable(pty_meta.session); catch; ""; end
+                        live = pty_meta === nothing ? pty_session : pty_meta.session
+                        output = _take_pty_capture!(capture_buffer, capture_lock)
                         if !isempty(output)
-                            put!(a.event_queue, PtyOutputEvent(event_type, name, output, nothing))
+                            write(buffer, output)
+                            last_output = _truncate_pty_output(output, max_event_bytes)
                         end
-                        if !is_active
+                        is_active = try; LLMTools.PtySessions.isactive(live); catch; false; end
+                        if !is_active && istaskdone(capture_task)
+                            # The reader is the completion signal. Drain once more
+                            # after it stops so no captured bytes remain behind.
+                            remaining = _take_pty_capture!(capture_buffer, capture_lock)
+                            if !isempty(remaining)
+                                write(buffer, remaining)
+                                last_output = _truncate_pty_output(remaining, max_event_bytes)
+                            end
                             lock(es.lock) do
                                 s = get(es.sessions, name, nothing)
                                 s !== nothing && (s.status = "exited")
                             end
-                            remaining = try; LLMTools.PtySessions.readavailable(pty_meta.session); catch; ""; end
-                            if !isempty(remaining)
-                                put!(a.event_queue, PtyOutputEvent(event_type, name, remaining, 0))
-                            else
-                                put!(a.event_queue, PtyOutputEvent(event_type, name, "", 0))
-                            end
-                            LLMTools.remove_session!(LLMTools.PTY_REGISTRY, registry_id;
+                            exit_code = _pty_exit_code(live)
+                            final_output = _drain_pty_buffer!(buffer, max_event_bytes)
+                            # The process can exit just after an active poll flushed
+                            # its final chunk. Repeat that bounded tail so the
+                            # terminal event always carries the output that led to
+                            # the reported exit status.
+                            isempty(final_output) && (final_output = last_output)
+                            submit_event!(a, PtyOutputEvent(event_type, name,
+                                final_output, exit_code, true))
+                            pty_meta === nothing || LLMTools.remove_session!(LLMTools.PTY_REGISTRY, registry_id;
                                 mark_status = LLMTools.SESSION_STATUS_EXITED, close_session = true)
                             break
                         end
+                        now = time()
+                        if buffer.size > 0 && now - last_emit >= notify_interval
+                            submit_event!(a, PtyOutputEvent(event_type, name,
+                                _drain_pty_buffer!(buffer, max_event_bytes), nothing, false))
+                            last_emit = now
+                        end
+                        # This is only the transport drain cadence. Model-facing
+                        # events still obey `pty_notify_interval_s`.
+                        sleep(0.05)
                     end
                 catch e
+                    if e isa InterruptException || a._state[] in (:stopping, :stopped)
+                        LLMTools.remove_session!(LLMTools.PTY_REGISTRY, registry_id;
+                            mark_status = LLMTools.SESSION_STATUS_KILLED, close_session = true)
+                        return nothing
+                    end
                     bt = catch_backtrace()
                     lock(es.lock) do
                         s = get(es.sessions, name, nothing)
@@ -521,7 +866,9 @@ Examples:
                         bt,
                         suggested_fix = "List PTY sessions, then restart or kill/recreate this PTY session.",
                     )
-                    put!(a.event_queue, PtyOutputEvent(event_type, name, payload, nothing))
+                    LLMTools.remove_session!(LLMTools.PTY_REGISTRY, registry_id;
+                        mark_status = LLMTools.SESSION_STATUS_ERROR, close_session = true)
+                    submit_event!(a, PtyOutputEvent(event_type, name, payload, nothing, false))
                 end
             end
             return "PTY '$name' started asynchronously (cmd: $cmd). You'll be notified when output is available."
@@ -558,8 +905,7 @@ Example:
                 session.last_used = time()
             end
             if sync
-                sleep(0.5)
-                output = try; LLMTools.PtySessions.readavailable(pty_meta.session); catch; ""; end
+                output = LLMTools.read_pty_output(pty_meta.session, 0.5)[1]
                 return LLMTools.truncate_tool_output(output; label = "PTY output")
             end
             return "Input sent to PTY '$name'. You'll be notified when output is available."
@@ -624,6 +970,7 @@ Arguments:
 - code (String, required): Julia code to evaluate. Runs in a fresh worker process. Output includes both the return value and any stdout/stderr.
 - prompt (String, optional): Notification context prepended to the async completion event. Use to label what this worker is computing — e.g. "CSV parsing results". Ignored when run_sync=true.
 - run_sync (Bool, optional): If true, blocks until execution completes and returns the output. Default: false (async).
+- timeout_s (Int, optional): Timeout in seconds for the initial evaluation. On timeout the worker process is terminated and a timeout error is reported. Default: no timeout.
 
 Examples:
 - start_worker("data-proc", "using CSV, DataFrames; df = CSV.read(\\"data.csv\\", DataFrame); describe(df)", "Data summary")
@@ -633,6 +980,7 @@ Examples:
             code::String,
             prompt::Union{Nothing, String} = nothing,
             run_sync::Union{Nothing, Bool} = nothing,
+            timeout_s::Union{Nothing, Int} = nothing,
         ) = begin
             sync = run_sync === nothing ? false : run_sync
             _validate_name(es, name)
@@ -655,7 +1003,7 @@ Examples:
 
             if sync
                 try
-                    combined, _ = LLMTools.eval_on_worker(worker_meta, code)
+                    combined, _ = LLMTools.eval_on_worker(worker_meta, code; timeout_s)
                     return LLMTools.truncate_tool_output(combined; label = "Worker output")
                 catch e
                     LLMTools.remove_session!(LLMTools.WORKER_REGISTRY, registry_id;
@@ -670,7 +1018,7 @@ Examples:
                 registry_id = registry_id)
             session.task = Threads.@spawn begin
                 try
-                    combined, _ = LLMTools.eval_on_worker(worker_meta, code)
+                    combined, _ = LLMTools.eval_on_worker(worker_meta, code; timeout_s)
                     lock(es.lock) do
                         s = get(es.sessions, name, nothing)
                         if s !== nothing
@@ -678,9 +1026,15 @@ Examples:
                             s.status = "completed"
                         end
                     end
-                    put!(a.event_queue, WorkerOutputEvent(event_type, name, combined))
+                    _async_session_cancelled(es, a, name) && return nothing
+                    submit_event!(a, WorkerOutputEvent(event_type, name, combined))
                 catch e
+                    _async_session_cancelled(es, a, name, e) && return nothing
                     bt = catch_backtrace()
+                    if e isa LLMTools.WorkerEvalTimeout
+                        LLMTools.remove_session!(LLMTools.WORKER_REGISTRY, registry_id;
+                            mark_status = LLMTools.SESSION_STATUS_ERROR)
+                    end
                     lock(es.lock) do
                         s = get(es.sessions, name, nothing)
                         s !== nothing && (s.status = "error")
@@ -696,7 +1050,7 @@ Examples:
                         bt,
                         suggested_fix = "Inspect worker output/error payload and retry with corrected Julia code.",
                     )
-                    put!(a.event_queue, WorkerOutputEvent(event_type, name, payload))
+                    submit_event!(a, WorkerOutputEvent(event_type, name, payload))
                 end
             end
             return "Worker '$name' started asynchronously. You'll be notified when execution completes."
@@ -714,6 +1068,7 @@ Arguments:
 - name (String, required): The name of an existing worker session (as given to start_worker).
 - code (String, required): Julia code to evaluate. Can reference variables/functions from prior calls.
 - run_sync (Bool, optional): If true, blocks until execution completes. Default: false (async).
+- timeout_s (Int, optional): Timeout in seconds for the evaluation. On timeout the worker process is terminated (all its state is lost) and a timeout error is reported. Default: no timeout.
 
 Example:
 - eval_worker("data-proc", "filter(row -> row.age > 30, df) |> nrow", run_sync=true)""",
@@ -721,6 +1076,7 @@ Example:
             name::String,
             code::String,
             run_sync::Union{Nothing, Bool} = nothing,
+            timeout_s::Union{Nothing, Int} = nothing,
         ) = begin
             sync = run_sync === nothing ? false : run_sync
             session = _get_session(es, name, :worker)
@@ -730,11 +1086,24 @@ Example:
             worker_meta === nothing && error("Worker session '$name' no longer exists in registry")
 
             if sync
-                combined, _ = LLMTools.eval_on_worker(worker_meta, code)
-                lock(es.lock) do
-                    session.last_used = time()
+                try
+                    combined, _ = LLMTools.eval_on_worker(worker_meta, code; timeout_s)
+                    lock(es.lock) do
+                        session.last_used = time()
+                        session.status = "completed"
+                    end
+                    return LLMTools.truncate_tool_output(combined; label = "Worker output")
+                catch e
+                    if e isa LLMTools.WorkerEvalTimeout
+                        LLMTools.remove_session!(LLMTools.WORKER_REGISTRY, session.registry_id;
+                            mark_status = LLMTools.SESSION_STATUS_ERROR)
+                    end
+                    lock(es.lock) do
+                        session.last_used = time()
+                        session.status = "error"
+                    end
+                    rethrow()
                 end
-                return LLMTools.truncate_tool_output(combined; label = "Worker output")
             end
 
             event_type = session.event_type
@@ -744,7 +1113,7 @@ Example:
             end
             session.task = Threads.@spawn begin
                 try
-                    combined, _ = LLMTools.eval_on_worker(worker_meta, code)
+                    combined, _ = LLMTools.eval_on_worker(worker_meta, code; timeout_s = timeout_s)
                     lock(es.lock) do
                         s = get(es.sessions, name, nothing)
                         if s !== nothing
@@ -752,9 +1121,15 @@ Example:
                             s.status = "completed"
                         end
                     end
-                    put!(a.event_queue, WorkerOutputEvent(event_type, name, combined))
+                    _async_session_cancelled(es, a, name) && return nothing
+                    submit_event!(a, WorkerOutputEvent(event_type, name, combined))
                 catch e
+                    _async_session_cancelled(es, a, name, e) && return nothing
                     bt = catch_backtrace()
+                    if e isa LLMTools.WorkerEvalTimeout
+                        LLMTools.remove_session!(LLMTools.WORKER_REGISTRY, session.registry_id;
+                            mark_status = LLMTools.SESSION_STATUS_ERROR)
+                    end
                     lock(es.lock) do
                         s = get(es.sessions, name, nothing)
                         s !== nothing && (s.status = "error")
@@ -770,7 +1145,7 @@ Example:
                         bt,
                         suggested_fix = "Inspect the error payload and retry with syntactically-valid Julia code that matches the worker's current state.",
                     )
-                    put!(a.event_queue, WorkerOutputEvent(event_type, name, payload))
+                    submit_event!(a, WorkerOutputEvent(event_type, name, payload))
                 end
             end
             return "Code sent to worker '$name'. You'll be notified when execution completes."

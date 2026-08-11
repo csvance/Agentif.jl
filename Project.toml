@@ -28,7 +28,7 @@ Claw = {path = "Claw"}
 ConcurrentUtilities = {url = "https://github.com/JuliaServices/ConcurrentUtilities.jl.git", rev = "main"}
 Encid = {url = "https://github.com/JuliaServices/Encid.jl.git"}
 HTTP = {url = "https://github.com/JuliaWeb/HTTP.jl.git", rev = "master"}
-JSONSchema = {url = "https://github.com/JuliaIO/JSONSchema.jl.git"}
+JSONSchema = {url = "https://github.com/JuliaIO/JSONSchema.jl.git", rev = "4076c12e69f8191b611580744c42579f95e92974"}
 Juco = {path = "Juco"}
 LLMOAuth = {path = "LLMOAuth"}
 LLMProviders = {path = "LLMProviders"}
@@ -37,7 +37,7 @@ LocalSearch = {url = "https://github.com/quinnj/LocalSearch.jl.git"}
 MSTeams = {url = "https://github.com/quinnj/MSTeams.jl.git"}
 Mattermost = {url = "https://github.com/quinnj/Mattermost.jl.git"}
 OAuth = {url = "https://github.com/JuliaServices/OAuth.jl.git", rev = "main"}
-PtySessions = {url = "https://github.com/quinnj/PtySessions.jl.git"}
+PtySessions = {url = "https://github.com/JuliaServices/PtySessions.jl.git"}
 Signal = {url = "https://github.com/quinnj/Signal.jl.git"}
 Slack = {url = "https://github.com/quinnj/Slack.jl.git"}
 Telegram = {url = "https://github.com/quinnj/Telegram.jl.git"}

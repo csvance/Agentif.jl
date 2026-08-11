@@ -37,6 +37,12 @@ end
 # --- Output limit constants ---
 const DEFAULT_MAX_OUTPUT_LINES = 1000
 const DEFAULT_MAX_OUTPUT_TOKENS = 10_000
+
+# Upper bound on any model-supplied yield window. `yield_time_ms` is only a
+# "wait this long for output before returning", so no legitimate call needs more
+# than a few minutes -- but the value comes straight from the model, and an
+# unclamped one (e.g. typemax(Int)) sleeps the agent forever.
+const MAX_YIELD_TIME_MS = 300_000
 const TRANSCRIPT_MAX_BYTES = 1024 * 1024
 const EVENT_DELTA_MAX_BYTES = 8 * 1024
 const RESPONSE_SCHEMA_VERSION = 1
@@ -136,6 +142,13 @@ function chunk_text_by_bytes(text::String, max_bytes::Int)
 end
 
 function project_output(raw_output::String, max_lines::Int, max_output_tokens::Int)
+    # A tool result is JSON-encoded and shipped to a provider, so it must be
+    # valid UTF-8; a subprocess is free to emit arbitrary bytes (`cat` on a
+    # binary, `head -c 100 /dev/urandom`, a truncated multi-byte sequence).
+    # Repair here rather than per read: this is the first point at which the
+    # output is fully accumulated, so a multi-byte character split across two
+    # PTY reads is already rejoined and is not mistaken for corruption.
+    raw_output = repair_utf8(raw_output)
     original_lines = line_count(raw_output)
     original_bytes = ncodeunits(raw_output)
     original_tokens = approx_token_count(raw_output)
@@ -207,6 +220,10 @@ end
 #   set_last_used!(meta::M, t::Float64)
 #   set_status!(meta::M, s::String)
 
+# Sessions normally belong to the registry cleanup task. A higher-level owner
+# can opt out while it still needs to drain process output before close.
+automatic_cleanup(::Any) = true
+
 # --- Registry operations ---
 
 function active_session_count(reg::SessionRegistry)
@@ -250,6 +267,7 @@ function cleanup_exited_sessions!(reg::SessionRegistry)
     to_remove = lock(reg.lock) do
         ids = Int[]
         for (id, meta) in reg.sessions
+            automatic_cleanup(meta) || continue
             status = resolve_status(meta)
             status == SESSION_STATUS_RUNNING && continue
             push!(ids, id)
@@ -289,7 +307,12 @@ function prune_oldest_session!(reg::SessionRegistry)
     prune_id = lock(reg.lock) do
         length(reg.sessions) < config.max_sessions && return nothing
 
-        sorted = sort(collect(reg.sessions), by = p -> session_last_used(p[2]), rev = true)
+        sorted = sort(
+            [pair for pair in reg.sessions if automatic_cleanup(pair[2])],
+            by = p -> session_last_used(p[2]),
+            rev = true,
+        )
+        isempty(sorted) && return nothing
         protected = Set(p[1] for p in sorted[1:min(8, length(sorted))])
 
         for (id, meta) in sorted

@@ -8,7 +8,7 @@ Current tool areas include:
 - PTY-backed terminal sessions
 - Julia worker execution
 - web fetch and search
-- Codex/subagent helpers
+- Subagent helpers
 
 Semantic/code-search experiments are no longer exposed from `LLMTools`; that work moved to `LocalSearch.jl`.
 

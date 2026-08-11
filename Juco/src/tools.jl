@@ -8,6 +8,28 @@
 const DEFAULT_BASH_TIMEOUT_S = 120
 const MAX_BASH_TIMEOUT_S = 600
 
+# Keep the LAST max_lines/max_bytes of content (LLMTools only ships head
+# truncation; bash output wants the tail, where errors and results live).
+function truncate_tail(content::String;
+        max_lines::Int = LLMTools.DEFAULT_MAX_LINES, max_bytes::Int = LLMTools.DEFAULT_MAX_BYTES)
+    lines = split(content, "\n"; keepempty = true)
+    total_lines = length(lines)
+    if total_lines <= max_lines && ncodeunits(content) <= max_bytes
+        return (content = content, truncated = false, output_lines = total_lines, total_lines = total_lines)
+    end
+    kept = String[]
+    bytes = 0
+    for idx in total_lines:-1:1
+        length(kept) >= max_lines && break
+        line_bytes = ncodeunits(lines[idx]) + (isempty(kept) ? 0 : 1)
+        bytes + line_bytes > max_bytes && break
+        pushfirst!(kept, lines[idx])
+        bytes += line_bytes
+    end
+    isempty(kept) && push!(kept, String(last(lines[total_lines], max_bytes)))
+    return (content = join(kept, "\n"), truncated = true, output_lines = length(kept), total_lines = total_lines)
+end
+
 function run_bash(base::AbstractString, command::String, timeout_s::Real)
     out = Pipe()
     cmd = Cmd(`bash -c $command`; dir = base, ignorestatus = true)
@@ -55,7 +77,7 @@ Examples:
         bash(command::String, timeout::Union{Nothing, Int} = nothing) = begin
             timeout_s = clamp(something(timeout, DEFAULT_BASH_TIMEOUT_S), 1, MAX_BASH_TIMEOUT_S)
             output, exitcode, timedout = run_bash(base, command, timeout_s)
-            truncation = LLMTools.truncate_tail(output)
+            truncation = truncate_tail(output)
             result = truncation.content
             if truncation.truncated
                 result = "[Output truncated: showing last $(truncation.output_lines) of $(truncation.total_lines) lines]\n" * result

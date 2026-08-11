@@ -18,6 +18,10 @@ end
     type::String = "thinking"
     thinking::String
     thinkingSignature::Union{Nothing, String} = nothing
+    # Anthropic redacted_thinking: `thinking` is empty and `thinkingSignature`
+    # carries the opaque `data` payload for replay. Defaults to false so
+    # previously persisted sessions load unchanged.
+    redacted::Bool = false
 end
 
 @kwarg mutable struct ImageContent <: ContentBlock
@@ -30,7 +34,7 @@ end
     type::String = "toolCall"
     id::String
     name::String
-    arguments::Dict{String, Any}
+    arguments::ToolArguments
     thoughtSignature::Union{Nothing, String} = nothing
 end
 
@@ -63,6 +67,13 @@ end
     tokens_before::Int
     compacted_at::Float64
 end
+
+const StoredAgentMessage = Union{
+    UserMessage,
+    AssistantMessage,
+    ToolResultMessage,
+    CompactionSummaryMessage,
+}
 
 const AGENT_MESSAGE_TYPE_USER = "user"
 const AGENT_MESSAGE_TYPE_ASSISTANT = "assistant"
@@ -100,15 +111,6 @@ message_text(msg::ToolResultMessage) = content_text(msg.content)
 message_text(msg::CompactionSummaryMessage) = msg.summary
 
 message_thinking(msg::AssistantMessage) = content_thinking(msg.content)
-
-function message_has_images(msg::AgentMessage)
-    if msg isa UserMessage || msg isa ToolResultMessage
-        for block in msg.content
-            block isa ImageContent && return true
-        end
-    end
-    return false
-end
 
 function append_text!(msg::AssistantMessage, delta::String)
     if isempty(msg.content) || !(msg.content[end] isa TextContent)
@@ -153,7 +155,7 @@ function set_last_text!(msg::AssistantMessage, text::String)
 end
 
 JSON.lower(x::TextContent) = (; type = x.type, text = x.text, textSignature = x.textSignature)
-JSON.lower(x::ThinkingContent) = (; type = x.type, thinking = x.thinking, thinkingSignature = x.thinkingSignature)
+JSON.lower(x::ThinkingContent) = (; type = x.type, thinking = x.thinking, thinkingSignature = x.thinkingSignature, redacted = x.redacted)
 JSON.lower(x::ImageContent) = (; type = x.type, data = x.data, mimeType = x.mimeType)
 JSON.lower(x::ToolCallContent) = (;
     type = x.type,
@@ -231,6 +233,14 @@ function StructUtils.make(st::StructUtils.StructStyle, ::Type{Union{TextContent,
     return StructUtils.make(st, ContentBlock, source)
 end
 
+function StructUtils.make(st::StructUtils.StructStyle, ::Type{StoredAgentMessage}, source, tags)
+    return StructUtils.make(st, AgentMessage, source, tags)
+end
+
+function StructUtils.make(st::StructUtils.StructStyle, ::Type{StoredAgentMessage}, source)
+    return StructUtils.make(st, AgentMessage, source)
+end
+
 const AgentTurnInput = Union{String, Vector{ToolResultMessage}, Vector{UserContentBlock}, UserMessage}
 
 function include_in_context(msg::AgentMessage)
@@ -255,22 +265,22 @@ function add_usage!(base::Usage, delta::Usage)
 end
 
 @kwarg mutable struct AgentState
-    messages::Vector{AgentMessage} = AgentMessage[]
+    messages::Vector{StoredAgentMessage} = StoredAgentMessage[]
     response_id::Union{Nothing, String} = nothing
     usage::Usage = Usage()
     pending_tool_calls::Vector{PendingToolCall} = PendingToolCall[]
     most_recent_stop_reason::Union{Nothing, Symbol} = nothing
     last_compaction::Union{Nothing, CompactionSummaryMessage} = nothing
-    compaction_kept_count::Int = 0
-end
-
-function set!(dest::AgentState, source::AgentState)
-    dest.messages = source.messages
-    dest.response_id = source.response_id
-    dest.usage = source.usage
-    dest.pending_tool_calls = source.pending_tool_calls
-    dest.most_recent_stop_reason = source.most_recent_stop_reason
-    dest.last_compaction = source.last_compaction
-    dest.compaction_kept_count = source.compaction_kept_count
-    return
+    # Input tokens (including cache reads and cache writes) reported by the most
+    # recent API call. 0 means "unknown" (fresh state restored from a session
+    # store), in which case compaction falls back to estimating from `messages`.
+    context_tokens::Int = 0
+    # Provenance for messages that a session store already persisted:
+    # how many leading messages of `messages` (skipping a leading compaction
+    # summary) are already stored, and the 1-based index of the first of them
+    # in the message list that was originally loaded from the store. `compact!`
+    # keeps both up to date so session persistence never has to reconstruct the
+    # kept boundary with index arithmetic.
+    persisted_prefix_count::Int = 0
+    persisted_prefix_start::Int = 1
 end

@@ -4,7 +4,7 @@ abstract type SessionStore end
     id::String
     parent_id::Union{Nothing, String} = nothing
     created_at::Float64 = time()
-    messages::Vector{AgentMessage} = AgentMessage[]
+    messages::Vector{StoredAgentMessage} = StoredAgentMessage[]
     is_compaction::Bool = false
     first_kept_entry_id::Union{Nothing, String} = nothing
     is_deleted::Bool = false
@@ -12,6 +12,10 @@ abstract type SessionStore end
     channel_id::Union{Nothing, String} = nothing
     search_channel_id::Union{Nothing, String} = nothing
     channel_flags::Union{Nothing, Int} = nothing
+    # Platform message id this entry was produced from. Entry ids must be unique
+    # (several evaluations can share one incoming message), so `scrub_post!`
+    # matches on this instead of on the entry id.
+    post_id::Union{Nothing, String} = nothing
 end
 
 struct EntryBoundary
@@ -40,6 +44,7 @@ function get_entry end
 function get_branch_leaf end
 function set_branch_leaf! end
 function lock_branch end
+function with_session_write end
 
 # ─── InMemorySessionStore implementations ───
 
@@ -67,7 +72,7 @@ function set_branch_leaf!(store::InMemorySessionStore, branch_id::String, entry_
     end
 end
 
-function lock_branch(f::Function, store::InMemorySessionStore, branch_id::String)
+function lock_branch(f::F, store::InMemorySessionStore, branch_id::String) where {F <: Function}
     branch_lock = lock(store.lock) do
         get!(store.branch_locks, branch_id) do
             ReentrantLock()
@@ -94,10 +99,22 @@ function _collect_lineage(store::SessionStore, leaf_entry_id::String)
     compaction_idx = 0
     stop_at = nothing
     current_id = leaf_entry_id
+    seen = Set{String}()
 
     while current_id !== nothing
+        current_id in seen && break  # corrupt parent chain; never loop forever
+        push!(seen, current_id)
         entry = get_entry(store, current_id)
         entry === nothing && break
+
+        # The newest compaction summary replaces every older summary. Keep
+        # walking through an older compaction's parent to reach the retained
+        # entries, but never replay that stale summary.
+        if entry.is_compaction && compaction_idx != 0
+            current_id = entry.parent_id
+            continue
+        end
+
         push!(entries, entry)
 
         if entry.is_compaction && compaction_idx == 0
@@ -225,14 +242,30 @@ end
 # Default no-op: scrub_post! is implemented by store types that support it
 scrub_post!(store::SessionStore, post_id::String) = nothing
 
+# Content-free copy of an entry: keeps its place (and role) in the entry tree so
+# lineage walks still resolve, but drops everything that could be replayed.
+function scrubbed_entry(entry::SessionEntry)
+    return SessionEntry(;
+        id = entry.id, parent_id = entry.parent_id, created_at = entry.created_at,
+        is_compaction = entry.is_compaction, first_kept_entry_id = entry.first_kept_entry_id,
+        is_deleted = true, channel_id = entry.channel_id,
+        search_channel_id = entry.search_channel_id, channel_flags = entry.channel_flags,
+        post_id = entry.post_id,
+    )
+end
+
+# An entry matches a scrub request when it was produced from that platform post.
+# Entries written before `post_id` existed used the post id as the entry id.
+entry_matches_post(entry::SessionEntry, post_id::String) =
+    entry.post_id === nothing ? entry.id == post_id : entry.post_id == post_id
+
 function scrub_post!(store::InMemorySessionStore, post_id::String)
     lock(store.lock) do
-        entry = get(store.entries, post_id, nothing)
-        entry === nothing && return
-        store.entries[post_id] = SessionEntry(;
-            id=entry.id, parent_id=entry.parent_id, created_at=entry.created_at,
-            is_deleted=true, channel_id=entry.channel_id,
-            search_channel_id=entry.search_channel_id, channel_flags=entry.channel_flags,
-        )
+        for (eid, entry) in collect(store.entries)
+            entry.is_deleted && continue
+            entry_matches_post(entry, post_id) || continue
+            store.entries[eid] = scrubbed_entry(entry)
+        end
     end
+    return nothing
 end

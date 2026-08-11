@@ -16,7 +16,7 @@ function resolve_log_level(level::Union{Nothing, LogLevel, Int, Symbol, Abstract
     return parsed
 end
 
-function with_log_level(f::Function, level::Union{Nothing, LogLevel, Int, Symbol, AbstractString} = nothing)
+function with_log_level(f::F, level::Union{Nothing, LogLevel, Int, Symbol, AbstractString} = nothing) where {F <: Function}
     resolved = resolve_log_level(level)
     resolved === nothing && return f()
     return LoggingExtras.withlevel(f, resolved)
@@ -36,7 +36,9 @@ function _format_stacktrace(bt; max_chars::Int = 16_000)
     end
     stack = String(take!(io))
     length(stack) <= max_chars && return stack
-    return stack[1:max_chars] * "\n... [stacktrace truncated]"
+    # first() is char-safe; stack[1:max_chars] is byte indexing and throws when
+    # the cut lands inside a multi-byte char ('…', unicode identifiers)
+    return first(stack, max_chars) * "\n... [stacktrace truncated]"
 end
 
 function render_tool_error_json(

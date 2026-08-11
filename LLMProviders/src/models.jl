@@ -1,7 +1,15 @@
 # Model definitions and registry
 # Ported from TypeScript models.ts and models.generated.ts
 
-# Model type definition
+# Model type definitions
+@kwarg struct ModelCostTier
+    inputTokensAbove::Int
+    input::Float64
+    output::Float64
+    cacheRead::Float64
+    cacheWrite::Float64
+end
+
 @kwarg struct Model
     id::String
     name::String
@@ -16,24 +24,9 @@
     headers::Union{Nothing, Dict{String, String}} = nothing
     compat::Union{Nothing, Dict{String, Any}} = nothing
     kw::Any = (;) # additional keyword arguments that will be passed when api calls are made
+    costTiers::Vector{ModelCostTier} = ModelCostTier[]
+    thinkingLevelMap::Union{Nothing, Dict{String, Any}} = nothing
 end
-
-with(model::Model; kw...) =
-    Model(;
-    id = model.id,
-    name = model.name,
-    api = model.api,
-    provider = model.provider,
-    baseUrl = model.baseUrl,
-    reasoning = model.reasoning,
-    input = model.input,
-    cost = model.cost,
-    contextWindow = model.contextWindow,
-    maxTokens = model.maxTokens,
-    headers = model.headers,
-    compat = model.compat,
-    kw = kw
-)
 
 # Model registry - will be populated from models_generated.jl
 const _model_registry = Dict{String, Dict{String, Model}}()
@@ -91,6 +84,17 @@ function calculateCost(model::Model, usage)
     output_rate = get(() -> 0.0, model.cost, "output")
     cache_read_rate = get(() -> 0.0, model.cost, "cacheRead")
     cache_write_rate = get(() -> 0.0, model.cost, "cacheWrite")
+    input_tokens = usage.input + usage.cacheRead + usage.cacheWrite
+    matched_threshold = -1
+    for tier in model.costTiers
+        if input_tokens > tier.inputTokensAbove && tier.inputTokensAbove > matched_threshold
+            input_rate = tier.input
+            output_rate = tier.output
+            cache_read_rate = tier.cacheRead
+            cache_write_rate = tier.cacheWrite
+            matched_threshold = tier.inputTokensAbove
+        end
+    end
     cost = Dict{String, Float64}(
         "input" => (input_rate / 1000000) * usage.input,
         "output" => (output_rate / 1000000) * usage.output,
@@ -98,7 +102,6 @@ function calculateCost(model::Model, usage)
         "cacheWrite" => (cache_write_rate / 1000000) * usage.cacheWrite,
     )
     cost["total"] = cost["input"] + cost["output"] + cost["cacheRead"] + cost["cacheWrite"]
-    usage.cost = cost
     return cost
 end
 

@@ -13,6 +13,8 @@ schema(::Type{T}) where {T} = JSONSchema.schema(
 
 @omit_null @kwarg struct CacheControl
     type::String
+    # "1h" opts into the extended-TTL cache; omitted means the default 5m ephemeral cache.
+    ttl::Union{Nothing, String} = nothing
 end
 
 @omit_null @kwarg mutable struct TextBlock
@@ -27,41 +29,60 @@ end
     signature::Union{Nothing, String} = nothing
 end
 
+@omit_null @kwarg struct RedactedThinkingBlock
+    type::String = "redacted_thinking"
+    data::String = ""
+end
+
 @omit_null @kwarg struct ImageSource
     type::String = "base64"
     media_type::String
     data::String
 end
 
-@omit_null @kwarg struct ImageBlock
+@omit_null @kwarg mutable struct ImageBlock
     type::String = "image"
     source::ImageSource
+    cache_control::Union{Nothing, CacheControl} = nothing
 end
 
 @omit_null @kwarg mutable struct ToolUseBlock
     type::String = "tool_use"
     id::String
     name::String
-    input::Any
+    input::Dict{String, Any}
 end
 
 const ToolResultContentBlock = Union{TextBlock, ImageBlock}
 
-@omit_null @kwarg struct ToolResultBlock
+@omit_null @kwarg mutable struct ToolResultBlock
     type::String = "tool_result"
     tool_use_id::String
     content::Union{String, Vector{ToolResultContentBlock}}
     is_error::Union{Nothing, Bool} = nothing
+    cache_control::Union{Nothing, CacheControl} = nothing
 end
 
-const ContentBlock = Union{TextBlock, ThinkingBlock, ImageBlock, ToolUseBlock, ToolResultBlock}
+# Catch-all so unrecognized content block types (e.g. server_tool_use) parse
+# without throwing; mirrors OpenAIResponses.UnknownOutput.
+@omit_null @kwarg struct UnknownContentBlock
+    type::Union{Nothing, String} = nothing
+end
+
+const ContentBlock = Union{TextBlock, ThinkingBlock, RedactedThinkingBlock, ImageBlock, ToolUseBlock, ToolResultBlock, UnknownContentBlock}
 
 JSON.@choosetype ContentBlock x -> begin
-    type = x.type[]
+    type = try
+        x.type[]
+    catch
+        nothing
+    end
     if type == "text"
         return TextBlock
     elseif type == "thinking"
         return ThinkingBlock
+    elseif type == "redacted_thinking"
+        return RedactedThinkingBlock
     elseif type == "image"
         return ImageBlock
     elseif type == "tool_use"
@@ -69,7 +90,7 @@ JSON.@choosetype ContentBlock x -> begin
     elseif type == "tool_result"
         return ToolResultBlock
     else
-        return Any
+        return UnknownContentBlock
     end
 end
 
@@ -78,10 +99,10 @@ end
     content::Union{String, Vector{ContentBlock}} & (json = (choosetype = x -> x[] isa String ? String : Vector{ContentBlock},),)
 end
 
-@omit_null @kwarg struct Tool{T}
+@omit_null @kwarg struct Tool
     name::String
     description::Union{Nothing, String} = nothing
-    input_schema::JSONSchema.Schema{T}
+    input_schema::JSONSchema.Schema
 end
 
 
@@ -132,10 +153,19 @@ end
     partial_json::String
 end
 
-const ContentBlockDelta = Union{TextDelta, ThinkingDelta, SignatureDelta, InputJsonDelta}
+# Catch-all so unrecognized delta types (e.g. citations_delta) parse without throwing.
+@omit_null @kwarg struct UnknownContentBlockDelta
+    type::Union{Nothing, String} = nothing
+end
+
+const ContentBlockDelta = Union{TextDelta, ThinkingDelta, SignatureDelta, InputJsonDelta, UnknownContentBlockDelta}
 
 JSON.@choosetype ContentBlockDelta x -> begin
-    type = x.type[]
+    type = try
+        x.type[]
+    catch
+        nothing
+    end
     if type == "text_delta"
         return TextDelta
     elseif type == "thinking_delta"
@@ -145,7 +175,7 @@ JSON.@choosetype ContentBlockDelta x -> begin
     elseif type == "input_json_delta"
         return InputJsonDelta
     else
-        return Any
+        return UnknownContentBlockDelta
     end
 end
 
@@ -173,7 +203,7 @@ end
 
 @omit_null @kwarg struct StreamMessageDeltaEvent
     type::String = "message_delta"
-    delta::Any = nothing
+    delta::Union{Nothing, Dict{String, Any}} = nothing
     usage::Union{Nothing, Usage} = nothing
 end
 
@@ -183,7 +213,7 @@ end
 
 @omit_null @kwarg struct StreamErrorEvent
     type::String = "error"
-    error::Any = nothing
+    error::Union{Nothing, Dict{String, Any}} = nothing
 end
 
 const StreamEvent = Union{
@@ -217,6 +247,22 @@ JSON.@choosetype StreamEvent x -> begin
     end
 end
 
+# Two distinct mechanisms:
+#   adaptive thinking  -> {"type": "adaptive"} (+ optional "display")
+#   extended thinking  -> {"type": "enabled", "budget_tokens": N}
+#   off                -> {"type": "disabled"} (rejected on always-thinking models)
+# `display` is "omitted" | "summarized"; it is invalid with type "disabled".
+@omit_null @kwarg struct ThinkingConfig
+    type::String = "adaptive"
+    budget_tokens::Union{Nothing, Int} = nothing
+    display::Union{Nothing, String} = nothing
+end
+
+# Carries the effort level: low | medium | high | xhigh | max (model dependent).
+@omit_null @kwarg struct OutputConfig
+    effort::Union{Nothing, String} = nothing
+end
+
 @omit_null @kwarg struct Request
     model::String
     messages::Vector{Message}
@@ -227,7 +273,13 @@ end
     stream::Union{Nothing, Bool} = nothing
     temperature::Union{Nothing, Float64} = nothing
     top_p::Union{Nothing, Float64} = nothing
+    top_k::Union{Nothing, Int} = nothing
     stop_sequences::Union{Nothing, Vector{String}} = nothing
+    # `Any` (like tool_choice) so callers can pass a raw Dict/NamedTuple through
+    # `model.kw`/stream kwargs while the adapter builds the typed structs above.
+    thinking::Union{Nothing, Any} = nothing
+    output_config::Union{Nothing, Any} = nothing
+    metadata::Union{Nothing, Any} = nothing
 end
 
 end # module AnthropicMessages

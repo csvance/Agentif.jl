@@ -11,7 +11,13 @@ mutable struct PtySessionMetadata
     workdir::String
     status::String
     last_exit_code::Union{Nothing, Int}
+    auto_cleanup::Bool
 end
+
+PtySessionMetadata(session, created_at, last_used, command, workdir, status, last_exit_code) =
+    PtySessionMetadata(session, created_at, last_used, command, workdir, status, last_exit_code, true)
+
+automatic_cleanup(meta::PtySessionMetadata) = meta.auto_cleanup
 
 # SessionRegistry interface implementation
 function resolve_status(meta::PtySessionMetadata)
@@ -27,7 +33,9 @@ end
 
 function close_quietly(meta::PtySessionMetadata)
     try
-        close(meta.session)
+        # force: closing the master alone no longer kills a running child
+        # (PtySessions ≥ the Base.TTY rewrite); SIGKILL the process group too
+        close(meta.session; force = true)
     catch
     end
     return nothing
@@ -46,27 +54,66 @@ const PTY_REGISTRY = SessionRegistry{PtySessionMetadata}(
     SessionRegistryConfig(20, 15, 0.5, 1),
 )
 
+# --- PTY output reading ---
+
+"""
+    collect_until_deadline(session, budget_s) -> (output::String, hit_eof::Bool)
+
+Accumulate output for up to `budget_s` seconds, returning as soon as the
+session's output ends (process exited and every byte drained).
+
+The budget is a ceiling on how long to wait for a *still-running* process to say
+something, not a fixed delay: a command that finishes immediately returns
+immediately. Sleeping out the whole window instead used to make every call cost
+its full `yield_time_ms` (10s by default) no matter how fast the command was.
+"""
+function collect_until_deadline(session::PtySessions.PtySession, budget_s::Real)
+    deadline = time() + max(budget_s, 0.0)
+    io = IOBuffer()
+    while true
+        remaining = deadline - time()
+        remaining <= 0 && return (String(take!(io)), false)
+        chunk, at_eof = read_pty_output(session, min(remaining, 0.25))
+        isempty(chunk) || write(io, chunk)
+        at_eof && return (String(take!(io)), true)
+    end
+end
+
+"""
+    read_pty_output(session, timeout_s) -> (output::String, at_eof::Bool)
+
+Wait up to `timeout_s` seconds for the session to produce any output, then
+return everything that has arrived without blocking further. Returns `("",
+false)` when nothing arrives in time. `at_eof` is `true` once the session's
+output has ended (process exited and all bytes drained) — a deterministic
+completion signal, unlike polling `isactive` (a process can exit before its
+final output is readable).
+
+Built on `PtySessions.expect`, whose internal reader-task reuse makes repeated
+short-timeout calls safe (no task leak, no lost data: output consumed while
+waiting stays buffered on the session).
+"""
+function read_pty_output(session::PtySessions.PtySession, timeout_s::Real)
+    isopen(session) || return ("", true)
+    drained() = bytesavailable(session) > 0 ? String(readavailable(session)) : ""
+    try
+        # matches the first character to arrive; MATCH_INVALID_UTF means any
+        # text output matches, then drain the rest of what came with it
+        first_chunk = PtySessions.expect(session, r"(?s)."; timeout = max(timeout_s, 0.05))
+        return (first_chunk * drained(), false)
+    catch e
+        e isa PtySessions.ExpectTimeoutError && return (drained(), false)
+        e isa EOFError && return (drained(), true)
+        e isa Base.IOError && return ("", true)  # closed underneath us
+        rethrow()
+    end
+end
+
 # --- Terminal tools ---
 
 function create_terminal_tools(base_dir::AbstractString = pwd())
     base = ensure_base_dir(base_dir)
     ensure_cleanup_task_running!(PTY_REGISTRY)
-
-    function readavailable_nonblocking(session::PtySessions.PtySession)
-        session.master_fd < 0 && return ""
-        return PtySessions.readavailable(session)
-    end
-
-    function readavailable_with_timeout(session::PtySessions.PtySession, timeout_s::Real)
-        deadline = time() + timeout_s
-        output = ""
-        while time() < deadline
-            output = readavailable_nonblocking(session)
-            !isempty(output) && return output
-            sleep(0.01)
-        end
-        return ""
-    end
 
     exec_command = @tool(
         """Execute a shell command in a new PTY (pseudo-terminal) session.
@@ -118,15 +165,11 @@ Limits: Maximum 20 concurrent sessions. Old exited sessions are auto-cleaned. Ou
                 "bash"
             end
 
-            yield_ms = yield_time_ms === nothing ? 10_000 : max(100, yield_time_ms)
+            yield_ms = yield_time_ms === nothing ? 10_000 : clamp(yield_time_ms, 100, MAX_YIELD_TIME_MS)
             max_lines = max_output_lines === nothing ? DEFAULT_MAX_OUTPUT_LINES : max(10, max_output_lines)
             max_tokens = max_output_tokens === nothing ? DEFAULT_MAX_OUTPUT_TOKENS : max(16, max_output_tokens)
 
-            full_cmd = if Sys.iswindows()
-                Cmd([shell_cmd, "-Command", cmd])
-            else
-                Cmd([shell_cmd, "-l", "-c", cmd])
-            end
+            full_cmd = subprocess_shell_command(shell_cmd, cmd)
 
             session_id = next_session_id!(PTY_REGISTRY)
             events = Dict{String, Any}[
@@ -140,7 +183,9 @@ Limits: Maximum 20 concurrent sessions. Old exited sessions are auto-cleaned. Ou
 
             start_time = time()
             try
-                pty_session = PtySessions.PtySession(full_cmd; dir = work_dir)
+                # Allowlisted environment only (§2.4). Without this the shell the model
+                # chose inherits every credential in the parent process.
+                pty_session = PtySessions.PtySession(full_cmd; dir = work_dir, env = subprocess_env())
                 now = time()
                 register_session!(PTY_REGISTRY, session_id, PtySessionMetadata(
                     pty_session,
@@ -152,16 +197,11 @@ Limits: Maximum 20 concurrent sessions. Old exited sessions are auto-cleaned. Ou
                     nothing,
                 ))
 
-                sleep(yield_ms / 1000.0)
-                output = readavailable_with_timeout(pty_session, max(0.2, min(1.0, yield_ms / 1000.0)))
-                is_running = try
+                output, hit_eof = collect_until_deadline(pty_session, yield_ms / 1000.0)
+                is_running = !hit_eof && try
                     PtySessions.isactive(pty_session)
                 catch
                     false
-                end
-                if !is_running
-                    sleep(0.05)
-                    output *= readavailable_with_timeout(pty_session, 0.2)
                 end
 
                 if is_running
@@ -233,11 +273,15 @@ Examples:
 Gotchas: If the session has exited, returns an error. The `chars` value is sent raw — you almost always want to append "\\n" to execute a line.""",
         write_stdin(
             session_id::Int,
-            chars::String = "",
+            chars::Union{Nothing, String} = nothing,
             yield_time_ms::Union{Nothing, Int} = nothing,
             max_output_lines::Union{Nothing, Int} = nothing,
             max_output_tokens::Union{Nothing, Int} = nothing,
         ) = begin
+            # `chars` must admit `nothing`: a plain `::String = ""` default is a
+            # required field in the generated schema, so a model taking the
+            # documented default fails to parse.
+            chars = chars === nothing ? "" : chars
             @debug "write_stdin start" session_id chars_length = ncodeunits(chars)
 
             meta = get_session(PTY_REGISTRY, session_id)
@@ -259,7 +303,7 @@ Gotchas: If the session has exited, returns an error. The `chars` value is sent 
                 current === nothing || set_last_used!(current, time())
             end
 
-            yield_ms = yield_time_ms === nothing ? 250 : max(50, yield_time_ms)
+            yield_ms = yield_time_ms === nothing ? 250 : clamp(yield_time_ms, 50, MAX_YIELD_TIME_MS)
             max_lines = max_output_lines === nothing ? DEFAULT_MAX_OUTPUT_LINES : max(10, max_output_lines)
             max_tokens = max_output_tokens === nothing ? DEFAULT_MAX_OUTPUT_TOKENS : max(16, max_output_tokens)
 
@@ -271,26 +315,13 @@ Gotchas: If the session has exited, returns an error. The `chars` value is sent 
             start_time = time()
             try
                 if !isempty(chars)
-                    write_timeout_s = max(1.0, min(5.0, yield_ms / 1000.0))
-                    written = PtySessions.write_with_timeout(pty_session, chars; timeout_s = write_timeout_s)
-                    if written < ncodeunits(chars)
-                        push!(events, make_event(
-                            PTY_REGISTRY,
-                            "warning";
-                            session_id,
-                            payload = Dict(
-                                "kind" => "partial_write",
-                                "written" => written,
-                                "requested" => ncodeunits(chars),
-                            ),
-                        ))
-                    end
-                    sleep(0.1)
+                    # libuv-backed write: completes fully or throws (handled below);
+                    # the old write_with_timeout partial-write path is gone with it
+                    write(pty_session, chars)
                 end
 
-                sleep(yield_ms / 1000.0)
-                output = readavailable_with_timeout(pty_session, max(1.0, min(2.0, yield_ms / 1000.0)))
-                is_running = try
+                output, hit_eof = collect_until_deadline(pty_session, yield_ms / 1000.0)
+                is_running = !hit_eof && try
                     PtySessions.isactive(pty_session)
                 catch
                     false

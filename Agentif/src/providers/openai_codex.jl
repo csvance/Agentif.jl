@@ -25,6 +25,10 @@ const CODEX_DEFAULT_RETRY_BASE_MS = 1000
 const CODEX_DEFAULT_RETRY_MAX_MS = 60000
 const CODEX_RETRYABLE_ERROR_REGEX = r"rate.?limit|overloaded|service.?unavailable|upstream.?connect|connection.?refused|connection.?reset|reset.?before.?headers|terminated|temporar"i
 
+@kwarg struct CodexAuthClaims
+    chatgpt_account_id::Union{Nothing, String} = nothing
+end
+
 function resolve_codex_url(base_url::AbstractString)
     raw = strip(String(base_url))
     raw = isempty(raw) ? CODEX_BASE_URL : raw
@@ -50,8 +54,14 @@ end
 function normalize_codex_transport(value)::Symbol
     value === nothing && return :sse
     value isa Bool && return value ? :websocket : :sse
-
-    text = lowercase(strip(string(value)))
+    text = if value isa Symbol
+        String(value)
+    elseif value isa AbstractString
+        String(value)
+    else
+        throw(ArgumentError("Unsupported codex transport value type: $(typeof(value))."))
+    end
+    text = lowercase(strip(text))
     text in ("", "sse") && return :sse
     text in ("ws", "websocket") && return :websocket
     text == "auto" && return :auto
@@ -104,7 +114,7 @@ function codex_retry_settings!(kw::Dict{Symbol, Any})
     return (; max_retries, retry_base_ms, retry_max_ms)
 end
 
-function build_codex_tools(tools::Vector{AgentTool})
+function build_codex_tools(tools::Vector{<:AgentTool})
     isempty(tools) && return nothing
     provider_tools = Vector{Dict{String, Any}}()
     for tool in tools
@@ -145,11 +155,15 @@ function codex_account_id_from_access_token(access_token::AbstractString)
     parts = split(String(access_token), ".")
     length(parts) == 3 || return nothing
     try
-        payload = JSON.parse(Vector{UInt8}(codeunits(decode_base64url(parts[2]))))
-        auth_claims = get(() -> nothing, payload, CODEX_JWT_CLAIM_PATH)
-        auth_claims isa AbstractDict || return nothing
-        account_id = get(() -> nothing, auth_claims, "chatgpt_account_id")
-        return (account_id isa AbstractString && !isempty(account_id)) ? String(account_id) : nothing
+        payload = JSON.parse(
+            Vector{UInt8}(codeunits(decode_base64url(parts[2]))),
+            Dict{String, JSON.JSONText},
+        )
+        auth_json = get(payload, CODEX_JWT_CLAIM_PATH, nothing)
+        auth_json === nothing && return nothing
+        auth_claims = JSON.parse(auth_json.value, CodexAuthClaims)
+        account_id = auth_claims.chatgpt_account_id
+        return (account_id !== nothing && !isempty(account_id)) ? account_id : nothing
     catch
         return nothing
     end
@@ -208,7 +222,7 @@ function transform_request_body!(
                         string(output)
                     end
                     if length(text) > 16000
-                        text = string(text[1:16000], "\n...[truncated]")
+                        text = string(first(text, 16000), "\n...[truncated]")
                     end
                     push!(
                         mapped, Dict(
@@ -260,126 +274,6 @@ function transform_request_body!(
     return body
 end
 
-"""
-    _split_compound_id(id::String) -> (call_id, item_id_or_nothing)
-
-Split a compound `callId|itemId` tool call ID into its parts.
-Returns (call_id, nothing) if no `|` separator is present.
-"""
-function _split_compound_id(id::AbstractString)
-    idx = findfirst('|', id)
-    if idx === nothing
-        return (String(id), nothing)
-    end
-    return (String(id[1:idx-1]), String(id[idx+1:end]))
-end
-
-function codex_input_from_message(msg::AgentMessage, model::Model)
-    if msg isa UserMessage
-        content = Any[]
-        for block in msg.content
-            if block isa TextContent
-                push!(content, Dict("type" => "input_text", "text" => block.text))
-            elseif block isa ImageContent
-                push!(content, Dict("type" => "input_image", "image_url" => "data:$(block.mimeType);base64,$(block.data)"))
-            end
-        end
-        isempty(content) && return Any[]
-        return Any[Dict("role" => "user", "content" => content)]
-    elseif msg isa AssistantMessage
-        different_model = openai_responses_is_different_model(msg, model)
-        parts = Any[]
-        # Iterate content blocks in order to preserve signatures
-        for block in msg.content
-            if block isa ThinkingContent
-                if block.thinkingSignature !== nothing
-                    # Send back the entire opaque reasoning item (includes encrypted_content)
-                    try
-                        push!(parts, JSON.parse(block.thinkingSignature))
-                        continue
-                    catch
-                    end
-                end
-                # Fallback: reconstruct from summary text
-                !isempty(block.thinking) && push!(
-                    parts, Dict(
-                        "type" => "reasoning",
-                        "summary" => [Dict("type" => "summary_text", "text" => block.thinking)],
-                        "status" => "completed",
-                    )
-                )
-            elseif block isa TextContent
-                !isempty(block.text) || continue
-                msg_item = Dict{String, Any}(
-                    "type" => "message",
-                    "role" => "assistant",
-                    "content" => [Dict("type" => "output_text", "text" => block.text)],
-                    "status" => "completed",
-                )
-                # Include id from textSignature for prompt cache pairing
-                if block.textSignature !== nothing
-                    sig = block.textSignature
-                    msg_item["id"] = length(sig) > 64 ? first(sig, 64) : sig
-                end
-                push!(parts, msg_item)
-            elseif block isa ToolCallContent
-                call_id_raw, item_id = _split_compound_id(block.id)
-                if different_model && item_id !== nothing && startswith(item_id, "fc_")
-                    item_id = nothing
-                end
-                fc = Dict{String, Any}(
-                    "type" => "function_call",
-                    "call_id" => call_id_raw,
-                    "name" => block.name,
-                    "arguments" => JSON.json(block.arguments),
-                )
-                item_id !== nothing && (fc["id"] = item_id)
-                push!(parts, fc)
-            end
-        end
-        # Fallback: if no ToolCallContent blocks, use tool_calls field
-        has_tc_blocks = any(b -> b isa ToolCallContent, msg.content)
-        if !has_tc_blocks
-            for tc in msg.tool_calls
-                call_id_raw, item_id = _split_compound_id(tc.call_id)
-                if different_model && item_id !== nothing && startswith(item_id, "fc_")
-                    item_id = nothing
-                end
-                fc = Dict{String, Any}(
-                    "type" => "function_call",
-                    "call_id" => call_id_raw,
-                    "name" => tc.name,
-                    "arguments" => tc.arguments,
-                )
-                item_id !== nothing && (fc["id"] = item_id)
-                push!(parts, fc)
-            end
-        end
-        return parts
-    elseif msg isa ToolResultMessage
-        output = provider_tool_result_output(msg)
-        # Use only the callId portion (before |) for function_call_output
-        call_id_raw, _ = _split_compound_id(msg.call_id)
-        return Any[
-            Dict(
-                "type" => "function_call_output",
-                "call_id" => call_id_raw,
-                "output" => output,
-            ),
-        ]
-    elseif msg isa CompactionSummaryMessage
-        return Any[Dict("role" => "user", "content" => [Dict("type" => "input_text", "text" => "[Previous conversation summary]\n\n$(msg.summary)")])]
-    end
-    return Any[]
-end
-
-function codex_build_input(agent::Agent, state::AgentState, input::AgentTurnInput, model::Model)
-    items = Any[]
-    for msg in openai_responses_transformed_messages(state, input, model)
-        append!(items, codex_input_from_message(msg, model))
-    end
-    return items
-end
 
 function codex_usage_from_response(u)
     u === nothing && return Usage()
@@ -391,7 +285,7 @@ function codex_usage_from_response(u)
     if details isa AbstractDict
         cached_tokens = get(() -> 0, details, "cached_tokens")
     end
-    return Usage(; input = input_tokens - cached_tokens, output = output_tokens, cacheRead = cached_tokens, cacheWrite = 0, total = total_tokens)
+    return Usage(; input = max(0, input_tokens - cached_tokens), output = output_tokens, cacheRead = cached_tokens, cacheWrite = 0, total = total_tokens)
 end
 
 function codex_stop_reason(status::Union{Nothing, String}, tool_calls::Vector{AgentToolCall})
@@ -403,7 +297,7 @@ function codex_stop_reason(status::Union{Nothing, String}, tool_calls::Vector{Ag
 end
 
 function openai_codex_event_callback(
-        f::Function,
+        f::F,
         agent::Agent,
         assistant_message::AssistantMessage,
         started::Base.RefValue{Bool},
@@ -412,7 +306,7 @@ function openai_codex_event_callback(
         response_status::Base.RefValue{Union{Nothing, String}},
         tool_call_accumulators::Dict{String, ToolCallAccumulator},
         abort::Abort,
-    )
+    ) where {F <: Function}
     ensure_started() = begin
         if !started[]
             started[] = true
@@ -713,7 +607,7 @@ end
 
 function truncate_text(text::String, limit::Int)
     length(text) <= limit && return text
-    return string(text[1:limit], "...[truncated $(length(text) - limit)]")
+    return string(first(text, limit), "...[truncated $(length(text) - limit)]")
 end
 
 function format_codex_failure(raw_event::AbstractDict{String, Any})
@@ -846,17 +740,48 @@ function codex_retryable_message(message::AbstractString)
     return occursin(CODEX_RETRYABLE_ERROR_REGEX, lowercase(message))
 end
 
+function codex_nested_retryable_exception(err::Exception)
+    if err isa TaskFailedException
+        task = getfield(err, :task)
+        for (nested, _) in Base.current_exceptions(task)
+            nested isa Exception && codex_retryable_exception(nested) && return true
+        end
+    elseif err isa CompositeException
+        for nested in getfield(err, :exceptions)
+            nested isa Exception && codex_retryable_exception(nested) && return true
+        end
+    end
+    return false
+end
+
 function codex_retryable_exception(err::Exception)
     if err isa HTTP.ConnectError
         return true
-    elseif err isa HTTP.RequestError
-        inner = err.error
+    elseif isdefined(HTTP, :RequestError) && err isa getfield(HTTP, :RequestError)
+        inner = getproperty(err, :error)
         inner isa Exception && return codex_retryable_exception(inner)
         return codex_retryable_message(string(inner))
-    elseif err isa EOFError || err isa Base.IOError || err isa InterruptException
+    elseif isdefined(HTTP, :RequestRetryError) && err isa getfield(HTTP, :RequestRetryError)
+        inner = getproperty(err, :err)
+        inner isa Exception && return codex_retryable_exception(inner)
+        return codex_retryable_message(string(inner))
+    elseif err isa InterruptException
+        return false
+    elseif err isa EOFError || err isa Base.IOError || err isa HTTP.ParseError
         return true
     end
+    codex_nested_retryable_exception(err) && return true
     return codex_retryable_message(sprint(showerror, err))
+end
+
+function http_recoverable_error(err::Exception)
+    if isdefined(HTTP, :isrecoverable)
+        return getfield(HTTP, :isrecoverable)(err)
+    elseif isdefined(HTTP, :RetryRequest)
+        retry_module = getfield(HTTP, :RetryRequest)
+        return getfield(retry_module, :isrecoverable)(err)
+    end
+    return false
 end
 
 function codex_retry_after_seconds(resp::HTTP.Response)
@@ -905,6 +830,10 @@ function codex_stream_sse_with_retry!(
     request_http_kw = merge(http_nt, (; retry = false, status_exception = false))
     payload = JSON.json(request_body)
     attempt = 0
+    # Once any SSE event has been delivered into the (stateful) callback,
+    # re-POSTing would replay the whole response and duplicate its content.
+    events_seen = Ref(false)
+    tracked_callback = sse_tracking_callback(callback, events_seen)
 
     while true
         isaborted(abort) && throw(StopStreaming("aborted"))
@@ -915,12 +844,12 @@ function codex_stream_sse_with_retry!(
                 url,
                 headers;
                 body = payload,
-                sse_callback = callback,
+                sse_callback = tracked_callback,
                 request_http_kw...,
             )
         catch err
             err isa StopStreaming && rethrow()
-            if attempt < max_retries && codex_retryable_exception(err)
+            if attempt < max_retries && !events_seen[] && codex_retryable_exception(err)
                 attempt += 1
                 delay_s = codex_retry_delay_seconds(attempt, retry_base_ms, retry_max_ms)
                 log_codex_debug(
@@ -945,7 +874,7 @@ function codex_stream_sse_with_retry!(
         info = parse_codex_error(resp)
         info_msg = String(get(() -> "", info, :message))
         retryable = codex_retryable_status(resp.status) || codex_retryable_message(info_msg)
-        if attempt < max_retries && retryable
+        if attempt < max_retries && !events_seen[] && retryable
             attempt += 1
             delay_s = codex_retry_delay_seconds(attempt, retry_base_ms, retry_max_ms; response = resp)
             log_codex_debug(
@@ -1037,6 +966,21 @@ function codex_websocket_pool_key(ws_url::String, headers::Dict{String, String})
     return (ws_url, account, String(session_id))
 end
 
+function codex_websocket_open_kw(http_kw)
+    http_nt = http_kw isa NamedTuple ? http_kw : (; http_kw...)
+    ws_open_kw = Base.structdiff(
+        http_nt,
+        (; retry = nothing, retries = nothing, retry_non_idempotent = nothing),
+    )
+    if isdefined(HTTP.WebSockets, :server_addr) && haskey(ws_open_kw, :readtimeout)
+        readtimeout = ws_open_kw.readtimeout
+        ws_open_kw = Base.structdiff(ws_open_kw, (; readtimeout = nothing))
+        haskey(ws_open_kw, :read_idle_timeout) ||
+            (ws_open_kw = merge(ws_open_kw, (; read_idle_timeout = readtimeout)))
+    end
+    return ws_open_kw
+end
+
 function codex_stream_websocket!(
         callback::Function,
         ws_url::String,
@@ -1045,8 +989,7 @@ function codex_stream_websocket!(
         abort::Abort;
         http_kw = (;),
     )
-    http_nt = http_kw isa NamedTuple ? http_kw : (; http_kw...)
-    ws_open_kw = merge(http_nt, (; retry = false))
+    ws_open_kw = codex_websocket_open_kw(http_kw)
     ws_headers = create_codex_websocket_headers(headers)
     start_request = copy(request_body)
     start_request["type"] = "response.create"

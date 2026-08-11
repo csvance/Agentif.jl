@@ -9,6 +9,9 @@ parameters(::AgentTool{F, T}) where {F, T} = T
 tool_name(tool::AgentTool) = tool.name
 tool_name(name::AbstractString) = String(name)
 
+const EmptyAgentTool = AgentTool{typeof(identity), @NamedTuple{}}
+empty_agent_tools() = EmptyAgentTool[]
+
 @kwarg mutable struct PendingToolCall
     const call_id::String
     const name::String
@@ -22,13 +25,6 @@ function findtool(tools, name)
         tool.name == name && return tool
     end
     throw(ArgumentError("invalid tool for agent: `$name`"))
-end
-
-function findpendingtool(pending_tool_calls::Vector{PendingToolCall}, call_id::String)
-    for ptc in pending_tool_calls
-        ptc.call_id == call_id && return ptc
-    end
-    throw(ArgumentError("invalid call_id for pending tool calls: $call_id"))
 end
 
 function extract_function_args(func_expr::Expr)

@@ -131,7 +131,7 @@ Return platform-specific tools for the current channel (e.g. emoji reactions).
 Channel extensions should specialize this for their channel types.
 Default: empty vector.
 """
-create_channel_tools(::AbstractChannel) = AgentTool[]
+create_channel_tools(::AbstractChannel) = empty_agent_tools()
 
 const CURRENT_CHANNEL = ScopedValue{Union{AbstractChannel, Nothing}}(nothing)
 
@@ -153,7 +153,7 @@ Used by group chat prompts to let the agent stay silent when it has nothing to a
 const NO_REPLY_SENTINEL = '∅'
 
 function channel_middleware(agent_handler::AgentHandler, ch::Union{Nothing, AbstractChannel})
-    return function (f, agent::Agent, state::AgentState, current_input::AgentTurnInput, abort::Abort; kw...)
+    return function (f::F, agent::Agent, state::AgentState, current_input::AgentTurnInput, abort::Abort; kw...) where {F <: Function}
         ch === nothing && return agent_handler(f, agent, state, current_input, abort; kw...)
         streaming = false
         suppressed = false

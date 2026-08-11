@@ -32,27 +32,33 @@ function openai_completions_detect_compat(model::Model)
     )
 end
 
+function openai_completions_compat_value(compat::Dict{String, Any}, key::String, default::T)::T where {T}
+    value = get(compat, key, default)
+    value isa T || throw(ArgumentError("OpenAI compatibility option `$key` must be a $(T)."))
+    return value
+end
+
 function openai_completions_resolve_compat(model::Model)
     detected = openai_completions_detect_compat(model)
     compat = model.compat
     compat === nothing && return detected
     return (;
-        supportsStore = get(() -> detected.supportsStore, compat, "supportsStore"),
-        supportsDeveloperRole = get(() -> detected.supportsDeveloperRole, compat, "supportsDeveloperRole"),
-        supportsReasoningEffort = get(() -> detected.supportsReasoningEffort, compat, "supportsReasoningEffort"),
-        supportsTools = get(() -> detected.supportsTools, compat, "supportsTools"),
-        supportsUsageInStreaming = get(() -> detected.supportsUsageInStreaming, compat, "supportsUsageInStreaming"),
-        maxTokensField = get(() -> detected.maxTokensField, compat, "maxTokensField"),
-        requiresToolResultName = get(() -> detected.requiresToolResultName, compat, "requiresToolResultName"),
-        requiresAssistantAfterToolResult = get(() -> detected.requiresAssistantAfterToolResult, compat, "requiresAssistantAfterToolResult"),
-        requiresThinkingAsText = get(() -> detected.requiresThinkingAsText, compat, "requiresThinkingAsText"),
-        requiresMistralToolIds = get(() -> detected.requiresMistralToolIds, compat, "requiresMistralToolIds"),
-        thinkingFormat = get(() -> detected.thinkingFormat, compat, "thinkingFormat"),
-        stripThinkTags = get(() -> detected.stripThinkTags, compat, "stripThinkTags"),
+        supportsStore = openai_completions_compat_value(compat, "supportsStore", detected.supportsStore),
+        supportsDeveloperRole = openai_completions_compat_value(compat, "supportsDeveloperRole", detected.supportsDeveloperRole),
+        supportsReasoningEffort = openai_completions_compat_value(compat, "supportsReasoningEffort", detected.supportsReasoningEffort),
+        supportsTools = openai_completions_compat_value(compat, "supportsTools", detected.supportsTools),
+        supportsUsageInStreaming = openai_completions_compat_value(compat, "supportsUsageInStreaming", detected.supportsUsageInStreaming),
+        maxTokensField = openai_completions_compat_value(compat, "maxTokensField", detected.maxTokensField),
+        requiresToolResultName = openai_completions_compat_value(compat, "requiresToolResultName", detected.requiresToolResultName),
+        requiresAssistantAfterToolResult = openai_completions_compat_value(compat, "requiresAssistantAfterToolResult", detected.requiresAssistantAfterToolResult),
+        requiresThinkingAsText = openai_completions_compat_value(compat, "requiresThinkingAsText", detected.requiresThinkingAsText),
+        requiresMistralToolIds = openai_completions_compat_value(compat, "requiresMistralToolIds", detected.requiresMistralToolIds),
+        thinkingFormat = openai_completions_compat_value(compat, "thinkingFormat", detected.thinkingFormat),
+        stripThinkTags = openai_completions_compat_value(compat, "stripThinkTags", detected.stripThinkTags),
     )
 end
 
-function openai_completions_has_tool_history(messages::Vector{AgentMessage})
+function openai_completions_has_tool_history(messages::Vector{StoredAgentMessage})
     for msg in messages
         if msg isa ToolResultMessage
             return true
@@ -64,16 +70,6 @@ function openai_completions_has_tool_history(messages::Vector{AgentMessage})
         end
     end
     return false
-end
-
-function openai_completions_is_zai(model::Model)
-    compat = openai_completions_resolve_compat(model)
-    return compat.thinkingFormat == "zai"
-end
-
-function openai_completions_supports_reasoning_effort(model::Model)
-    compat = openai_completions_resolve_compat(model)
-    return compat.supportsReasoningEffort
 end
 
 function openai_completions_use_reasoning_split(model::Model)
@@ -133,7 +129,8 @@ function openai_completions_append_thinking_with_details!(assistant_message::Ass
     return
 end
 
-function openai_completions_build_tools(tools::Vector{AgentTool}; force_empty::Bool = false)
+function openai_completions_build_tools(
+        tools::Vector{<:AgentTool}; force_empty::Bool = false)
     isempty(tools) && return force_empty ? OpenAICompletions.Tool[] : nothing
     provider_tools = OpenAICompletions.Tool[]
     for tool in tools
@@ -163,7 +160,7 @@ end
 
 function openai_completions_build_messages(agent::Agent, state::AgentState, input::AgentTurnInput, model::Model)
     compat = openai_completions_resolve_compat(model)
-    raw_messages = AgentMessage[]
+    raw_messages = StoredAgentMessage[]
     for msg in state.messages
         include_in_context(msg) || continue
         push!(raw_messages, msg)
@@ -183,7 +180,7 @@ function openai_completions_build_messages(agent::Agent, state::AgentState, inpu
             return normalize_mistral_tool_id(id)
         end
         if model.provider == "openai"
-            return length(id) > 40 ? id[1:40] : id
+            return length(id) > 40 ? first(id, 40) : id
         end
         if model.provider == "github-copilot" && occursin("claude", lowercase(model.id))
             normalized = replace(id, r"[^A-Za-z0-9_-]" => "_")
@@ -227,7 +224,10 @@ function openai_completions_build_messages(agent::Agent, state::AgentState, inpu
             if !("image" in model.input)
                 parts = OpenAICompletions.ContentPart[part for part in parts if part.type != "image_url"]
             end
-            isempty(parts) && continue
+            if isempty(parts)
+                i += 1
+                continue
+            end
             push!(messages, OpenAICompletions.Message(; role = "user", content = parts))
             last_role = "user"
         elseif msg isa AssistantMessage
@@ -299,6 +299,7 @@ function openai_completions_build_messages(agent::Agent, state::AgentState, inpu
             has_extra = assistant_msg.extra !== nothing && !isempty(assistant_msg.extra)
             has_reasoning = assistant_msg.reasoning_details !== nothing
             if !has_content && assistant_msg.tool_calls === nothing && !has_extra && !has_reasoning
+                i += 1
                 continue
             end
             push!(messages, assistant_msg)
@@ -339,14 +340,18 @@ function openai_completions_build_messages(agent::Agent, state::AgentState, inpu
                 if compat.requiresAssistantAfterToolResult
                     push!(messages, OpenAICompletions.Message(; role = "assistant", content = "I have processed the tool results."))
                 end
+                content = OpenAICompletions.ContentPart[
+                    OpenAICompletions.ContentPart(;
+                        type = "text",
+                        text = "Attached image(s) from tool result:",
+                    ),
+                ]
+                append!(content, image_blocks)
                 push!(
                     messages,
                     OpenAICompletions.Message(;
                         role = "user",
-                        content = OpenAICompletions.ContentPart[
-                            OpenAICompletions.ContentPart(; type = "text", text = "Attached image(s) from tool result:"),
-                            image_blocks...,
-                        ],
+                        content,
                     ),
                 )
                 last_role = "user"
@@ -417,8 +422,10 @@ function strip_think_tags(text::AbstractString)
     # Implicit-open: everything before first </think> is thinking
     idx = findfirst("</think>", text)
     if idx !== nothing
-        thinking = text[1:first(idx)-1]
-        content = lstrip(text[last(idx)+1:end])
+        # prevind/nextind keep slices on char boundaries: `first(idx)-1` is a
+        # continuation byte when the char right before the tag is multi-byte
+        thinking = text[1:prevind(text, first(idx))]
+        content = lstrip(text[nextind(text, last(idx)):end])
         return thinking, content
     end
     return "", text
@@ -450,6 +457,9 @@ function process_think_tag_chunk(tts::ThinkTagStreamState, chunk::AbstractString
     buf = tts.buffer
     tts.buffer = ""
 
+    # NOTE: all slicing below must stay on char boundaries — the char right
+    # before/after an ASCII tag can be multi-byte, so raw index arithmetic
+    # (`first(idx)-1`, `end-8`) would land on continuation bytes and throw.
     while !isempty(buf)
         if tts.in_think
             # Skip explicit <think> open tag if present
@@ -457,21 +467,22 @@ function process_think_tag_chunk(tts::ThinkTagStreamState, chunk::AbstractString
                 idx = findfirst("<think>", buf)
                 if idx !== nothing && first(idx) == 1
                     tts.saw_explicit_open = true
-                    buf = buf[last(idx)+1:end]
+                    buf = buf[nextind(buf, last(idx)):end]
                     continue
                 end
             end
             # Look for closing </think>
             idx = findfirst("</think>", buf)
             if idx !== nothing
-                write(thinking, buf[1:first(idx)-1])
-                buf = buf[last(idx)+1:end]
+                write(thinking, buf[1:prevind(buf, first(idx))])
+                buf = buf[nextind(buf, last(idx)):end]
                 tts.in_think = false
             else
                 # Buffer last 8 chars in case </think> spans chunks
-                if length(buf) >= 8
-                    write(thinking, buf[1:end-8])
-                    tts.buffer = buf[end-7:end]
+                n = length(buf)
+                if n >= 8
+                    write(thinking, first(buf, n - 8))
+                    tts.buffer = last(buf, 8)
                 else
                     tts.buffer = buf
                 end
@@ -481,15 +492,16 @@ function process_think_tag_chunk(tts::ThinkTagStreamState, chunk::AbstractString
             # Look for opening <think>
             idx = findfirst("<think>", buf)
             if idx !== nothing
-                write(content, buf[1:first(idx)-1])
-                buf = buf[last(idx)+1:end]
+                write(content, buf[1:prevind(buf, first(idx))])
+                buf = buf[nextind(buf, last(idx)):end]
                 tts.in_think = true
                 tts.saw_explicit_open = true
             else
                 # Buffer last 7 chars in case <think> spans chunks
-                if length(buf) >= 7
-                    write(content, buf[1:end-7])
-                    tts.buffer = buf[end-6:end]
+                n = length(buf)
+                if n >= 7
+                    write(content, first(buf, n - 7))
+                    tts.buffer = last(buf, 7)
                 else
                     tts.buffer = buf
                 end
@@ -517,7 +529,7 @@ function flush_think_tag_state(tts::ThinkTagStreamState)
 end
 
 function openai_completions_event_callback(
-        f::Function,
+        f::F,
         assistant_message::AssistantMessage,
         started::Base.RefValue{Bool},
         ended::Base.RefValue{Bool},
@@ -526,7 +538,7 @@ function openai_completions_event_callback(
         tool_call_accumulators::Dict{Int, ToolCallAccumulator},
         abort::Abort;
         think_tag_state::Union{Nothing, ThinkTagStreamState} = nothing,
-    )
+    ) where {F <: Function}
     reasoning_buffer = ""
     leading_whitespace = ""
     saw_text = false
@@ -644,8 +656,10 @@ function openai_completions_event_callback(
                     if isempty(reasoning_buffer)
                         push!(new_text_parts, text_str)
                     else
-                        start_idx = lastindex(reasoning_buffer) + 1
-                        start_idx <= lastindex(text_str) && push!(new_text_parts, text_str[start_idx:end])
+                        # startswith guarantees the prefix bytes match, so the byte
+                        # after the prefix is a valid char boundary in text_str.
+                        start_idx = ncodeunits(reasoning_buffer) + 1
+                        start_idx <= ncodeunits(text_str) && push!(new_text_parts, text_str[start_idx:end])
                     end
                 else
                     push!(new_text_parts, text_str)
@@ -718,12 +732,12 @@ function openai_completions_event_callback(
                     )
                     f(MessageUpdateEvent(:assistant, assistant_message, :tool_arguments, tool_delta.function.arguments, acc.id))
                     if get(ENV, "AGENTIF_STOP_ON_TOOL_CALL", "") != "" && acc.name !== nothing && !isempty(acc.arguments)
-                        try
-                            parsed = JSON.parse(acc.arguments)
-                            parsed isa AbstractDict || throw(ArgumentError("tool arguments not object"))
-                            throw(StopStreaming("tool call arguments complete"))
+                        complete = try
+                            JSON.parse(acc.arguments) isa AbstractDict
                         catch
+                            false
                         end
+                        complete && throw(StopStreaming("tool call arguments complete"))
                     end
                 end
             end

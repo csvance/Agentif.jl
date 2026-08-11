@@ -8,6 +8,7 @@ using LLMProviders
 using LLMOAuth
 using LocalSearch
 using SQLite
+using Sockets
 
 function dummy_model()
     return Model(
@@ -40,6 +41,51 @@ function make_agent(; prompt = "test prompt", tools = AgentTool[])
         apikey = "test-key",
         tools = tools,
     )
+end
+
+function test_server_port(server)
+    if applicable(HTTP.port, server)
+        port = HTTP.port(server)
+        port != 0 && return port
+    end
+    if hasproperty(server, :listener) && hasproperty(server.listener, :server)
+        return Sockets.getsockname(server.listener.server)[2]
+    end
+    return parse(Int, last(rsplit(HTTP.WebSockets.server_addr(server), ':'; limit = 2)))
+end
+
+function test_websocket_request(ws)
+    return hasproperty(ws, :handshake_request) ? ws.handshake_request : ws.request
+end
+
+function test_status_error(status::Integer)
+    response = HTTP.Response(status)
+    if applicable(HTTP.StatusError, status, "POST", "/x", response)
+        return HTTP.StatusError(status, "POST", "/x", response)
+    end
+    return HTTP.StatusError(response)
+end
+
+function test_parse_error(message::AbstractString)
+    if applicable(HTTP.ParseError, message)
+        return HTTP.ParseError(message)
+    end
+    return HTTP.ParseError(:INVALID_STATUS_LINE, message)
+end
+
+function test_force_close_stream(http)
+    if hasproperty(http, :tracked)
+        tracked = http.tracked
+        if tracked !== nothing && hasproperty(tracked, :conn)
+            close(tracked.conn)
+            return
+        end
+    end
+    if hasproperty(http, :stream) && hasproperty(http.stream, :io)
+        close(http.stream.io)
+        return
+    end
+    error("Unable to find the test server stream transport")
 end
 
 function fake_jwt(payload::AbstractDict)
@@ -89,6 +135,72 @@ function make_base_handler(; with_tool_call::Bool = false, call_counter = Ref(0)
     end
 end
 
+# ── Compaction/session integration helpers ──
+
+# Minimal openai-completions SSE body carrying a single assistant text.
+function summary_sse_body(text::String)
+    chunks = String[]
+    isempty(text) || push!(chunks, "data: " * JSON.json((; choices = [(; index = 0, delta = (; content = text), finish_reason = nothing)])))
+    push!(chunks, "data: " * JSON.json((; choices = [(; index = 0, delta = (;), finish_reason = "stop")])))
+    push!(chunks, "data: [DONE]")
+    return join(chunks, "\n\n") * "\n\n"
+end
+
+# Mock provider used for compaction's summarization call.
+function start_summary_server(; summary_text::String = "SUMMARY", status::Int = 200,
+        error_message::String = "bad request", hits = Ref(0))
+    server = HTTP.serve!("127.0.0.1", 0) do req
+        hits[] += 1
+        status == 200 || return HTTP.Response(
+            status,
+            ["Content-Type" => "application/json"],
+            JSON.json(Dict("error" => Dict("message" => error_message))),
+        )
+        return HTTP.Response(200, ["Content-Type" => "text/event-stream"], summary_sse_body(summary_text))
+    end
+    port = test_server_port(server)
+    return server, port
+end
+
+function compaction_test_model(port::Integer; contextWindow::Int)
+    return Model(
+        id = "test-model", name = "test-model", api = "openai-completions",
+        provider = "test", baseUrl = "http://127.0.0.1:$port", reasoning = false,
+        input = ["text"],
+        cost = Dict("input" => 0.0, "output" => 0.0, "cacheRead" => 0.0, "cacheWrite" => 0.0),
+        contextWindow = contextWindow, maxTokens = 4096,
+    )
+end
+
+# Base handler with a scripted per-call usage/tool-call program. Records the
+# messages it was handed on every call so tests can assert what the LLM would
+# have seen.
+function scripted_handler(; usage_inputs::Vector{Int} = Int[], tool_turns = Set{Int}(),
+        calls = Ref(0), observed = Vector{Vector{AgentMessage}}())
+    return function (f, agent::Agent, state::AgentState, input::Agentif.AgentTurnInput, abort::Agentif.Abort; kw...)
+        calls[] += 1
+        n = calls[]
+        push!(observed, copy(state.messages))
+        msg = AssistantMessage(; provider = "test", api = "test", model = "test")
+        Agentif.append_text!(msg, "reply-$n")
+        args = "{\"text\":\"t\"}"
+        n in tool_turns && push!(msg.tool_calls, AgentToolCall(; call_id = "call-$n", name = "echo_back", arguments = args))
+        tokens = n <= length(usage_inputs) ? usage_inputs[n] : 0
+        Agentif.append_state!(state, input, msg, Usage(; input = tokens, total = tokens))
+        if n in tool_turns
+            state.pending_tool_calls = Agentif.PendingToolCall[Agentif.PendingToolCall(; call_id = "call-$n", name = "echo_back", arguments = args)]
+            state.most_recent_stop_reason = :tool_calls
+        else
+            state.pending_tool_calls = Agentif.PendingToolCall[]
+            state.most_recent_stop_reason = :stop
+        end
+        return state
+    end
+end
+
+message_signatures(messages::AbstractVector{<:AgentMessage}) = [(typeof(m), message_text(m)) for m in messages]
+message_signatures(state::AgentState) = message_signatures(state.messages)
+
 struct SessionTestChannel <: Agentif.AbstractChannel
     id::String
     user::Union{Nothing, Agentif.ChannelUser}
@@ -98,6 +210,14 @@ end
 Agentif.channel_id(ch::SessionTestChannel) = ch.id
 Agentif.get_current_user(ch::SessionTestChannel) = ch.user
 Agentif.entry_id(ch::SessionTestChannel) = ch.message_id
+
+struct ProactiveSessionTestChannel <: Agentif.AbstractChannel
+    id::String
+    response_id::String
+end
+
+Agentif.channel_id(ch::ProactiveSessionTestChannel) = ch.id
+Agentif.response_entry_id(ch::ProactiveSessionTestChannel) = ch.response_id
 
 mutable struct StreamTestChannel <: Agentif.AbstractChannel
     id::String
@@ -119,6 +239,25 @@ Agentif.close_channel(ch::StreamTestChannel) = (ch.closed += 1)
 @testset "public API bindings" begin
     tool = @tool "Echo text." echo_text(text::String) = text
     @test tool_name(tool) == "echo_text"
+    agent = make_agent(; tools = [tool])
+    @test eltype(agent.tools) === typeof(tool)
+    @test @inferred(Agentif.findtool(agent.tools, "echo_text")) === tool
+    default_agent = Agent(
+        id = "default-tools",
+        prompt = "test",
+        model = dummy_model(),
+        apikey = "test-key",
+    )
+    @test Agentif.openai_responses_build_tools(default_agent.tools) === nothing
+    @test Agentif.openai_completions_build_tools(default_agent.tools) === nothing
+    @test Agentif.build_codex_tools(default_agent.tools) === nothing
+    @test Agentif.google_generative_build_tools(default_agent.tools) === nothing
+    @test Agentif.google_gemini_cli_build_tools(default_agent.tools) === nothing
+    tool_name_map, tool_name_reverse_map =
+        Agentif.anthropic_tool_name_maps(default_agent.tools, true)
+    @test isempty(tool_name_map)
+    @test isempty(tool_name_reverse_map)
+    @test Agentif.anthropic_build_tools(default_agent.tools, tool_name_map) === nothing
     pending = Agentif.PendingToolCall(; call_id = "call-1", name = "echo_pending", arguments = "{}")
     @test tool_name(pending) == "echo_pending"
     @test tool_name("literal-name") == "literal-name"
@@ -276,6 +415,73 @@ end
     @test haskey(parse_payload, "raw_arguments")
 end
 
+# Regression: tool_fuzz.jl found that a confused model's arguments produced raw
+# Julia conversion errors (`Cannot convert Int64 to String`) that name no field,
+# and that truncated argument JSON escaped as a BoundsError from JSON.jl's own
+# error-reporting path. Both must arrive as field-level validation errors.
+@testset "tool argument validation errors" begin
+    T = @NamedTuple{cmd::String, workdir::Union{Nothing, String}, yield_time_ms::Union{Nothing, Int}}
+    parse_message(args) = try
+        Agentif.parse_tool_arguments(args, T)
+        nothing
+    catch e
+        e isa Agentif.ToolArgumentError || rethrow()
+        sprint(showerror, e)
+    end
+
+    @test parse_message("{\"cmd\":12345}") ==
+        "argument `cmd` expects a string, but received an integer"
+    @test parse_message("{\"cmd\":[\"ls\",\"-la\"]}") ==
+        "argument `cmd` expects a string, but received an array"
+    @test parse_message("{\"cmd\":null}") ==
+        "argument `cmd` expects a string, but received null"
+    @test parse_message("{\"cmd\":{\"a\":1}}") ==
+        "argument `cmd` expects a string, but received an object"
+    @test parse_message("{\"workdir\":\"/tmp\"}") ==
+        "missing required argument `cmd` (expected a string)"
+    @test parse_message("{\"cmd\":\"ls\",\"yield_time_ms\":\"soon\"}") ==
+        "argument `yield_time_ms` expects an integer or null, but received a string"
+    # every bad field is reported, so one round trip is enough to fix them all
+    @test parse_message("{\"cmd\":1,\"yield_time_ms\":\"soon\"}") ==
+        "argument `cmd` expects a string, but received an integer; " *
+        "argument `yield_time_ms` expects an integer or null, but received a string"
+    @test parse_message("\"echo hi\"") ==
+        "expected a JSON object of arguments, but received a string"
+    # JSON.jl v1.7.1 raises BoundsError, not its own ArgumentError, when the
+    # input ends mid-token; the call site must absorb that.
+    @test parse_message("{\"cmd\":\"echo") ==
+        "the arguments are not valid JSON: the input ends unexpectedly (truncated or malformed)"
+    @test parse_message("{") ==
+        "the arguments are not valid JSON: the input ends unexpectedly (truncated or malformed)"
+    # JSON.jl's own diagnostic survives when it is well formed
+    @test occursin("invalid JSON at byte position", parse_message("{cmd:\"echo hi\"}"))
+
+    # valid arguments are untouched, optional fields included
+    @test Agentif.parse_tool_arguments("{\"cmd\":\"echo hi\"}", T) ==
+        (cmd = "echo hi", workdir = nothing, yield_time_ms = nothing)
+    @test Agentif.parse_tool_arguments("{\"cmd\":\"echo hi\",\"yield_time_ms\":500}", T) ==
+        (cmd = "echo hi", workdir = nothing, yield_time_ms = 500)
+
+    # the rendered envelope keeps its shape; only the message got specific
+    typed_tool = @tool "Echoes." echoer(cmd::String) = cmd
+    for (args, expected) in [
+            ("{\"cmd\":12345}", "argument `cmd` expects a string, but received an integer"),
+            ("{\"cmd\":\"echo", "the input ends unexpectedly (truncated or malformed)"),
+        ]
+        tc = Agentif.PendingToolCall(; call_id = "call-bad", name = "echoer", arguments = args)
+        trm = wait(Agentif.call_function_tool!(identity, typed_tool, tc))
+        @test trm.is_error
+        payload = JSON.parse(message_text(trm))
+        @test payload["ok"] == false
+        @test payload["error_kind"] == "tool_argument_parse_failed"
+        @test payload["tool"] == "echoer"
+        @test payload["call_id"] == "call-bad"
+        @test payload["exception_type"] == "Agentif.ToolArgumentError"
+        @test payload["raw_arguments"] == args
+        @test occursin(expected, payload["message"])
+    end
+end
+
 @testset "provider tool result output wrapping" begin
     err_output = JSON.json(Dict("ok" => false, "error_kind" => "tool_execution_failed", "message" => "boom"))
     result = ToolResultMessage("call-wrap", "explode", err_output; is_error = true)
@@ -295,6 +501,17 @@ end
         return state
     end
     agent = make_agent()
+    handler = @inferred Agentif.build_default_handler(;
+        base_handler,
+        compaction_config = nothing,
+        steer_queue = nothing,
+        message_queue = nothing,
+        session_store = nothing,
+        input_guardrail = nothing,
+        skill_registry = nothing,
+        channel = nothing,
+    )
+    @test handler isa Function
     state = Agentif.evaluate(identity, agent, "hello"; base_handler, level = :debug)
     @test state isa AgentState
     @test observed_kw[] !== nothing
@@ -463,15 +680,19 @@ end
     user_msgs = [Agentif.message_text(m) for m in state.messages if m isa UserMessage]
     @test user_msgs == ["hello sqlite world", "second sqlite row"]
 
-    row_iter = SQLite.DBInterface.execute(db, "SELECT entry, user_id, channel_id FROM session_entries WHERE entry_id = ?", ("entry-1",))
-    row = iterate(row_iter)
-    @test row !== nothing
-    parsed = JSON.parse(row[1].entry, SessionEntry)
+    rows = SQLite.rowtable(SQLite.DBInterface.execute(
+        db,
+        "SELECT entry, user_id, channel_id FROM session_entries WHERE entry_id = ?",
+        ("entry-1",),
+    ))
+    @test length(rows) == 1
+    row = only(rows)
+    parsed = JSON.parse(row.entry, SessionEntry)
     @test parsed.id == "entry-1"
     @test parsed.user_id == "U100"
     @test parsed.channel_id == "chan:alpha"
-    @test row[1].user_id == "U100"
-    @test row[1].channel_id == "chan:alpha"
+    @test row.user_id == "U100"
+    @test row.channel_id == "chan:alpha"
 
     results = LocalSearch.search(search_store, "hello sqlite world"; limit = 5)
     matches = filter(r -> startswith(r.id, "session:entry:entry-1"), results)
@@ -489,6 +710,32 @@ end
     # entry has no channel_flags → tagged as public
     @test "session:public" in tags
     @test "session:ch:chan:alpha" in tags
+end
+
+@testset "AgentifSQLiteExt schema checks release read snapshots" begin
+    path = joinpath(mktempdir(), "session.sqlite")
+    initial = SQLite.DB(path)
+    Agentif.init_sqlite_session_schema!(initial)
+    close(initial)
+
+    # On an existing schema, `_ensure_column!` finds `post_id` before the end of
+    # PRAGMA table_info. It must still close that cursor so this connection can
+    # observe commits made through another WAL connection.
+    reader = SQLite.DB(path)
+    Agentif.init_sqlite_session_schema!(reader)
+    writer = SQLite.DB(path)
+    SQLite.execute(writer,
+        "INSERT INTO session_branches (branch_id, leaf_entry_id) VALUES ('probe', 'fresh')")
+    leaves = String[
+        String(row.leaf_entry_id)
+        for row in SQLite.DBInterface.execute(
+            reader,
+            "SELECT leaf_entry_id FROM session_branches WHERE branch_id = 'probe'",
+        )
+    ]
+    @test leaves == ["fresh"]
+    close(writer)
+    close(reader)
 end
 
 @testset "AgentifSQLiteExt schema columns" begin
@@ -627,12 +874,12 @@ end
 
     @testset "find_cut_point" begin
         # Empty / single message: no cut point
-        @test Agentif.find_cut_point(AgentMessage[], 100) == 0
-        @test Agentif.find_cut_point(AgentMessage[UserMessage("hi")], 100) == 0
+        @test Agentif.find_cut_point(Agentif.StoredAgentMessage[], 100) == 0
+        @test Agentif.find_cut_point(Agentif.StoredAgentMessage[UserMessage("hi")], 100) == 0
 
         # Build messages: User → Assistant → ToolResult → User → Assistant
         # Each ~100 chars ≈ 25 tokens
-        msgs = AgentMessage[
+        msgs = Agentif.StoredAgentMessage[
             UserMessage("a" ^ 100),           # ~25 tokens
             AssistantMessage(; provider = "t", api = "t", model = "t"),
             ToolResultMessage("c1", "tool1", "b" ^ 100),  # ~25 tokens
@@ -659,7 +906,7 @@ end
         @test Agentif.find_cut_point(msgs, 100000) == 0
 
         # Cut point can land on UserMessage or AssistantMessage (at valid boundary)
-        msgs2 = AgentMessage[
+        msgs2 = Agentif.StoredAgentMessage[
             UserMessage("a" ^ 100),
             AssistantMessage(; provider = "t", api = "t", model = "t"),
             UserMessage("b" ^ 100),
@@ -672,7 +919,7 @@ end
     end
 
     @testset "format_messages_for_summary" begin
-        msgs = AgentMessage[
+        msgs = Agentif.StoredAgentMessage[
             UserMessage("What is 2+2?"),
             AssistantMessage(; provider = "t", api = "t", model = "t"),
             ToolResultMessage("c1", "calculator", "4"),
@@ -688,13 +935,13 @@ end
 
         # Truncation of long tool results
         long_result = ToolResultMessage("c2", "read_file", "z" ^ 1000)
-        text2 = Agentif.format_messages_for_summary(AgentMessage[long_result])
+        text2 = Agentif.format_messages_for_summary(Agentif.StoredAgentMessage[long_result])
         @test occursin("(truncated)", text2)
         @test length(text2) < 1000
 
         # Error tool result
         err_result = ToolResultMessage("c3", "bad_tool", "file not found"; is_error = true)
-        text3 = Agentif.format_messages_for_summary(AgentMessage[err_result])
+        text3 = Agentif.format_messages_for_summary(Agentif.StoredAgentMessage[err_result])
         @test occursin("Tool bad_tool error:", text3)
     end
 
@@ -758,7 +1005,9 @@ end
             push!(state.messages, compaction_msg)
             push!(state.messages, UserMessage("kept"))
             state.last_compaction = compaction_msg
-            state.compaction_kept_count = 1
+            # "kept" was produced during this evaluation, so nothing of the
+            # persisted prefix survived the cut.
+            state.persisted_prefix_count = 0
             # Also add the assistant response
             msg = AssistantMessage(; provider = "test", api = "test", model = "test")
             Agentif.append_text!(msg, "response")
@@ -776,10 +1025,13 @@ end
         # Verify last_compaction was cleared
         @test result.last_compaction === nothing
 
-        # Loading branch should produce the compacted state
+        # Loading the branch reproduces the in-memory state exactly — including
+        # the kept message, which used to be dropped from persistence.
         loaded = load_branch(store, "chan:compact")
         @test loaded.messages[1] isa CompactionSummaryMessage
         @test loaded.messages[1].summary == "compacted"
+        @test message_signatures(loaded) == message_signatures(result)
+        @test any(m -> m isa UserMessage && message_text(m) == "kept", loaded.messages)
     end
 
     @testset "compaction_middleware passthrough" begin
@@ -849,12 +1101,627 @@ end
         # state.usage.input should now be 5000+10000=15000
     end
 
+    @testset "compaction summary uses override model API" begin
+        request_target = Ref("")
+        server = HTTP.serve!("127.0.0.1", 0) do req
+            request_target[] = string(req.target)
+            if endswith(request_target[], "/chat/completions")
+                sse = join([
+                    "data: {\"id\":\"summary-1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"summary\"},\"finish_reason\":null}]}",
+                    "data: {\"id\":\"summary-1\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}",
+                    "data: [DONE]",
+                ], "\n\n") * "\n\n"
+                return HTTP.Response(
+                    200, ["Content-Type" => "text/event-stream"], sse)
+            end
+            return HTTP.Response(400, "wrong provider API")
+        end
+
+        try
+            port = test_server_port(server)
+            summary_model = Model(
+                id = "summary-model",
+                name = "summary-model",
+                api = "openai-completions",
+                provider = "test",
+                baseUrl = "http://127.0.0.1:$port/v1",
+                reasoning = false,
+                input = ["text"],
+                cost = Dict(
+                    "input" => 0.0,
+                    "output" => 0.0,
+                    "cacheRead" => 0.0,
+                    "cacheWrite" => 0.0,
+                ),
+                contextWindow = 100000,
+                maxTokens = 4096,
+            )
+            source_model = Model(
+                id = "source-model",
+                name = "source-model",
+                api = "openai-responses",
+                provider = "test",
+                baseUrl = "http://127.0.0.1:$port/v1",
+                reasoning = false,
+                input = ["text"],
+                cost = Dict(
+                    "input" => 0.0,
+                    "output" => 0.0,
+                    "cacheRead" => 0.0,
+                    "cacheWrite" => 0.0,
+                ),
+                contextWindow = 100000,
+                maxTokens = 4096,
+            )
+            agent = Agent(
+                id = "source-agent",
+                prompt = "test",
+                model = source_model,
+                apikey = "test-key",
+            )
+            summary = Agentif.generate_summary(
+                agent,
+                Agentif.StoredAgentMessage[UserMessage("old context")],
+                nothing,
+                CompactionConfig(),
+                summary_model,
+            )
+            @test summary == "summary"
+            @test endswith(request_target[], "/chat/completions")
+        finally
+            close(server)
+        end
+    end
+
     @testset "CompactionConfig defaults" begin
         config = CompactionConfig()
         @test config.enabled == true
         @test config.reserve_tokens == 16384
         @test config.keep_recent_tokens == 20000
     end
+
+    @testset "context overflow detection" begin
+        @test Agentif.is_context_overflow_error("This model's maximum context length is 8192 tokens")
+        @test Agentif.is_context_overflow_error("prompt is too long: 210000 tokens > 200000")
+        @test Agentif.is_context_overflow_error(ErrorException("Requested tokens exceed context window"))
+        @test !Agentif.is_context_overflow_error("rate limit exceeded")
+        @test !Agentif.is_context_overflow_error(ErrorException("invalid api key"))
+    end
+
+    @testset "estimate_context_tokens" begin
+        msgs = AgentMessage[UserMessage("a" ^ 400), UserMessage("b" ^ 400)]
+        @test Agentif.estimate_context_tokens(msgs) == 200
+        @test Agentif.estimate_context_tokens(AgentMessage[]) == 0
+        state = AgentState(; messages = msgs)
+        @test Agentif.current_context_tokens(state) == 200
+        state.context_tokens = 5000
+        @test Agentif.current_context_tokens(state) == 5000
+    end
+
+    @testset "context token usage includes new cache writes" begin
+        state = AgentState(; usage = Usage(; input = 11, cacheRead = 13, cacheWrite = 17))
+        Agentif._record_context_tokens!(state, 7)
+        @test state.context_tokens == 34
+    end
+
+    @testset "persisted prefix excludes a leading compaction summary" begin
+        summary = CompactionSummaryMessage(; summary = "old", tokens_before = 10, compacted_at = 1.0)
+        state = AgentState(; messages = AgentMessage[summary, UserMessage("kept")])
+        Agentif._reset_persisted_prefix!(state)
+        @test state.persisted_prefix_start == 2
+        @test state.persisted_prefix_count == 1
+    end
+end
+
+# ── Compaction × session persistence ──
+#
+# These drive the real middleware stack (evaluate → session_middleware →
+# tool_call_middleware → compaction_middleware → scripted base handler) with a
+# mock provider serving the summarization call.
+
+new_sqlite_store() = Agentif.SQLiteSessionStore(tempname(); embed = nothing)
+
+const SESSION_STORE_FACTORIES = [
+    ("in-memory", () -> InMemorySessionStore()),
+    ("sqlite", new_sqlite_store),
+]
+
+@testset "compaction mid-evaluation round-trips through $label store" for (label, make_store) in SESSION_STORE_FACTORIES
+    hits = Ref(0)
+    server, port = start_summary_server(; summary_text = "SUMMARY-OF-OLD", hits)
+    try
+        store = make_store()
+        model = compaction_test_model(port; contextWindow = 1000)
+        tool = @tool "Echo text." echo_back(text::String) = "echoed"
+        agent = Agent(; id = "a", prompt = "p", model = model, apikey = "k", tools = [tool])
+        # threshold = 1000 - 200 = 800
+        config = CompactionConfig(; enabled = true, reserve_tokens = 200, keep_recent_tokens = 100)
+        calls = Ref(0)
+        observed = Vector{Vector{AgentMessage}}()
+        # call 3 (first call of the third evaluation) reports a context over the
+        # threshold and requests a tool, so compaction fires mid-evaluation.
+        base_handler = scripted_handler(; usage_inputs = [100, 100, 900, 100], tool_turns = Set([3]), calls, observed)
+
+        run_eval(msg_id, input) = Agentif.evaluate(
+            agent, input;
+            session_store = store, channel = SessionTestChannel("chan:mid", nothing, msg_id),
+            base_handler = base_handler, compaction_config = config,
+        )
+
+        run_eval("m1", "A" ^ 400)   # entry 1: [user, assistant]
+        run_eval("m2", "B" ^ 400)   # entry 2: [user, assistant]
+        result = run_eval("m3", "C" ^ 40)
+
+        @test calls[] == 4
+        @test hits[] == 1  # exactly one summarization call
+        @test result.messages[1] isa CompactionSummaryMessage
+        @test result.messages[1].summary == "SUMMARY-OF-OLD"
+
+        loaded = load_branch(store, "chan:mid")
+        # Invariant 1: reload == in-memory, message for message.
+        @test message_signatures(loaded) == message_signatures(result)
+        # The in-evaluation messages survived persistence (H1a).
+        @test any(m -> m isa UserMessage && message_text(m) == "C" ^ 40, loaded.messages)
+        @test count(m -> m isa AssistantMessage && message_text(m) == "reply-3", loaded.messages) == 1
+        # Kept pre-evaluation history appears exactly once, summarized history not at all (H1b).
+        @test count(m -> message_text(m) == "B" ^ 400, loaded.messages) == 1
+        @test !any(m -> message_text(m) == "A" ^ 400, loaded.messages)
+        @test count(m -> m isa CompactionSummaryMessage, loaded.messages) == 1
+        # Nothing lost: user turn, assistant turn, tool result, final assistant.
+        @test message_signatures(loaded) == [
+            (CompactionSummaryMessage, "SUMMARY-OF-OLD"),
+            (UserMessage, "B" ^ 400),
+            (AssistantMessage, "reply-2"),
+            (UserMessage, "C" ^ 40),
+            (AssistantMessage, "reply-3"),
+            (ToolResultMessage, "echoed"),
+            (AssistantMessage, "reply-4"),
+        ]
+
+        # Loading again from the same leaf is stable (no growth/duplication).
+        @test message_signatures(load_branch(store, "chan:mid")) == message_signatures(loaded)
+    finally
+        close(server)
+    end
+end
+
+@testset "restored over-threshold session compacts on the first call ($label)" for (label, make_store) in SESSION_STORE_FACTORIES
+    hits = Ref(0)
+    server, port = start_summary_server(; summary_text = "RESTORED-SUMMARY", hits)
+    try
+        store = make_store()
+        # threshold = 300 - 100 = 200; the two seeded evaluations estimate ~204
+        model = compaction_test_model(port; contextWindow = 300)
+        agent = Agent(; id = "a", prompt = "p", model = model, apikey = "k")
+        config = CompactionConfig(; enabled = true, reserve_tokens = 100, keep_recent_tokens = 100)
+        calls = Ref(0)
+        observed = Vector{Vector{AgentMessage}}()
+        # Every call reports zero usage: the trigger must come from the restored
+        # messages themselves, not from an in-process token counter.
+        base_handler = scripted_handler(; usage_inputs = Int[], calls, observed)
+
+        run_eval(msg_id, input) = Agentif.evaluate(
+            agent, input;
+            session_store = store, channel = SessionTestChannel("chan:restore", nothing, msg_id),
+            base_handler = base_handler, compaction_config = config,
+        )
+
+        run_eval("m1", "A" ^ 400)
+        run_eval("m2", "B" ^ 400)
+        result = run_eval("m3", "hello again")
+
+        @test hits[] == 1
+        # Invariant 4: the third evaluation compacted BEFORE its first LLM call.
+        @test length(observed) == 3
+        @test observed[3][1] isa CompactionSummaryMessage
+        @test message_signatures(observed[3]) == [
+            (CompactionSummaryMessage, "RESTORED-SUMMARY"),
+            (UserMessage, "B" ^ 400),
+            (AssistantMessage, "reply-2"),
+        ]
+        loaded = load_branch(store, "chan:restore")
+        @test message_signatures(loaded) == message_signatures(result)
+        @test !any(m -> message_text(m) == "A" ^ 400, loaded.messages)
+    finally
+        close(server)
+    end
+end
+
+@testset "failed summary leaves history intact ($mode)" for (mode, server_kw) in [
+        ("provider error", (; status = 400, error_message = "bad request")),
+        ("empty summary", (; summary_text = "")),
+        ("whitespace summary", (; summary_text = "   \n ")),
+    ]
+    hits = Ref(0)
+    server, port = start_summary_server(; hits, server_kw...)
+    try
+        store = InMemorySessionStore()
+        model = compaction_test_model(port; contextWindow = 300)
+        agent = Agent(; id = "a", prompt = "p", model = model, apikey = "k")
+        config = CompactionConfig(; enabled = true, reserve_tokens = 100, keep_recent_tokens = 100)
+        calls = Ref(0)
+        observed = Vector{Vector{AgentMessage}}()
+        base_handler = scripted_handler(; calls, observed)
+
+        run_eval(msg_id, input) = Agentif.evaluate(
+            agent, input;
+            session_store = store, channel = SessionTestChannel("chan:failsum", nothing, msg_id),
+            base_handler = base_handler, compaction_config = config,
+        )
+
+        run_eval("m1", "A" ^ 400)
+        run_eval("m2", "B" ^ 400)
+        result = @test_logs (:warn,) match_mode = :any run_eval("m3", "still here")
+
+        # Invariant 3: summarization was attempted and failed; nothing was lost.
+        @test hits[] >= 1
+        @test !any(m -> m isa CompactionSummaryMessage, result.messages)
+        @test result.most_recent_stop_reason == :stop
+        @test message_signatures(observed[3]) == [
+            (UserMessage, "A" ^ 400),
+            (AssistantMessage, "reply-1"),
+            (UserMessage, "B" ^ 400),
+            (AssistantMessage, "reply-2"),
+        ]
+        loaded = load_branch(store, "chan:failsum")
+        @test message_signatures(loaded) == message_signatures(result)
+        @test message_signatures(loaded) == [
+            (UserMessage, "A" ^ 400),
+            (AssistantMessage, "reply-1"),
+            (UserMessage, "B" ^ 400),
+            (AssistantMessage, "reply-2"),
+            (UserMessage, "still here"),
+            (AssistantMessage, "reply-3"),
+        ]
+    finally
+        close(server)
+    end
+end
+
+@testset "provider context overflow compacts and retries once" begin
+    server, port = start_summary_server(; summary_text = "OVERFLOW-SUMMARY")
+    try
+        # Threshold (100000 - 16384) is far above the estimate, so the only
+        # compaction that can happen is the one the overflow error triggers.
+        model = compaction_test_model(port; contextWindow = 100000)
+        agent = Agent(; id = "a", prompt = "p", model = model, apikey = "k")
+        config = CompactionConfig(; enabled = true, reserve_tokens = 16384, keep_recent_tokens = 4)
+
+        overflow_handler(overflow_calls) = function (f, agent::Agent, state::AgentState, input::Agentif.AgentTurnInput, abort::Agentif.Abort; kw...)
+            overflow_calls[] += 1
+            msg = AssistantMessage(; provider = "test", api = "test", model = "test")
+            f(MessageStartEvent(:assistant, msg))
+            if overflow_calls[] == 1
+                f(MessageEndEvent(:assistant, msg))
+                f(Agentif.AgentErrorEvent(ErrorException("prompt is too long: 210000 tokens > 200000 maximum")))
+                Agentif.append_state!(state, input, msg, Usage())
+                state.pending_tool_calls = Agentif.PendingToolCall[]
+                state.most_recent_stop_reason = :error
+                return state
+            end
+            Agentif.append_text!(msg, "recovered")
+            f(MessageUpdateEvent(:assistant, msg, :text, "recovered", nothing))
+            f(MessageEndEvent(:assistant, msg))
+            Agentif.append_state!(state, input, msg, Usage())
+            state.pending_tool_calls = Agentif.PendingToolCall[]
+            state.most_recent_stop_reason = :stop
+            return state
+        end
+
+        seed_messages() = AgentMessage[
+            UserMessage("O" ^ 4000),
+            let m = AssistantMessage(; provider = "t", api = "t", model = "t"); Agentif.append_text!(m, "a1"); m end,
+            UserMessage("recent-keep"),
+            let m = AssistantMessage(; provider = "t", api = "t", model = "t"); Agentif.append_text!(m, "a2"); m end,
+        ]
+
+        calls = Ref(0)
+        events = Agentif.AgentEvent[]
+        handler = compaction_middleware(overflow_handler(calls), config)
+        result = handler(ev -> push!(events, ev), agent, AgentState(; messages = seed_messages()), "hello", Abort())
+
+        @test calls[] == 2  # one failure, one retry — never more
+        @test result.messages[1] isa CompactionSummaryMessage
+        @test result.messages[1].summary == "OVERFLOW-SUMMARY"
+        @test message_text(Agentif.last_assistant_message(result)) == "recovered"
+        @test result.most_recent_stop_reason == :stop
+        # The rejected turn is not duplicated, and the overflow error is not
+        # surfaced because the retry succeeded.
+        @test count(m -> m isa UserMessage && message_text(m) == "hello", result.messages) == 1
+        @test !any(ev -> ev isa Agentif.AgentErrorEvent, events)
+        @test count(ev -> ev isa MessageStartEvent, events) == 1
+        @test count(ev -> ev isa MessageEndEvent, events) == 1
+
+        # Nothing to compact → the original error is surfaced and the failed
+        # turn's messages and lifecycle are left in place.
+        calls2 = Ref(0)
+        events2 = Agentif.AgentEvent[]
+        handler2 = compaction_middleware(overflow_handler(calls2), config)
+        result2 = handler2(ev -> push!(events2, ev), agent, AgentState(), "hello", Abort())
+        @test calls2[] == 1
+        @test !any(m -> m isa CompactionSummaryMessage, result2.messages)
+        @test count(ev -> ev isa Agentif.AgentErrorEvent, events2) == 1
+        @test count(ev -> ev isa MessageStartEvent, events2) == 1
+        @test count(ev -> ev isa MessageEndEvent, events2) == 1
+        @test count(m -> m isa UserMessage && message_text(m) == "hello", result2.messages) == 1
+
+        # A thrown overflow that compaction cannot fix keeps propagating.
+        throwing_handler = function (f, agent::Agent, state::AgentState, input::Agentif.AgentTurnInput, abort::Agentif.Abort; kw...)
+            throw(ErrorException("This model's maximum context length is 8192 tokens"))
+        end
+        handler3 = compaction_middleware(throwing_handler, config)
+        @test_throws ErrorException handler3(identity, agent, AgentState(), "hello", Abort())
+
+        # …but a thrown overflow with compactable history is retried.
+        calls4 = Ref(0)
+        retry_after_throw = function (f, agent::Agent, state::AgentState, input::Agentif.AgentTurnInput, abort::Agentif.Abort; kw...)
+            calls4[] += 1
+            calls4[] == 1 && throw(ErrorException("This model's maximum context length is 8192 tokens"))
+            msg = AssistantMessage(; provider = "test", api = "test", model = "test")
+            Agentif.append_text!(msg, "recovered-after-throw")
+            Agentif.append_state!(state, input, msg, Usage())
+            state.pending_tool_calls = Agentif.PendingToolCall[]
+            state.most_recent_stop_reason = :stop
+            return state
+        end
+        handler4 = compaction_middleware(retry_after_throw, config)
+        result4 = handler4(identity, agent, AgentState(; messages = seed_messages()), "hello", Abort())
+        @test calls4[] == 2
+        @test result4.messages[1] isa CompactionSummaryMessage
+        @test message_text(Agentif.last_assistant_message(result4)) == "recovered-after-throw"
+
+        # Once output is visible, retrying would duplicate it. Surface the
+        # overflow and preserve the single partial response instead.
+        progress_calls = Ref(0)
+        progress_handler = function (f, agent::Agent, state::AgentState, input::Agentif.AgentTurnInput, abort::Agentif.Abort; kw...)
+            progress_calls[] += 1
+            msg = AssistantMessage(; provider = "test", api = "test", model = "test")
+            f(MessageStartEvent(:assistant, msg))
+            Agentif.append_text!(msg, "partial")
+            f(MessageUpdateEvent(:assistant, msg, :text, "partial", nothing))
+            f(MessageEndEvent(:assistant, msg))
+            f(Agentif.AgentErrorEvent(ErrorException("prompt is too long after partial output")))
+            Agentif.append_state!(state, input, msg, Usage())
+            state.pending_tool_calls = Agentif.PendingToolCall[]
+            state.most_recent_stop_reason = :error
+            return state
+        end
+        progress_events = Agentif.AgentEvent[]
+        handler5 = compaction_middleware(progress_handler, config)
+        result5 = handler5(
+            ev -> push!(progress_events, ev), agent,
+            AgentState(; messages = seed_messages()), "hello", Abort(),
+        )
+        @test progress_calls[] == 1
+        @test !any(m -> m isa CompactionSummaryMessage, result5.messages)
+        @test count(ev -> ev isa Agentif.AgentErrorEvent, progress_events) == 1
+        @test count(ev -> ev isa MessageUpdateEvent, progress_events) == 1
+    finally
+        close(server)
+    end
+end
+
+@testset "newest compaction replaces older summaries ($label)" for (label, make_store) in SESSION_STORE_FACTORIES
+    store = make_store()
+    old_summary = CompactionSummaryMessage(; summary = "OLD-SUMMARY", tokens_before = 10, compacted_at = 1.0)
+    new_summary = CompactionSummaryMessage(; summary = "NEW-SUMMARY", tokens_before = 20, compacted_at = 2.0)
+    append_entry!(store, SessionEntry(; id = "e1", messages = AgentMessage[UserMessage("discarded")]))
+    append_entry!(store, SessionEntry(; id = "e2", parent_id = "e1", messages = AgentMessage[UserMessage("old-kept")]))
+    append_entry!(store, SessionEntry(; id = "e3", parent_id = "e2", messages = AgentMessage[UserMessage("new-kept")]))
+    append_entry!(store, SessionEntry(;
+        id = "c1", parent_id = "e3", messages = AgentMessage[old_summary],
+        is_compaction = true, first_kept_entry_id = "e2",
+    ))
+    append_entry!(store, SessionEntry(; id = "e4", parent_id = "c1", messages = AgentMessage[UserMessage("after-old")]))
+    append_entry!(store, SessionEntry(;
+        id = "c2", parent_id = "e4", messages = AgentMessage[new_summary],
+        is_compaction = true, first_kept_entry_id = "e3",
+    ))
+    set_branch_leaf!(store, "branch-two-compactions", "c2")
+
+    @test message_signatures(load_branch(store, "branch-two-compactions")) == [
+        (CompactionSummaryMessage, "NEW-SUMMARY"),
+        (UserMessage, "new-kept"),
+        (UserMessage, "after-old"),
+    ]
+end
+
+@testset "second compaction round-trips exactly ($label)" for (label, make_store) in SESSION_STORE_FACTORIES
+    hits = Ref(0)
+    server, port = start_summary_server(; summary_text = "NEW-SUMMARY", hits)
+    try
+        store = make_store()
+        old_summary = CompactionSummaryMessage(; summary = "OLD-SUMMARY", tokens_before = 100, compacted_at = 1.0)
+        append_entry!(store, SessionEntry(;
+            id = "old-kept", messages = AgentMessage[
+                UserMessage("A" ^ 400),
+                let msg = AssistantMessage(; provider = "test", api = "test", model = "test")
+                    Agentif.append_text!(msg, "old reply")
+                    msg
+                end,
+            ],
+        ))
+        append_entry!(store, SessionEntry(;
+            id = "new-kept", parent_id = "old-kept", messages = AgentMessage[
+                UserMessage("B" ^ 400),
+                let msg = AssistantMessage(; provider = "test", api = "test", model = "test")
+                    Agentif.append_text!(msg, "recent reply")
+                    msg
+                end,
+            ],
+        ))
+        append_entry!(store, SessionEntry(;
+            id = "old-compaction", parent_id = "new-kept", messages = AgentMessage[old_summary],
+            is_compaction = true, first_kept_entry_id = "old-kept",
+        ))
+        set_branch_leaf!(store, "branch:repeat", "old-compaction")
+
+        model = compaction_test_model(port; contextWindow = 280)
+        agent = Agent(; id = "a", prompt = "p", model = model, apikey = "k")
+        config = CompactionConfig(; enabled = true, reserve_tokens = 100, keep_recent_tokens = 100)
+        result = Agentif.evaluate(
+            agent, "next";
+            session_store = store, channel = SessionTestChannel("branch:repeat", nothing, "repeat-post"),
+            base_handler = scripted_handler(), compaction_config = config,
+        )
+
+        @test hits[] == 1
+        @test message_signatures(result) == [
+            (CompactionSummaryMessage, "NEW-SUMMARY"),
+            (UserMessage, "B" ^ 400),
+            (AssistantMessage, "recent reply"),
+            (UserMessage, "next"),
+            (AssistantMessage, "reply-1"),
+        ]
+        @test message_signatures(load_branch(store, "branch:repeat")) == message_signatures(result)
+        @test result.persisted_prefix_start == 2
+        @test result.persisted_prefix_count == length(result.messages) - 1
+    finally
+        close(server)
+    end
+end
+
+@testset "mid-entry compaction cut round-trips exactly ($label)" for (label, make_store) in SESSION_STORE_FACTORIES
+    server, port = start_summary_server(; summary_text = "MID-ENTRY-SUMMARY")
+    try
+        store = make_store()
+        append_entry!(store, SessionEntry(;
+            id = "combined-entry", messages = AgentMessage[
+                UserMessage("D" ^ 400),
+                let msg = AssistantMessage(; provider = "test", api = "test", model = "test")
+                    Agentif.append_text!(msg, "discarded reply")
+                    msg
+                end,
+                UserMessage("K" ^ 400),
+                let msg = AssistantMessage(; provider = "test", api = "test", model = "test")
+                    Agentif.append_text!(msg, "kept reply")
+                    msg
+                end,
+            ],
+        ))
+        set_branch_leaf!(store, "branch:mid-entry", "combined-entry")
+
+        model = compaction_test_model(port; contextWindow = 280)
+        agent = Agent(; id = "a", prompt = "p", model = model, apikey = "k")
+        config = CompactionConfig(; enabled = true, reserve_tokens = 100, keep_recent_tokens = 100)
+        result = Agentif.evaluate(
+            agent, "next";
+            session_store = store, channel = SessionTestChannel("branch:mid-entry", nothing, "mid-entry-post"),
+            base_handler = scripted_handler(), compaction_config = config,
+        )
+
+        @test message_signatures(result) == [
+            (CompactionSummaryMessage, "MID-ENTRY-SUMMARY"),
+            (UserMessage, "K" ^ 400),
+            (AssistantMessage, "kept reply"),
+            (UserMessage, "next"),
+            (AssistantMessage, "reply-1"),
+        ]
+        @test message_signatures(load_branch(store, "branch:mid-entry")) == message_signatures(result)
+        @test !any(m -> message_text(m) == "D" ^ 400, result.messages)
+    finally
+        close(server)
+    end
+end
+
+@testset "compaction entry as branch leaf resumes with summary + kept ($label)" for (label, make_store) in SESSION_STORE_FACTORIES
+    store = make_store()
+    summary = CompactionSummaryMessage(; summary = "SUM", tokens_before = 10, compacted_at = 1.0)
+    append_entry!(store, SessionEntry(; id = "e1", messages = AgentMessage[UserMessage("discarded-old")]))
+    append_entry!(store, SessionEntry(; id = "e2", parent_id = "e1", messages = AgentMessage[UserMessage("kept-recent")]))
+    append_entry!(store, SessionEntry(;
+        id = "c1", parent_id = "e2", messages = AgentMessage[summary],
+        is_compaction = true, first_kept_entry_id = "e2",
+    ))
+    set_branch_leaf!(store, "branch-leaf", "c1")
+
+    # Invariant 2: leaf IS the compaction entry — summary + kept only.
+    loaded = load_branch(store, "branch-leaf")
+    @test message_signatures(loaded) == [(CompactionSummaryMessage, "SUM"), (UserMessage, "kept-recent")]
+
+    state, boundaries = load_branch_with_boundaries(store, "branch-leaf")
+    @test message_signatures(state) == message_signatures(loaded)
+    @test [b.entry_id for b in boundaries] == ["c1", "e2"]
+
+    # Everything compacted (no kept entries) stops at the compaction entry.
+    append_entry!(store, SessionEntry(;
+        id = "c2", parent_id = "e2", messages = AgentMessage[summary], is_compaction = true,
+    ))
+    set_branch_leaf!(store, "branch-all", "c2")
+    @test message_signatures(load_branch(store, "branch-all")) == [(CompactionSummaryMessage, "SUM")]
+end
+
+@testset "sqlite scrub_post! removes replayable content" begin
+    store = new_sqlite_store()
+    append_entry!(store, SessionEntry(; id = "s1", messages = AgentMessage[UserMessage("keep alpha")], post_id = "post-1"))
+    append_entry!(store, SessionEntry(; id = "s2", parent_id = "s1", messages = AgentMessage[UserMessage("secret bravo")], post_id = "post-2"))
+    append_entry!(store, SessionEntry(; id = "s3", parent_id = "s2", messages = AgentMessage[UserMessage("keep charlie")], post_id = "post-3"))
+    set_branch_leaf!(store, "branch-scrub", "s3")
+    @test length(load_branch(store, "branch-scrub").messages) == 3
+
+    scrub_post!(store, "post-2")
+
+    # Invariant 5: content is gone from the lineage, tree structure intact.
+    loaded = load_branch(store, "branch-scrub")
+    @test message_signatures(loaded) == [(UserMessage, "keep alpha"), (UserMessage, "keep charlie")]
+    @test !any(occursin("bravo", message_text(m)) for m in loaded.messages)
+    scrubbed = get_entry(store, "s2")
+    @test scrubbed !== nothing
+    @test isempty(scrubbed.messages)
+    @test scrubbed.is_deleted
+    @test scrubbed.parent_id == "s1"
+    @test get_entry(store, "s3").parent_id == "s2"
+    # Stored JSON no longer carries the message text at all.
+    rows = SQLite.rowtable(SQLite.DBInterface.execute(
+        store.db,
+        "SELECT entry FROM session_entries WHERE entry_id = ?",
+        ("s2",),
+    ))
+    @test !occursin("bravo", String(only(rows).entry))
+    # Search doc removed.
+    results = LocalSearch.search(store.search_store, "secret bravo"; limit = 10)
+    @test !any(r -> r.id == "session:entry:s2", results)
+end
+
+@testset "queued evaluations persist distinctly and stay scrubbable ($label)" for (label, make_store) in SESSION_STORE_FACTORIES
+    store = make_store()
+    message_queue = Channel{Agentif.AgentTurnInput}(1)
+    put!(message_queue, "second message")
+    # Same channel object for both evaluations → same platform entry id.
+    ch = SessionTestChannel("chan:queued", nothing, "post-shared")
+    result = Agentif.evaluate(
+        make_agent(), "first message";
+        session_store = store, channel = ch, message_queue = message_queue,
+        base_handler = make_base_handler(), compaction_config = nothing,
+    )
+
+    # Invariant 6: both evaluations persisted (no UNIQUE violation, no clobber).
+    @test length(result.messages) == 4
+    loaded = load_branch(store, "chan:queued")
+    @test message_signatures(loaded) == message_signatures(result)
+    @test count(m -> m isa UserMessage && message_text(m) == "first message", loaded.messages) == 1
+    @test count(m -> m isa UserMessage && message_text(m) == "second message", loaded.messages) == 1
+
+    # …and scrubbing by the shared platform post id still clears both.
+    scrub_post!(store, "post-shared")
+    @test isempty(load_branch(store, "chan:queued").messages)
+end
+
+@testset "proactive response entries stay scrubbable ($label)" for (label, make_store) in SESSION_STORE_FACTORIES
+    store = make_store()
+    message_queue = Channel{Agentif.AgentTurnInput}(1)
+    put!(message_queue, "second proactive message")
+    ch = ProactiveSessionTestChannel("chan:proactive", "response-shared")
+    result = Agentif.evaluate(
+        make_agent(), "first proactive message";
+        session_store = store, channel = ch, message_queue = message_queue,
+        base_handler = make_base_handler(), compaction_config = nothing,
+    )
+
+    @test length(result.messages) == 4
+    @test message_signatures(load_branch(store, "chan:proactive")) == message_signatures(result)
+    scrub_post!(store, "response-shared")
+    @test isempty(load_branch(store, "chan:proactive").messages)
 end
 
 @testset "skills_middleware" begin
@@ -984,6 +1851,11 @@ end
         @test get(() -> nothing, parsed_output, "tool_error") == true
     end
 
+    @test Agentif._responses_split_compound_id("café|élément") == ("café", "élément")
+    @test Agentif._responses_split_compound_id("appel-é|élément") == ("appel-é", "élément")
+    @test Agentif._responses_split_compound_id("|élément") == ("", "élément")
+    @test Agentif._responses_split_compound_id("appel|") == ("appel", "")
+
     let
         prior = AssistantMessage(
             provider = "openai-codex",
@@ -992,7 +1864,7 @@ end
         )
         push!(prior.content, Agentif.ToolCallContent(; id = "bad+call|item/with=chars__", name = "read", arguments = Dict("path" => "README.md")))
         state = AgentState(messages = AgentMessage[prior])
-        items = Agentif.codex_build_input(make_agent(), state, "continue", codex_model)
+        items = Agentif.openai_responses_build_full_input(make_agent(), state, "continue", codex_model)
 
         function_calls = [item for item in items if item isa AbstractDict && get(() -> nothing, item, "type") == "function_call"]
         tool_outputs = [item for item in items if item isa AbstractDict && get(() -> nothing, item, "type") == "function_call_output"]
@@ -1015,7 +1887,7 @@ end
         )
         push!(prior.content, Agentif.ThinkingContent(; thinking = "cross-provider reasoning"))
         state = AgentState(messages = AgentMessage[prior])
-        items = Agentif.codex_build_input(make_agent(), state, "continue", codex_model)
+        items = Agentif.openai_responses_build_full_input(make_agent(), state, "continue", codex_model)
 
         assistant_messages = [item for item in items if item isa AbstractDict && get(() -> nothing, item, "role") == "assistant"]
         reasoning_items = [item for item in items if item isa AbstractDict && get(() -> nothing, item, "type") == "reasoning"]
@@ -1027,6 +1899,12 @@ end
         @test get(() -> nothing, content[1], "type") == "output_text"
         @test get(() -> nothing, content[1], "text") == "cross-provider reasoning"
     end
+end
+
+@testset "skill metadata unquoting is UTF-8 safe" begin
+    @test Agentif.unquote("\"café\"") == "café"
+    @test Agentif.unquote("'😀'") == "😀"
+    @test Agentif.unquote("\"\"") == ""
 end
 
 @testset "openai request shaping and usage parity" begin
@@ -1063,12 +1941,48 @@ end
     @test completions_usage.total == 16
 end
 
+@testset "completions message builder terminates on empty messages" begin
+    model = Model(
+        id = "test-model", name = "test-model", api = "openai-completions",
+        provider = "test", baseUrl = "http://localhost", reasoning = false,
+        input = ["text"],
+        cost = Dict("input" => 0.0, "output" => 0.0, "cacheRead" => 0.0, "cacheWrite" => 0.0),
+        contextWindow = 100000, maxTokens = 4096,
+    )
+    agent = Agent(; id = "a", prompt = "p", model, apikey = "k")
+    state = AgentState()
+    # Empty assistant message (routinely produced by an errored/aborted turn) and
+    # an image-only user message to a text-only model: both used to `continue`
+    # without advancing the loop index, hanging the builder forever.
+    push!(state.messages, AssistantMessage(; provider = "test", api = "openai-completions", model = "test-model"))
+    push!(state.messages, UserMessage(Agentif.UserContentBlock[Agentif.ImageContent("aGk=", "image/png")]))
+    result = Ref{Any}(nothing)
+    t = @async (result[] = Agentif.openai_completions_build_messages(agent, state, "hi", model))
+    timedwait(() -> istaskdone(t), 30.0)
+    @test istaskdone(t)
+    if istaskdone(t)
+        msgs, _ = result[]
+        @test !any(m -> m.role == "assistant", msgs)
+        @test count(m -> m.role == "user", msgs) == 1
+    end
+end
+
+@testset "utf8-safe truncation previews" begin
+    s = repeat("é", 400)  # 2-byte chars: byte-index slicing throws StringIndexError
+    p = Agentif.toolcall_preview(s; limit = 300)
+    @test endswith(p, "...(truncated)")
+    @test startswith(p, repeat("é", 300))
+    t = Agentif.truncate_text(repeat("🐳", 50), 10)  # 4-byte chars
+    @test startswith(t, repeat("🐳", 10))
+    @test occursin("[truncated 40]", t)
+end
+
 @testset "openai_responses stream shapes GPT-5 requests and keeps incomplete as length" begin
     request_body = Ref(Dict{String, Any}())
     seen_events = Agentif.AgentEvent[]
 
     server = HTTP.serve!("127.0.0.1", 0) do req
-        request_body[] = JSON.parse(req.body)
+        request_body[] = JSON.parse(String(req.body))
         sse = join([
             "data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"message\",\"id\":\"msg_1\",\"role\":\"assistant\",\"content\":[]}}",
             "data: {\"type\":\"response.output_text.delta\",\"delta\":\"Partial\"}",
@@ -1079,8 +1993,7 @@ end
     end
 
     try
-        sock = HTTP.Sockets.getsockname(server.listener.server)
-        port = sock[2]
+        port = test_server_port(server)
         model = Model(
             id = "gpt-5.2",
             name = "gpt-5.2",
@@ -1103,7 +2016,8 @@ end
 
         result = stream(ev -> (push!(seen_events, ev); ev), agent, AgentState(), "Say hello", Abort(); sessionId = "sess-42")
         @test result.most_recent_stop_reason == :length
-        @test !any(ev -> ev isa Agentif.AgentErrorEvent, seen_events)
+        errors = [sprint(showerror, ev.error) for ev in seen_events if ev isa Agentif.AgentErrorEvent]
+        @test errors == String[]
         @test get(() -> nothing, request_body[], "prompt_cache_key") == "sess-42"
         @test !haskey(request_body[], "sessionId")
         input_items = get(() -> Any[], request_body[], "input")
@@ -1112,6 +2026,992 @@ end
         dev_content = get(() -> Any[], input_items[1], "content")
         @test dev_content isa AbstractVector
         @test get(() -> nothing, dev_content[1], "text") == "# Juice: 0 !important"
+    finally
+        close(server)
+    end
+end
+
+@testset "openai_responses stream ends message once on response.completed" begin
+    seen_events = Agentif.AgentEvent[]
+
+    server = HTTP.serve!("127.0.0.1", 0) do req
+        sse = join([
+            "data: {\"type\":\"response.reasoning_summary_text.delta\",\"delta\":\"Think\",\"item_id\":\"rs_1\"}",
+            # Arrives before the message item begins; must NOT end the message.
+            "data: {\"type\":\"response.reasoning_summary_text.done\",\"text\":\"Think\",\"item_id\":\"rs_1\"}",
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"Hello\",\"item_id\":\"msg_1\"}",
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\" world\",\"item_id\":\"msg_1\"}",
+            "data: {\"type\":\"response.output_text.done\",\"text\":\"Hello world\",\"item_id\":\"msg_1\"}",
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"model\":\"gpt-5.2\",\"status\":\"completed\",\"usage\":{\"input_tokens\":10,\"output_tokens\":4,\"total_tokens\":14}}}",
+            "data: [DONE]",
+        ], "\n\n") * "\n\n"
+        return HTTP.Response(200, ["Content-Type" => "text/event-stream"], sse)
+    end
+
+    try
+        port = test_server_port(server)
+        model = Model(
+            id = "gpt-5.2",
+            name = "gpt-5.2",
+            api = "openai-responses",
+            provider = "openai",
+            baseUrl = "http://127.0.0.1:$port",
+            reasoning = true,
+            input = ["text"],
+            cost = Dict("input" => 0.0, "output" => 0.0, "cacheRead" => 0.0, "cacheWrite" => 0.0),
+            contextWindow = 128000,
+            maxTokens = 32000,
+        )
+        agent = Agent(
+            id = "responses-end-once-test",
+            prompt = "You are helpful.",
+            model = model,
+            apikey = "test-key",
+            tools = AgentTool[],
+        )
+
+        result = stream(ev -> (push!(seen_events, ev); ev), agent, AgentState(), "Say hello", Abort())
+        @test result.most_recent_stop_reason == :stop
+        @test !any(ev -> ev isa Agentif.AgentErrorEvent, seen_events)
+        end_indices = findall(ev -> ev isa Agentif.MessageEndEvent, seen_events)
+        @test length(end_indices) == 1
+        last_update = findlast(ev -> ev isa Agentif.MessageUpdateEvent, seen_events)
+        @test last_update !== nothing && end_indices[1] > last_update
+        assistant = result.messages[end]
+        @test assistant isa AssistantMessage
+        @test Agentif.message_text(assistant) == "Hello world"
+        @test Agentif.message_thinking(assistant) == "Think"
+    finally
+        close(server)
+    end
+end
+
+@testset "anthropic stream error event maps to error" begin
+    seen_events = Agentif.AgentEvent[]
+
+    server = HTTP.serve!("127.0.0.1", 0) do req
+        sse = join([
+            "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_e\",\"role\":\"assistant\",\"content\":[],\"usage\":{\"input_tokens\":5,\"output_tokens\":0}}}",
+            "data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}",
+        ], "\n\n") * "\n\n"
+        return HTTP.Response(200, ["Content-Type" => "text/event-stream"], sse)
+    end
+
+    try
+        port = test_server_port(server)
+        model = Model(
+            id = "claude-test",
+            name = "claude-test",
+            api = "anthropic-messages",
+            provider = "anthropic",
+            baseUrl = "http://127.0.0.1:$port",
+            reasoning = false,
+            input = ["text"],
+            cost = Dict("input" => 0.0, "output" => 0.0, "cacheRead" => 0.0, "cacheWrite" => 0.0),
+            contextWindow = 200000,
+            maxTokens = 8192,
+        )
+        agent = Agent(
+            id = "anthropic-error-test",
+            prompt = "You are helpful.",
+            model = model,
+            apikey = "test-key",
+            tools = AgentTool[],
+        )
+
+        result = stream(ev -> (push!(seen_events, ev); ev), agent, AgentState(), "Hello", Abort())
+        @test result.most_recent_stop_reason == :error
+        @test count(ev -> ev isa Agentif.AgentErrorEvent, seen_events) == 1
+        @test count(ev -> ev isa Agentif.MessageStartEvent, seen_events) == 1
+        @test count(ev -> ev isa Agentif.MessageEndEvent, seen_events) == 1
+    finally
+        close(server)
+    end
+end
+
+@testset "anthropic stream redacted thinking, unknown blocks, and usage merge" begin
+    seen_events = Agentif.AgentEvent[]
+
+    server = HTTP.serve!("127.0.0.1", 0) do req
+        sse = join([
+            "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_a\",\"role\":\"assistant\",\"content\":[],\"usage\":{\"input_tokens\":100,\"output_tokens\":1,\"cache_read_input_tokens\":40,\"cache_creation_input_tokens\":7}}}",
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"redacted_thinking\",\"data\":\"opaque-blob\"}}",
+            "data: {\"type\":\"content_block_stop\",\"index\":0}",
+            "data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"server_tool_use\",\"id\":\"srvtoolu_1\",\"name\":\"web_search\",\"input\":{}}}",
+            "data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"citations_delta\",\"citation\":{\"url\":\"https://example.com\"}}}",
+            "data: {\"type\":\"content_block_stop\",\"index\":1}",
+            "data: {\"type\":\"content_block_start\",\"index\":2,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}",
+            "data: {\"type\":\"content_block_delta\",\"index\":2,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hello\"}}",
+            "data: {\"type\":\"content_block_stop\",\"index\":2}",
+            # Delta usage only carries output_tokens; input/cache from message_start must survive.
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":9}}",
+            "data: {\"type\":\"message_stop\"}",
+        ], "\n\n") * "\n\n"
+        return HTTP.Response(200, ["Content-Type" => "text/event-stream"], sse)
+    end
+
+    try
+        port = test_server_port(server)
+        model = Model(
+            id = "claude-test",
+            name = "claude-test",
+            api = "anthropic-messages",
+            provider = "anthropic",
+            baseUrl = "http://127.0.0.1:$port",
+            reasoning = true,
+            input = ["text"],
+            cost = Dict("input" => 0.0, "output" => 0.0, "cacheRead" => 0.0, "cacheWrite" => 0.0),
+            contextWindow = 200000,
+            maxTokens = 8192,
+        )
+        agent = Agent(
+            id = "anthropic-redacted-test",
+            prompt = "You are helpful.",
+            model = model,
+            apikey = "test-key",
+            tools = AgentTool[],
+        )
+
+        result = stream(ev -> (push!(seen_events, ev); ev), agent, AgentState(), "Say hello", Abort())
+        @test result.most_recent_stop_reason == :stop
+        @test !any(ev -> ev isa Agentif.AgentErrorEvent, seen_events)
+
+        assistant = result.messages[end]
+        @test assistant isa AssistantMessage
+        thinking_blocks = [b for b in assistant.content if b isa Agentif.ThinkingContent]
+        @test length(thinking_blocks) == 1
+        @test thinking_blocks[1].redacted
+        @test thinking_blocks[1].thinking == ""
+        @test thinking_blocks[1].thinkingSignature == "opaque-blob"
+        @test Agentif.message_text(assistant) == "Hello"
+
+        # Usage from message_start survives a delta that only carries output_tokens.
+        @test result.usage.input == 100
+        @test result.usage.output == 9
+        @test result.usage.cacheRead == 40
+        @test result.usage.cacheWrite == 7
+
+        # Replay: redacted thinking converts back to a redacted_thinking wire block.
+        replayed = Agentif.anthropic_message_from_agent(assistant, Dict{String, String}(), model)
+        @test replayed !== nothing
+        lowered = JSON.parse(JSON.json(replayed))
+        content = lowered["content"]
+        @test content[1]["type"] == "redacted_thinking"
+        @test content[1]["data"] == "opaque-blob"
+        @test content[end]["type"] == "text"
+        @test content[end]["text"] == "Hello"
+
+        # Session persistence round-trip keeps the redacted flag; legacy JSON
+        # without the field still loads with redacted = false.
+        roundtrip = JSON.parse(JSON.json(assistant), Agentif.AgentMessage)
+        @test roundtrip isa AssistantMessage
+        rt_thinking = [b for b in roundtrip.content if b isa Agentif.ThinkingContent]
+        @test length(rt_thinking) == 1 && rt_thinking[1].redacted
+        legacy = JSON.parse("{\"type\":\"thinking\",\"thinking\":\"t\",\"thinkingSignature\":null}", Agentif.ContentBlock)
+        @test legacy isa Agentif.ThinkingContent
+        @test legacy.redacted == false
+    finally
+        close(server)
+    end
+end
+
+@testset "anthropic stream maps refusal to error stop reason" begin
+    seen_events = Agentif.AgentEvent[]
+
+    server = HTTP.serve!("127.0.0.1", 0) do req
+        sse = join([
+            "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_r\",\"role\":\"assistant\",\"content\":[],\"usage\":{\"input_tokens\":5,\"output_tokens\":1}}}",
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"I can't help with that.\"}}",
+            "data: {\"type\":\"content_block_stop\",\"index\":0}",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"refusal\"},\"usage\":{\"output_tokens\":6}}",
+            "data: {\"type\":\"message_stop\"}",
+        ], "\n\n") * "\n\n"
+        return HTTP.Response(200, ["Content-Type" => "text/event-stream"], sse)
+    end
+
+    try
+        port = test_server_port(server)
+        model = Model(
+            id = "claude-test",
+            name = "claude-test",
+            api = "anthropic-messages",
+            provider = "anthropic",
+            baseUrl = "http://127.0.0.1:$port",
+            reasoning = false,
+            input = ["text"],
+            cost = Dict("input" => 0.0, "output" => 0.0, "cacheRead" => 0.0, "cacheWrite" => 0.0),
+            contextWindow = 200000,
+            maxTokens = 8192,
+        )
+        agent = Agent(
+            id = "anthropic-refusal-test",
+            prompt = "You are helpful.",
+            model = model,
+            apikey = "test-key",
+            tools = AgentTool[],
+        )
+
+        result = stream(ev -> (push!(seen_events, ev); ev), agent, AgentState(), "Do the thing", Abort())
+        @test result.most_recent_stop_reason == :error
+        @test !any(ev -> ev isa Agentif.AgentErrorEvent, seen_events)
+    finally
+        close(server)
+    end
+end
+
+function anthropic_test_model(;
+        id = "claude-opus-5",
+        reasoning = true,
+        maxTokens = 32000,
+        baseUrl = "http://127.0.0.1:1",
+        compat = nothing,
+        thinkingLevelMap = nothing,
+        kw = (;),
+    )
+    return Model(
+        id = id,
+        name = id,
+        api = "anthropic-messages",
+        provider = "anthropic",
+        baseUrl = baseUrl,
+        reasoning = reasoning,
+        input = ["text"],
+        cost = Dict("input" => 0.0, "output" => 0.0, "cacheRead" => 0.0, "cacheWrite" => 0.0),
+        contextWindow = 200000,
+        maxTokens = maxTokens,
+        compat = compat,
+        thinkingLevelMap = thinkingLevelMap,
+        kw = kw,
+    )
+end
+
+@testset "anthropic per-model thinking capabilities" begin
+    @test Agentif.anthropic_stop_reason(
+        "model_context_window_exceeded", Agentif.AgentToolCall[]) == :length
+
+    # Adaptive thinking: 4.6 family and newer
+    @test Agentif.anthropic_supports_adaptive_thinking("claude-opus-4-6")
+    @test Agentif.anthropic_supports_adaptive_thinking("claude-sonnet-4-6")
+    @test Agentif.anthropic_supports_adaptive_thinking("claude-opus-5")
+    @test Agentif.anthropic_supports_adaptive_thinking("claude-sonnet-5")
+    @test Agentif.anthropic_supports_adaptive_thinking("claude-fable-5")
+    @test Agentif.anthropic_supports_adaptive_thinking("claude-mythos-preview")
+    @test !Agentif.anthropic_supports_adaptive_thinking("claude-opus-4-5")
+    @test !Agentif.anthropic_supports_adaptive_thinking("claude-haiku-4-5-20251001")
+
+    # Extended thinking (budget_tokens): everything except the adaptive-only models
+    @test Agentif.anthropic_supports_extended_thinking("claude-haiku-4-5-20251001")
+    @test Agentif.anthropic_supports_extended_thinking("claude-sonnet-4-5")
+    @test Agentif.anthropic_supports_extended_thinking("claude-opus-4-6")   # deprecated but accepted
+    @test !Agentif.anthropic_supports_extended_thinking("claude-opus-4-7")
+    @test !Agentif.anthropic_supports_extended_thinking("claude-opus-5")
+    @test !Agentif.anthropic_supports_extended_thinking("claude-sonnet-5")
+    @test !Agentif.anthropic_supports_extended_thinking("claude-fable-5")
+    @test Agentif.anthropic_supports_extended_thinking("claude-mythos-preview")
+
+    # Thinking cannot be turned off on the always-thinking models
+    @test Agentif.anthropic_thinking_always_on("claude-fable-5")
+    @test Agentif.anthropic_thinking_always_on("claude-mythos-5")
+    @test Agentif.anthropic_thinking_always_on("claude-mythos-preview")
+    @test !Agentif.anthropic_thinking_always_on("claude-opus-5")
+
+    # effort: 4.6 family and newer, plus Opus 4.5 (the one extended-only model with effort)
+    @test Agentif.anthropic_supports_effort("claude-opus-4-5")
+    @test Agentif.anthropic_supports_effort("claude-sonnet-4-6")
+    @test !Agentif.anthropic_supports_effort("claude-haiku-4-5-20251001")
+    @test !Agentif.anthropic_supports_effort("claude-sonnet-4-5")
+    # max: 4.6 family and newer; xhigh: Opus 4.7+ / Sonnet 5 / Fable 5 only
+    @test Agentif.anthropic_supports_max_effort("claude-sonnet-4-6")
+    @test !Agentif.anthropic_supports_max_effort("claude-opus-4-5")
+    @test Agentif.anthropic_supports_xhigh_effort("claude-opus-4-7")
+    @test Agentif.anthropic_supports_xhigh_effort("claude-sonnet-5")
+    @test !Agentif.anthropic_supports_xhigh_effort("claude-opus-4-6")
+    @test !Agentif.anthropic_supports_xhigh_effort("claude-sonnet-4-6")
+
+    # Sampling params are rejected outright on the adaptive-only models
+    @test Agentif.anthropic_rejects_sampling_params("claude-opus-5")
+    @test Agentif.anthropic_rejects_sampling_params("claude-sonnet-5")
+    @test Agentif.anthropic_rejects_sampling_params("claude-mythos-preview")
+    @test !Agentif.anthropic_rejects_sampling_params("claude-opus-4-6")
+    @test !Agentif.anthropic_rejects_sampling_params("claude-haiku-4-5-20251001")
+
+    # Interleaved thinking depends on the selected mode, not only model capability.
+    adaptive = LLMProviders.AnthropicMessages.ThinkingConfig(; type = "adaptive")
+    enabled = LLMProviders.AnthropicMessages.ThinkingConfig(; type = "enabled", budget_tokens = 2048)
+    @test !Agentif.anthropic_needs_interleaved_thinking_beta(
+        anthropic_test_model(id = "claude-opus-5"), adaptive)
+    @test !Agentif.anthropic_needs_interleaved_thinking_beta(
+        anthropic_test_model(id = "claude-haiku-4-5-20251001"), enabled)
+    @test Agentif.anthropic_needs_interleaved_thinking_beta(
+        anthropic_test_model(id = "claude-sonnet-4-5"), enabled)
+    @test Agentif.anthropic_needs_interleaved_thinking_beta(
+        anthropic_test_model(id = "claude-sonnet-4-6"), enabled)
+    @test !Agentif.anthropic_needs_interleaved_thinking_beta(
+        anthropic_test_model(id = "claude-opus-4-6"), enabled)
+end
+
+@testset "anthropic thinking config, effort mapping, and budget clamping" begin
+    # Effort levels step down to the highest rung the model actually supports
+    @test Agentif.anthropic_effort_for_level("minimal", "claude-opus-5") == "low"
+    @test Agentif.anthropic_effort_for_level("low", "claude-opus-5") == "low"
+    @test Agentif.anthropic_effort_for_level("medium", "claude-opus-5") == "medium"
+    @test Agentif.anthropic_effort_for_level("high", "claude-opus-5") == "high"
+    @test Agentif.anthropic_effort_for_level("max", "claude-sonnet-5") == "max"
+    @test Agentif.anthropic_effort_for_level("xhigh", "claude-opus-5") == "xhigh"
+    @test Agentif.anthropic_effort_for_level("xhigh", "claude-opus-4-7") == "xhigh"
+    # 4.6 family has max but not xhigh
+    @test Agentif.anthropic_effort_for_level("xhigh", "claude-opus-4-6") == "max"
+    @test Agentif.anthropic_effort_for_level("xhigh", "claude-sonnet-4-6") == "max"
+    # Opus 4.5 has neither xhigh nor max
+    @test Agentif.anthropic_effort_for_level("xhigh", "claude-opus-4-5") == "high"
+    @test Agentif.anthropic_effort_for_level("max", "claude-opus-4-5") == "high"
+    @test Agentif.anthropic_effort_for_level("bogus", "claude-opus-5") == "high"
+
+    # budget_tokens must stay strictly below max_tokens (pi's adjustMaxTokensForThinking)
+    grown = Agentif.anthropic_adjust_max_tokens_for_thinking(4096, 64000, "medium")
+    @test grown.max_tokens == 12288
+    @test grown.thinking_budget == 8192
+    @test grown.thinking_budget < grown.max_tokens
+    clamped = Agentif.anthropic_adjust_max_tokens_for_thinking(1000, 8192, "high")
+    @test clamped.max_tokens == 8192
+    @test clamped.thinking_budget == 8192 - 1024
+    @test clamped.thinking_budget < clamped.max_tokens
+    @test Agentif.anthropic_adjust_max_tokens_for_thinking(4096, 64000, "xhigh") ==
+        Agentif.anthropic_adjust_max_tokens_for_thinking(4096, 64000, "high")
+
+    # Adaptive path: {type: adaptive} + output_config.effort, max_tokens untouched
+    adaptive_model = anthropic_test_model()
+    cfg = Agentif.anthropic_thinking_request(adaptive_model, "xhigh", 8192)
+    @test cfg.thinking.type == "adaptive"
+    @test cfg.thinking.budget_tokens === nothing
+    @test cfg.thinking.display == "summarized"
+    @test cfg.output_config.effort == "xhigh"
+    @test cfg.max_tokens == 8192
+
+    # Extended path: {type: enabled, budget_tokens} and a grown max_tokens, no effort
+    # (Haiku 4.5 has a 64k output ceiling and does not support the effort parameter)
+    budget_model = anthropic_test_model(id = "claude-haiku-4-5-20251001", maxTokens = 64000)
+    bcfg = Agentif.anthropic_thinking_request(budget_model, "medium", 4096)
+    @test bcfg.thinking.type == "enabled"
+    @test bcfg.thinking.budget_tokens == 8192
+    @test bcfg.thinking.display === nothing
+    @test bcfg.output_config === nothing
+    @test bcfg.max_tokens == 12288
+    @test bcfg.thinking.budget_tokens < bcfg.max_tokens
+
+    # Opus 4.5 is extended-thinking-only but supports effort: both ride along
+    both_model = anthropic_test_model(id = "claude-opus-4-5", maxTokens = 64000)
+    both = Agentif.anthropic_thinking_request(both_model, "high", 8192)
+    @test both.thinking.type == "enabled"
+    @test both.thinking.budget_tokens == 16384
+    @test both.output_config.effort == "high"
+
+    # No effort requested, or a non-reasoning model: no thinking config at all
+    @test Agentif.anthropic_thinking_request(adaptive_model, nothing, 8192).thinking === nothing
+    @test Agentif.anthropic_thinking_request(anthropic_test_model(reasoning = false), "high", 8192).thinking === nothing
+
+    # Registry metadata wins over model-name inference.
+    metadata_model = anthropic_test_model(
+        id = "custom-anthropic-model",
+        compat = Dict{String, Any}("forceAdaptiveThinking" => true),
+        thinkingLevelMap = Dict{String, Any}(
+            "off" => "disabled",
+            "high" => "medium",
+            "max" => "high",
+        ),
+    )
+    metadata_cfg = Agentif.anthropic_thinking_request(metadata_model, "max", 8192)
+    @test metadata_cfg.thinking.type == "adaptive"
+    @test metadata_cfg.output_config.effort == "high"
+
+    opt_out_model = anthropic_test_model(
+        id = "claude-opus-4-8",
+        maxTokens = 64000,
+        compat = Dict{String, Any}(
+            "forceAdaptiveThinking" => false,
+            "supportsTemperature" => true,
+        ),
+    )
+    opt_out_cfg = Agentif.anthropic_thinking_request(opt_out_model, "medium", 4096)
+    @test opt_out_cfg.thinking.type == "enabled"
+    @test opt_out_cfg.output_config === nothing
+    @test Agentif.anthropic_supports_extended_thinking(opt_out_model)
+    @test !Agentif.anthropic_rejects_sampling_params(opt_out_model)
+
+    @test Agentif.anthropic_thinking_is_enabled(nothing) == false
+    @test Agentif.anthropic_thinking_is_enabled(Dict("type" => "disabled")) == false
+    @test Agentif.anthropic_thinking_is_enabled(Dict("type" => "adaptive")) == true
+    @test Agentif.anthropic_thinking_is_enabled((; type = "enabled")) == true
+    @test Agentif.anthropic_thinking_is_enabled(LLMProviders.AnthropicMessages.ThinkingConfig(; type = "disabled")) == false
+end
+
+@testset "anthropic clamps unsupported thinking configs to model capability" begin
+    # Extended thinking on an adaptive-only model would 400: fall back to adaptive
+    opus5 = anthropic_test_model(id = "claude-opus-5", maxTokens = 128000)
+    fallback = @test_logs (:warn,) match_mode = :any Agentif.anthropic_normalize_thinking(
+        Dict("type" => "enabled", "budget_tokens" => 8192), opus5, 32000,
+    )
+    @test fallback.thinking.type == "adaptive"
+    @test fallback.thinking.budget_tokens === nothing
+    @test fallback.max_tokens == 32000
+
+    # Adaptive on an extended-only model: fall back to a token budget below max_tokens
+    haiku = anthropic_test_model(id = "claude-haiku-4-5-20251001", maxTokens = 64000)
+    downgraded = @test_logs (:warn,) match_mode = :any Agentif.anthropic_normalize_thinking(
+        Dict("type" => "adaptive"), haiku, 4096,
+    )
+    @test downgraded.thinking.type == "enabled"
+    @test downgraded.thinking.budget_tokens == 16384
+    @test downgraded.thinking.budget_tokens < downgraded.max_tokens
+
+    # Thinking cannot be disabled on Fable 5: drop the field instead of sending a 400
+    fable = anthropic_test_model(id = "claude-fable-5", maxTokens = 128000)
+    dropped = @test_logs (:warn,) match_mode = :any Agentif.anthropic_normalize_thinking(
+        Dict("type" => "disabled"), fable, 32000,
+    )
+    @test dropped.thinking === nothing
+
+    # Supported configs are converted to validated typed values.
+    supported = Agentif.anthropic_normalize_thinking(Dict("type" => "adaptive"), opus5, 32000)
+    @test supported.thinking.type == "adaptive"
+    @test Agentif.anthropic_normalize_thinking(
+        Dict("type" => "disabled"), opus5, 32000).thinking.type == "disabled"
+    @test Agentif.anthropic_normalize_thinking(
+        Dict("type" => "enabled", "budget_tokens" => 2048), haiku, 32000,
+    ).thinking.budget_tokens == 2048
+    minimum = @test_logs (:warn,) match_mode = :any Agentif.anthropic_normalize_thinking(
+        Dict("type" => "enabled", "budget_tokens" => 10), haiku, 32000,
+    )
+    @test minimum.thinking.budget_tokens == 1024
+    below_max = @test_logs (:warn,) match_mode = :any Agentif.anthropic_normalize_thinking(
+        Dict("type" => "enabled", "budget_tokens" => 64000), haiku, 32000,
+    )
+    @test below_max.thinking.budget_tokens < below_max.max_tokens
+    @test_throws ArgumentError Agentif.anthropic_normalize_thinking(
+        Dict("type" => "enabled", "budget_tokens" => "many"), haiku, 32000,
+    )
+    @test Agentif.anthropic_normalize_thinking(nothing, opus5, 32000).thinking === nothing
+end
+
+@testset "anthropic cache_control placement" begin
+    A = LLMProviders.AnthropicMessages
+    ephemeral = A.CacheControl(; type = "ephemeral")
+
+    # retention resolution: none disables breakpoints, long only gets 1h on Anthropic's host
+    @test Agentif.anthropic_cache_control("https://api.anthropic.com", "none") === nothing
+    @test Agentif.anthropic_cache_control("https://api.anthropic.com", "short").ttl === nothing
+    @test Agentif.anthropic_cache_control("https://api.anthropic.com", "long").ttl == "1h"
+    @test Agentif.anthropic_cache_control("https://api.anthropic.com.example.test", "long").ttl === nothing
+    @test Agentif.anthropic_cache_control("http://127.0.0.1:8080", "long").ttl === nothing
+
+    # a string user turn is promoted to a block array carrying the breakpoint
+    msgs = A.Message[A.Message(; role = "user", content = "hello")]
+    Agentif.anthropic_apply_cache_control!(msgs, ephemeral)
+    @test msgs[end].content isa AbstractVector
+    @test msgs[end].content[end].cache_control !== nothing
+
+    # the breakpoint lands on the last block of the last user message
+    blocks = A.ContentBlock[A.TextBlock(; text = "a"), A.TextBlock(; text = "b")]
+    msgs2 = A.Message[A.Message(; role = "user", content = blocks)]
+    Agentif.anthropic_apply_cache_control!(msgs2, ephemeral)
+    @test msgs2[end].content[1].cache_control === nothing
+    @test msgs2[end].content[2].cache_control !== nothing
+
+    # tool results are cacheable blocks too
+    msgs3 = A.Message[A.Message(; role = "user", content = A.ContentBlock[A.ToolResultBlock(; tool_use_id = "t1", content = "ok")])]
+    Agentif.anthropic_apply_cache_control!(msgs3, ephemeral)
+    @test msgs3[end].content[end].cache_control !== nothing
+
+    # trailing assistant turns and retention=none are left untouched
+    msgs4 = A.Message[A.Message(; role = "assistant", content = A.ContentBlock[A.TextBlock(; text = "a")])]
+    Agentif.anthropic_apply_cache_control!(msgs4, ephemeral)
+    @test msgs4[end].content[end].cache_control === nothing
+    msgs5 = A.Message[A.Message(; role = "user", content = A.ContentBlock[A.TextBlock(; text = "a")])]
+    Agentif.anthropic_apply_cache_control!(msgs5, nothing)
+    @test msgs5[end].content[end].cache_control === nothing
+
+    # system blocks: plain API key gets one breakpoint, the OAuth spoof keeps its two
+    system_blocks = Agentif.anthropic_system_blocks("You are helpful.", ephemeral)
+    @test length(system_blocks) == 1
+    @test system_blocks[1].cache_control !== nothing
+    @test Agentif.anthropic_system_blocks("", ephemeral) === nothing
+    @test Agentif.anthropic_system_blocks("You are helpful.", nothing)[1].cache_control === nothing
+    oauth_blocks = Agentif.anthropic_oauth_system_blocks("You are helpful.", ephemeral)
+    @test length(oauth_blocks) == 2
+    @test all(b -> b.cache_control !== nothing, oauth_blocks)
+    @test all(b -> b.cache_control === nothing, Agentif.anthropic_oauth_system_blocks("You are helpful.", nothing))
+end
+
+@testset "anthropic request shaping: thinking, effort, caching, and API guards" begin
+    bodies = Vector{Any}()
+    beta_headers = String[]
+
+    server = HTTP.serve!("127.0.0.1", 0) do req
+        push!(bodies, JSON.parse(String(req.body)))
+        push!(beta_headers, something(HTTP.header(req, "anthropic-beta"), ""))
+        sse = join([
+            "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_s\",\"role\":\"assistant\",\"content\":[],\"usage\":{\"input_tokens\":5,\"output_tokens\":1}}}",
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"ok\"}}",
+            "data: {\"type\":\"content_block_stop\",\"index\":0}",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":2}}",
+            "data: {\"type\":\"message_stop\"}",
+        ], "\n\n") * "\n\n"
+        return HTTP.Response(200, ["Content-Type" => "text/event-stream"], sse)
+    end
+
+    try
+        port = test_server_port(server)
+        base_url = "http://127.0.0.1:$port"
+        # Sampling controls come from model.kw; the newest-model guard strips all three.
+        model = anthropic_test_model(
+            baseUrl = base_url,
+            maxTokens = 128000,
+            kw = (; temperature = 0.7, top_p = 0.8, top_k = 20),
+        )
+        agent = Agent(id = "anthropic-shape-test", prompt = "You are helpful.", model = model, apikey = "test-key", tools = AgentTool[])
+
+        stream(ev -> ev, agent, AgentState(), "Say hello", Abort(); reasoning_effort = "xhigh")
+        body = bodies[end]
+        @test body["thinking"]["type"] == "adaptive"
+        @test !haskey(body["thinking"], "budget_tokens")
+        @test body["thinking"]["display"] == "summarized"
+        @test body["output_config"]["effort"] == "xhigh"
+        # Claude Opus 5 rejects non-default sampling params outright
+        @test !haskey(body, "temperature")
+        @test !haskey(body, "top_p")
+        @test !haskey(body, "top_k")
+        # the effort kwarg is consumed, never forwarded as an unknown request field
+        @test !haskey(body, "reasoning_effort")
+        @test body["max_tokens"] == 128000
+        @test body["system"][1]["cache_control"]["type"] == "ephemeral"
+        @test !haskey(body["system"][1]["cache_control"], "ttl")
+        last_msg = body["messages"][end]
+        @test last_msg["role"] == "user"
+        @test last_msg["content"][end]["cache_control"]["type"] == "ephemeral"
+
+        # ...even with no thinking at all, since the restriction is unconditional there
+        stream(ev -> ev, agent, AgentState(), "Say hello", Abort())
+        plain = bodies[end]
+        @test !haskey(plain, "thinking")
+        @test !haskey(plain, "output_config")
+        @test !haskey(plain, "temperature")
+        @test !haskey(plain, "top_p")
+        @test !haskey(plain, "top_k")
+
+        # Older models only reject temperature/top_k while thinking is on. Their
+        # top_p value must be in the 0.95–1.0 interval.
+        legacy_agent = Agent(
+            id = "anthropic-legacy-test", prompt = "You are helpful.",
+            model = anthropic_test_model(
+                id = "claude-opus-4-6",
+                baseUrl = base_url,
+                kw = (; temperature = 0.7, top_p = 0.8, top_k = 20),
+            ),
+            apikey = "test-key", tools = AgentTool[],
+        )
+        stream(ev -> ev, legacy_agent, AgentState(), "Say hello", Abort())
+        @test bodies[end]["temperature"] == 0.7
+        @test bodies[end]["top_p"] == 0.8
+        @test bodies[end]["top_k"] == 20
+        stream(ev -> ev, legacy_agent, AgentState(), "Say hello", Abort(); reasoning_effort = "xhigh")
+        legacy_thinking = bodies[end]
+        @test !haskey(legacy_thinking, "temperature")
+        @test !haskey(legacy_thinking, "top_p")
+        @test !haskey(legacy_thinking, "top_k")
+        @test legacy_thinking["thinking"]["type"] == "adaptive"
+        # Opus 4.6 has max but not xhigh
+        @test legacy_thinking["output_config"]["effort"] == "max"
+
+        # extended-thinking models get {type: enabled, budget_tokens} and a grown max_tokens
+        budget_agent = Agent(
+            id = "anthropic-budget-test", prompt = "You are helpful.",
+            model = anthropic_test_model(id = "claude-haiku-4-5-20251001", maxTokens = 64000, baseUrl = base_url),
+            apikey = "test-key", tools = AgentTool[],
+        )
+        stream(ev -> ev, budget_agent, AgentState(), "Say hello", Abort(); reasoning_effort = "medium", max_tokens = 4096)
+        budget_body = bodies[end]
+        @test budget_body["thinking"]["type"] == "enabled"
+        @test budget_body["thinking"]["budget_tokens"] == 8192
+        @test budget_body["thinking"]["budget_tokens"] < budget_body["max_tokens"]
+        @test budget_body["max_tokens"] == 12288
+        # Haiku 4.5 does not support the effort parameter
+        @test !haskey(budget_body, "output_config")
+
+        valid_top_p_agent = Agent(
+            id = "anthropic-valid-top-p-test", prompt = "You are helpful.",
+            model = anthropic_test_model(
+                id = "claude-haiku-4-5-20251001",
+                maxTokens = 64000,
+                baseUrl = base_url,
+                kw = (; top_p = 0.97),
+            ),
+            apikey = "test-key", tools = AgentTool[],
+        )
+        stream(ev -> ev, valid_top_p_agent, AgentState(), "Say hello", Abort();
+            reasoning_effort = "medium", max_tokens = 4096)
+        @test bodies[end]["top_p"] == 0.97
+
+        # cache_retention="none" drops every breakpoint
+        stream(ev -> ev, agent, AgentState(), "Say hello", Abort(); cache_retention = "none")
+        uncached = bodies[end]
+        @test !haskey(uncached["system"][1], "cache_control")
+        @test !haskey(uncached, "cache_retention")
+        uncached_last = uncached["messages"][end]
+        @test uncached_last["content"] == "Say hello" || !haskey(uncached_last["content"][end], "cache_control")
+
+        # an explicit thinking kwarg wins over the derived config
+        stream(ev -> ev, legacy_agent, AgentState(), "Say hello", Abort(); reasoning_effort = "high", thinking = Dict("type" => "disabled"))
+        explicit = bodies[end]
+        @test explicit["thinking"]["type"] == "disabled"
+        @test !haskey(explicit, "output_config")
+        # thinking disabled => the temperature guard stays out of the way
+        @test explicit["temperature"] == 0.7
+
+        # ...but an unsupported explicit config is clamped instead of 400ing
+        stream(ev -> ev, agent, AgentState(), "Say hello", Abort(); thinking = Dict("type" => "enabled", "budget_tokens" => 4096))
+        clamped = bodies[end]
+        @test clamped["thinking"]["type"] == "adaptive"
+        @test !haskey(clamped["thinking"], "budget_tokens")
+
+        # Opus 5 rejects disabled thinking with xhigh/max effort.
+        stream(ev -> ev, agent, AgentState(), "Say hello", Abort();
+            thinking = Dict("type" => "disabled"),
+            output_config = Dict("effort" => "max"))
+        effort_conflict = bodies[end]
+        @test effort_conflict["thinking"]["type"] == "adaptive"
+        @test effort_conflict["thinking"]["display"] == "summarized"
+
+        # Manual thinking rejects forced tool selection. Sonnet 4.6 still needs
+        # the interleaved-thinking beta when manual thinking is selected.
+        shape_tool = @tool "Echo text." anthropic_shape_echo(text::String) = text
+        manual_agent = Agent(
+            id = "anthropic-manual-tool-test", prompt = "You are helpful.",
+            model = anthropic_test_model(
+                id = "claude-sonnet-4-6",
+                maxTokens = 64000,
+                baseUrl = base_url,
+            ),
+            apikey = "test-key", tools = [shape_tool],
+        )
+        stream(ev -> ev, manual_agent, AgentState(), "Say hello", Abort();
+            thinking = Dict("type" => "enabled", "budget_tokens" => 2048),
+            tool_choice = Dict("type" => "tool", "name" => "anthropic_shape_echo"))
+        manual = bodies[end]
+        @test !haskey(manual, "tool_choice")
+        @test occursin("interleaved-thinking-2025-05-14", beta_headers[end])
+
+        # OAuth keeps its two system breakpoints and still caches the conversation tail
+        oauth_agent = Agent(
+            id = "anthropic-oauth-test", prompt = "You are helpful.",
+            model = anthropic_test_model(baseUrl = base_url), apikey = "sk-ant-oat01-test", tools = AgentTool[],
+        )
+        stream(ev -> ev, oauth_agent, AgentState(), "Say hello", Abort())
+        oauth_body = bodies[end]
+        @test length(oauth_body["system"]) == 2
+        @test all(b -> b["cache_control"]["type"] == "ephemeral", oauth_body["system"])
+        @test oauth_body["messages"][end]["content"][end]["cache_control"]["type"] == "ephemeral"
+        # Anthropic allows at most four breakpoints per request
+        @test length(oauth_body["system"]) + 1 <= 4
+    finally
+        close(server)
+    end
+end
+
+@testset "anthropic stream captures thinking blocks with signatures" begin
+    seen_events = Agentif.AgentEvent[]
+    bodies = Vector{Any}()
+
+    server = HTTP.serve!("127.0.0.1", 0) do req
+        push!(bodies, JSON.parse(String(req.body)))
+        sse = join([
+            "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_t\",\"role\":\"assistant\",\"content\":[],\"usage\":{\"input_tokens\":11,\"output_tokens\":1}}}",
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\"}}",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"step one \"}}",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"step two\"}}",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"signature_delta\",\"signature\":\"sig-\"}}",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"signature_delta\",\"signature\":\"abc\"}}",
+            "data: {\"type\":\"content_block_stop\",\"index\":0}",
+            "data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}",
+            "data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"Answer\"}}",
+            "data: {\"type\":\"content_block_stop\",\"index\":1}",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":13}}",
+            "data: {\"type\":\"message_stop\"}",
+        ], "\n\n") * "\n\n"
+        return HTTP.Response(200, ["Content-Type" => "text/event-stream"], sse)
+    end
+
+    try
+        port = test_server_port(server)
+        model = anthropic_test_model(baseUrl = "http://127.0.0.1:$port")
+        agent = Agent(id = "anthropic-thinking-test", prompt = "You are helpful.", model = model, apikey = "test-key", tools = AgentTool[])
+
+        result = stream(ev -> (push!(seen_events, ev); ev), agent, AgentState(), "Think it through", Abort(); reasoning_effort = "high")
+        @test result.most_recent_stop_reason == :stop
+        @test !any(ev -> ev isa Agentif.AgentErrorEvent, seen_events)
+        @test bodies[end]["thinking"]["type"] == "adaptive"
+        @test bodies[end]["output_config"]["effort"] == "high"
+
+        assistant = result.messages[end]
+        thinking_blocks = [b for b in assistant.content if b isa Agentif.ThinkingContent]
+        @test length(thinking_blocks) == 1
+        @test thinking_blocks[1].thinking == "step one step two"
+        @test thinking_blocks[1].thinkingSignature == "sig-abc"
+        @test !thinking_blocks[1].redacted
+        @test Agentif.message_thinking(assistant) == "step one step two"
+        @test Agentif.message_text(assistant) == "Answer"
+        @test any(ev -> ev isa Agentif.MessageUpdateEvent && ev.kind == :reasoning, seen_events)
+
+        # signed thinking replays as a thinking block rather than being downgraded to text
+        replayed = Agentif.anthropic_message_from_agent(assistant, Dict{String, String}(), model)
+        lowered = JSON.parse(JSON.json(replayed))
+        @test lowered["content"][1]["type"] == "thinking"
+        @test lowered["content"][1]["signature"] == "sig-abc"
+    finally
+        close(server)
+    end
+end
+
+@testset "anthropic stream resubmits paused turns" begin
+    seen_events = Agentif.AgentEvent[]
+    bodies = Vector{Any}()
+
+    function pause_sse(text, stop_reason, id)
+        return join([
+            "data: {\"type\":\"message_start\",\"message\":{\"id\":\"$id\",\"role\":\"assistant\",\"content\":[],\"usage\":{\"input_tokens\":100,\"output_tokens\":1}}}",
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"$text\"}}",
+            "data: {\"type\":\"content_block_stop\",\"index\":0}",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"$stop_reason\"},\"usage\":{\"output_tokens\":5}}",
+            "data: {\"type\":\"message_stop\"}",
+        ], "\n\n") * "\n\n"
+    end
+
+    server = HTTP.serve!("127.0.0.1", 0) do req
+        push!(bodies, JSON.parse(String(req.body)))
+        sse = length(bodies) == 1 ? pause_sse("Part one ", "pause_turn", "msg_p1") : pause_sse("Part two", "end_turn", "msg_p2")
+        return HTTP.Response(200, ["Content-Type" => "text/event-stream"], sse)
+    end
+
+    try
+        port = test_server_port(server)
+        model = anthropic_test_model(baseUrl = "http://127.0.0.1:$port")
+        agent = Agent(id = "anthropic-pause-test", prompt = "You are helpful.", model = model, apikey = "test-key", tools = AgentTool[])
+
+        result = stream(ev -> (push!(seen_events, ev); ev), agent, AgentState(), "Do the long thing", Abort())
+        @test result.most_recent_stop_reason == :stop
+        @test !any(ev -> ev isa Agentif.AgentErrorEvent, seen_events)
+        # exactly one resubmit
+        @test length(bodies) == 2
+
+        assistant = result.messages[end]
+        @test Agentif.message_text(assistant) == "Part one Part two"
+        # the paused turn is one logical assistant message: one start, one end
+        @test count(ev -> ev isa Agentif.MessageStartEvent, seen_events) == 1
+        @test count(ev -> ev isa Agentif.MessageEndEvent, seen_events) == 1
+        @test findlast(ev -> ev isa Agentif.MessageEndEvent, seen_events) >
+            findlast(ev -> ev isa Agentif.MessageUpdateEvent, seen_events)
+
+        # the continuation replays the paused assistant content verbatim, with no extra user turn
+        @test length(bodies[2]["messages"]) == length(bodies[1]["messages"]) + 1
+        resumed = bodies[2]["messages"][end]
+        @test resumed["role"] == "assistant"
+        @test resumed["content"][1]["type"] == "text"
+        @test resumed["content"][1]["text"] == "Part one "
+        @test bodies[2]["messages"][end - 1]["role"] == "user"
+
+        # usage is summed across both requests
+        @test result.usage.input == 200
+        @test result.usage.output == 10
+    finally
+        close(server)
+    end
+end
+
+@testset "anthropic pause_turn preserves raw server-tool state" begin
+    seen_events = Agentif.AgentEvent[]
+    bodies = Vector{Any}()
+    expected_server_tool = Dict{String, Any}(
+        "type" => "server_tool_use",
+        "id" => "srvtoolu_01",
+        "name" => "web_search",
+        "input" => Dict{String, Any}("query" => "Julia language"),
+    )
+    expected_server_result = Dict{String, Any}(
+        "type" => "web_search_tool_result",
+        "tool_use_id" => "srvtoolu_01",
+        "content" => Any[
+            Dict{String, Any}(
+                "type" => "web_search_result",
+                "url" => "https://julialang.org",
+                "title" => "The Julia Programming Language",
+                "encrypted_content" => "opaque-result",
+            ),
+        ],
+    )
+
+    server = HTTP.serve!("127.0.0.1", 0) do req
+        push!(bodies, JSON.parse(String(req.body)))
+        sse = if length(bodies) == 1
+            join([
+                "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_srv_1\",\"role\":\"assistant\",\"content\":[],\"usage\":{\"input_tokens\":20,\"output_tokens\":1}}}",
+                "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"server_tool_use\",\"id\":\"srvtoolu_01\",\"name\":\"web_search\",\"input\":{}}}",
+                "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"query\\\":\\\"Julia language\\\"}\"}}",
+                "data: {\"type\":\"content_block_stop\",\"index\":0}",
+                "data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"web_search_tool_result\",\"tool_use_id\":\"srvtoolu_01\",\"content\":[{\"type\":\"web_search_result\",\"url\":\"https://julialang.org\",\"title\":\"The Julia Programming Language\",\"encrypted_content\":\"opaque-result\"}]}}",
+                "data: {\"type\":\"content_block_stop\",\"index\":1}",
+                "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"pause_turn\"},\"usage\":{\"output_tokens\":8}}",
+                "data: {\"type\":\"message_stop\"}",
+            ], "\n\n") * "\n\n"
+        else
+            join([
+                "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_srv_2\",\"role\":\"assistant\",\"content\":[],\"usage\":{\"input_tokens\":30,\"output_tokens\":1}}}",
+                "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}",
+                "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Julia found.\"}}",
+                "data: {\"type\":\"content_block_stop\",\"index\":0}",
+                "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":3}}",
+                "data: {\"type\":\"message_stop\"}",
+            ], "\n\n") * "\n\n"
+        end
+        return HTTP.Response(200, ["Content-Type" => "text/event-stream"], sse)
+    end
+
+    try
+        port = test_server_port(server)
+        model = anthropic_test_model(baseUrl = "http://127.0.0.1:$port")
+        agent = Agent(
+            id = "anthropic-server-pause-test",
+            prompt = "You are helpful.",
+            model = model,
+            apikey = "test-key",
+            tools = AgentTool[],
+        )
+
+        result = stream(
+            ev -> (push!(seen_events, ev); ev),
+            agent,
+            AgentState(),
+            "Search the web",
+            Abort(),
+        )
+        @test result.most_recent_stop_reason == :stop
+        @test length(bodies) == 2
+        @test !any(ev -> ev isa Agentif.AgentErrorEvent, seen_events)
+        resumed = bodies[2]["messages"][end]
+        @test resumed["role"] == "assistant"
+        @test resumed["content"] == Any[expected_server_tool, expected_server_result]
+        @test Agentif.message_text(result.messages[end]) == "Julia found."
+    finally
+        close(server)
+    end
+end
+
+@testset "anthropic non-streaming pause_turn preserves raw content" begin
+    bodies = Vector{Any}()
+    paused_content = Any[
+        Dict{String, Any}(
+            "type" => "server_tool_use",
+            "id" => "srvtoolu_nonstream",
+            "name" => "web_fetch",
+            "input" => Dict{String, Any}("url" => "https://julialang.org"),
+        ),
+        Dict{String, Any}(
+            "type" => "web_fetch_tool_result",
+            "tool_use_id" => "srvtoolu_nonstream",
+            "content" => Dict{String, Any}(
+                "type" => "web_fetch_result",
+                "url" => "https://julialang.org",
+                "content" => "opaque",
+            ),
+        ),
+    ]
+
+    server = HTTP.serve!("127.0.0.1", 0) do req
+        push!(bodies, JSON.parse(String(req.body)))
+        response = if length(bodies) == 1
+            Dict{String, Any}(
+                "id" => "msg_ns_1",
+                "model" => "claude-opus-5",
+                "role" => "assistant",
+                "content" => paused_content,
+                "stop_reason" => "pause_turn",
+                "usage" => Dict("input_tokens" => 4, "output_tokens" => 2),
+            )
+        else
+            Dict{String, Any}(
+                "id" => "msg_ns_2",
+                "model" => "claude-opus-5",
+                "role" => "assistant",
+                "content" => Any[Dict("type" => "text", "text" => "Done.")],
+                "stop_reason" => "end_turn",
+                "usage" => Dict("input_tokens" => 6, "output_tokens" => 1),
+            )
+        end
+        return HTTP.Response(
+            200,
+            ["Content-Type" => "application/json"],
+            JSON.json(response),
+        )
+    end
+
+    try
+        port = test_server_port(server)
+        model = anthropic_test_model(baseUrl = "http://127.0.0.1:$port")
+        agent = Agent(
+            id = "anthropic-nonstream-pause-test",
+            prompt = "You are helpful.",
+            model = model,
+            apikey = "test-key",
+            tools = AgentTool[],
+        )
+        result = withenv("AGENTIF_DISABLE_STREAMING" => "1") do
+            stream(identity, agent, AgentState(), "Fetch the page", Abort())
+        end
+
+        @test length(bodies) == 2
+        @test bodies[2]["messages"][end]["content"] == paused_content
+        @test Agentif.message_text(result.messages[end]) == "Done."
+        @test result.most_recent_stop_reason == :stop
+        @test result.usage.input == 10
+        @test result.usage.output == 3
+    finally
+        close(server)
+    end
+end
+
+@testset "anthropic pause_turn resubmits are bounded" begin
+    bodies = Vector{Any}()
+
+    server = HTTP.serve!("127.0.0.1", 0) do req
+        push!(bodies, JSON.parse(String(req.body)))
+        sse = join([
+            "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_b\",\"role\":\"assistant\",\"content\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}",
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"x\"}}",
+            "data: {\"type\":\"content_block_stop\",\"index\":0}",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"pause_turn\"},\"usage\":{\"output_tokens\":1}}",
+            "data: {\"type\":\"message_stop\"}",
+        ], "\n\n") * "\n\n"
+        return HTTP.Response(200, ["Content-Type" => "text/event-stream"], sse)
+    end
+
+    try
+        port = test_server_port(server)
+        model = anthropic_test_model(baseUrl = "http://127.0.0.1:$port")
+        agent = Agent(id = "anthropic-pause-bound-test", prompt = "You are helpful.", model = model, apikey = "test-key", tools = AgentTool[])
+
+        seen_events = Agentif.AgentEvent[]
+        result = stream(ev -> (push!(seen_events, ev); ev), agent, AgentState(), "Loop forever", Abort())
+        # one original request plus ANTHROPIC_MAX_PAUSE_TURN_RESUBMITS continuations
+        @test length(bodies) == 1 + Agentif.ANTHROPIC_MAX_PAUSE_TURN_RESUBMITS
+        @test result.most_recent_stop_reason == :length
+        @test Agentif.message_text(result.messages[end]) == "xxxx"
+        @test all(body -> begin
+            replay = body["messages"][end]["content"]
+            length(replay) == 1 && replay[1]["text"] == "x"
+        end, bodies[2:end])
+        @test count(ev -> ev isa Agentif.MessageEndEvent, seen_events) == 1
     finally
         close(server)
     end
@@ -1131,8 +3031,7 @@ end
     end
 
     try
-        sock = HTTP.Sockets.getsockname(server.listener.server)
-        port = sock[2]
+        port = test_server_port(server)
         model = Model(
             id = "gpt-5.2-codex",
             name = "gpt-5.2-codex",
@@ -1167,8 +3066,8 @@ end
     request_body = Ref(Dict{String, Any}())
 
     server = HTTP.serve!("127.0.0.1", 0) do req
-        request_headers[] = Dict{String, String}(String(k) => String(v) for (k, v) in req.headers)
-        request_body[] = JSON.parse(req.body)
+        request_headers[] = Dict{String, String}(lowercase(String(k)) => String(v) for (k, v) in req.headers)
+        request_body[] = JSON.parse(String(req.body))
         sse = join([
             "data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"message\",\"id\":\"msg_1\",\"role\":\"assistant\",\"content\":[]}}",
             "data: {\"type\":\"response.output_text.delta\",\"delta\":\"Hello\"}",
@@ -1180,8 +3079,7 @@ end
     end
 
     try
-        sock = HTTP.Sockets.getsockname(server.listener.server)
-        port = sock[2]
+        port = test_server_port(server)
         model = Model(
             id = "gpt-5.3-codex-spark",
             name = "gpt-5.3-codex-spark",
@@ -1242,8 +3140,7 @@ end
     end
 
     try
-        sock = HTTP.Sockets.getsockname(server.listener.server)
-        port = sock[2]
+        port = test_server_port(server)
         model = Model(
             id = "gpt-5.3-codex",
             name = "gpt-5.3-codex",
@@ -1306,8 +3203,7 @@ end
     end
 
     try
-        sock = HTTP.Sockets.getsockname(server.listener.server)
-        port = sock[2]
+        port = test_server_port(server)
         model = Model(
             id = "gpt-5.3-codex",
             name = "gpt-5.3-codex",
@@ -1339,13 +3235,320 @@ end
     end
 end
 
+@testset "sse retry helpers" begin
+    @test Agentif.sse_retryable_status(503)
+    @test Agentif.sse_retryable_status(429)
+    @test !Agentif.sse_retryable_status(400)
+    @test !Agentif.sse_retryable_status(401)
+
+    @test Agentif.sse_recoverable_connection_error(EOFError())
+    @test Agentif.sse_recoverable_connection_error(Base.IOError("connection reset", -104))
+    @test Agentif.sse_recoverable_connection_error(HTTP.ConnectError("http://x", EOFError()))
+    @test !Agentif.sse_recoverable_connection_error(InterruptException())
+    @test !Agentif.sse_recoverable_connection_error(Agentif.StopStreaming())
+    @test !Agentif.sse_recoverable_connection_error(ArgumentError("bad input"))
+    failed_task = @async throw(EOFError())
+    task_error = try
+        wait(failed_task)
+        nothing
+    catch err
+        err
+    end
+    @test task_error isa TaskFailedException
+    @test Agentif.sse_recoverable_connection_error(task_error)
+    failed_parse_task = @async throw(test_parse_error("unexpected EOF while reading HTTP data"))
+    parse_task_error = try
+        wait(failed_parse_task)
+        nothing
+    catch err
+        err
+    end
+    @test parse_task_error isa TaskFailedException
+    @test Agentif.sse_recoverable_connection_error(parse_task_error)
+
+    # HTTP.StatusError routes through status-based retryability, not connection recovery
+    status_err = test_status_error(503)
+    @test !Agentif.sse_recoverable_connection_error(status_err)
+    @test Agentif.sse_retryable_error(status_err)
+    @test !Agentif.sse_retryable_error(test_status_error(400))
+
+    # http_kw overrides are respected
+    @test Agentif.sse_retry_attempts(Agentif.DEFAULT_HTTP_KW) == 6
+    @test Agentif.sse_retry_attempts((; retry = false, retries = 5)) == 1
+    @test Agentif.sse_retry_attempts((; retry = true, retries = 2)) == 3
+    @test Agentif.sse_retry_attempts((; retry = true, retries = 0)) == 1
+
+    # Retry-After honored and capped by max_delay_ms
+    retry_after_resp = HTTP.Response(429, ["Retry-After" => "3"], "")
+    @test Agentif.codex_retry_delay_seconds(1, 1000, 60000; response = retry_after_resp) == 3.0
+    capped_resp = HTTP.Response(503, ["Retry-After" => "500"], "")
+    @test Agentif.codex_retry_delay_seconds(1, 1000, 60000; response = capped_resp) == 60.0
+
+    # Retries transient failures while no SSE event has been delivered
+    events_seen = Ref(false)
+    calls = Ref(0)
+    result = Agentif.sse_request_with_retry(events_seen, Abort(); max_attempts = 3, base_delay_ms = 1, max_delay_ms = 2) do
+        calls[] += 1
+        calls[] < 3 && throw(EOFError())
+        return :ok
+    end
+    @test result == :ok
+    @test calls[] == 3
+
+    # Never retries once an event has been delivered
+    events_seen[] = true
+    calls[] = 0
+    @test_throws EOFError Agentif.sse_request_with_retry(events_seen, Abort(); max_attempts = 3, base_delay_ms = 1, max_delay_ms = 2) do
+        calls[] += 1
+        throw(EOFError())
+    end
+    @test calls[] == 1
+
+    # Never retries non-transient errors
+    events_seen[] = false
+    calls[] = 0
+    @test_throws ArgumentError Agentif.sse_request_with_retry(events_seen, Abort(); max_attempts = 3, base_delay_ms = 1, max_delay_ms = 2) do
+        calls[] += 1
+        throw(ArgumentError("nope"))
+    end
+    @test calls[] == 1
+end
+
+@testset "openai_responses stream retries pre-stream 503 then succeeds" begin
+    request_count = Ref(0)
+    seen_events = Agentif.AgentEvent[]
+
+    server = HTTP.serve!("127.0.0.1", 0) do req
+        request_count[] += 1
+        if request_count[] == 1
+            return HTTP.Response(
+                503,
+                ["Content-Type" => "application/json", "Retry-After" => "0"],
+                "{\"error\":{\"message\":\"temporary outage\"}}",
+            )
+        end
+        sse = join([
+            "data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"message\",\"id\":\"msg_1\",\"role\":\"assistant\",\"content\":[]}}",
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"Hello\"}",
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"model\":\"gpt-4.1\",\"status\":\"completed\",\"usage\":{\"input_tokens\":1,\"input_tokens_details\":{\"cached_tokens\":0},\"output_tokens\":1,\"total_tokens\":2}}}",
+            "data: [DONE]",
+        ], "\n\n") * "\n\n"
+        return HTTP.Response(200, ["Content-Type" => "text/event-stream"], sse)
+    end
+
+    try
+        port = test_server_port(server)
+        model = Model(
+            id = "gpt-4.1",
+            name = "gpt-4.1",
+            api = "openai-responses",
+            provider = "openai",
+            baseUrl = "http://127.0.0.1:$port",
+            reasoning = false,
+            input = ["text"],
+            cost = Dict("input" => 0.0, "output" => 0.0, "cacheRead" => 0.0, "cacheWrite" => 0.0),
+            contextWindow = 128000,
+            maxTokens = 32000,
+        )
+        agent = Agent(
+            id = "responses-503-retry-test",
+            prompt = "You are helpful.",
+            model = model,
+            apikey = "test-key",
+            tools = AgentTool[],
+        )
+
+        result = stream(ev -> (push!(seen_events, ev); ev), agent, AgentState(), "Say hello", Abort())
+        @test request_count[] == 2
+        @test !any(ev -> ev isa Agentif.AgentErrorEvent, seen_events)
+        @test result.most_recent_stop_reason == :stop
+        @test result.messages[end] isa AssistantMessage
+        @test Agentif.message_text(result.messages[end]) == "Hello"
+    finally
+        close(server)
+    end
+end
+
+@testset "openai_responses stream surfaces mid-stream disconnect without duplicating deltas" begin
+    request_count = Ref(0)
+    seen_events = Agentif.AgentEvent[]
+
+    server = HTTP.listen!("127.0.0.1", 0) do http
+        request_count[] += 1
+        read(http)
+        sse = join([
+            "data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"message\",\"id\":\"msg_1\",\"role\":\"assistant\",\"content\":[]}}",
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"MARKER_ONCE\"}",
+        ], "\n\n") * "\n\n"
+        HTTP.setstatus(http, 200)
+        HTTP.setheader(http, "Content-Type" => "text/event-stream")
+        HTTP.startwrite(http)
+        write(http, sse)
+        flush(http)
+        sleep(0.2)
+        test_force_close_stream(http)  # drop before the terminating chunk/end-stream
+    end
+
+    try
+        port = test_server_port(server)
+        model = Model(
+            id = "gpt-4.1",
+            name = "gpt-4.1",
+            api = "openai-responses",
+            provider = "openai",
+            baseUrl = "http://127.0.0.1:$port",
+            reasoning = false,
+            input = ["text"],
+            cost = Dict("input" => 0.0, "output" => 0.0, "cacheRead" => 0.0, "cacheWrite" => 0.0),
+            contextWindow = 128000,
+            maxTokens = 32000,
+        )
+        agent = Agent(
+            id = "responses-disconnect-test",
+            prompt = "You are helpful.",
+            model = model,
+            apikey = "test-key",
+            tools = AgentTool[],
+        )
+
+        result = stream(ev -> (push!(seen_events, ev); ev), agent, AgentState(), "Say hello", Abort())
+        # Events already flowed, so the request must NOT be replayed
+        @test request_count[] == 1
+        @test result.most_recent_stop_reason == :error
+        @test any(ev -> ev isa Agentif.AgentErrorEvent, seen_events)
+        @test result.messages[end] isa AssistantMessage
+        delivered = Agentif.message_text(result.messages[end])
+        @test length(collect(eachmatch(r"MARKER_ONCE", delivered))) == 1
+        @test count(ev -> ev isa Agentif.MessageUpdateEvent && occursin("MARKER_ONCE", ev.delta), seen_events) == 1
+        @test count(ev -> ev isa Agentif.MessageEndEvent, seen_events) == 1
+    finally
+        close(server)
+    end
+end
+
+@testset "openai_codex stream does not re-POST after mid-stream disconnect" begin
+    request_count = Ref(0)
+    seen_events = Agentif.AgentEvent[]
+
+    server = HTTP.listen!("127.0.0.1", 0) do http
+        request_count[] += 1
+        read(http)
+        sse = join([
+            "data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"message\",\"id\":\"msg_1\",\"role\":\"assistant\",\"content\":[]}}",
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"CODEX_MARKER\"}",
+        ], "\n\n") * "\n\n"
+        HTTP.setstatus(http, 200)
+        HTTP.setheader(http, "Content-Type" => "text/event-stream")
+        HTTP.startwrite(http)
+        write(http, sse)
+        flush(http)
+        sleep(0.2)
+        test_force_close_stream(http)  # drop before the terminating chunk/end-stream
+    end
+
+    try
+        port = test_server_port(server)
+        model = Model(
+            id = "gpt-5.3-codex",
+            name = "gpt-5.3-codex",
+            api = "openai-codex-responses",
+            provider = "openai-codex",
+            baseUrl = "http://127.0.0.1:$port",
+            reasoning = true,
+            input = ["text"],
+            cost = Dict("input" => 0.0, "output" => 0.0, "cacheRead" => 0.0, "cacheWrite" => 0.0),
+            contextWindow = 128000,
+            maxTokens = 32000,
+        )
+        token = fake_jwt(Dict("https://api.openai.com/auth" => Dict("chatgpt_account_id" => "acct-jwt-disconnect")))
+        agent = Agent(
+            id = "codex-disconnect-test",
+            prompt = "You are helpful.",
+            model = model,
+            apikey = token,
+            tools = AgentTool[],
+        )
+
+        err = try
+            stream(
+                ev -> (push!(seen_events, ev); ev),
+                agent,
+                AgentState(),
+                "Say hello",
+                Abort();
+                max_retries = 3,
+                retry_base_ms = 1,
+                retry_max_ms = 5,
+            )
+            nothing
+        catch e
+            e
+        end
+        @test err isa Exception
+        @test !(err isa Agentif.StopStreaming)
+        # The delivered events must not be replayed by a re-POST
+        @test request_count[] == 1
+        @test count(ev -> ev isa Agentif.MessageUpdateEvent && occursin("CODEX_MARKER", ev.delta), seen_events) == 1
+    finally
+        close(server)
+    end
+end
+
+@testset "google_generative stream surfaces HTTP status errors" begin
+    seen_events = Agentif.AgentEvent[]
+
+    server = HTTP.serve!("127.0.0.1", 0) do req
+        return HTTP.Response(
+            400,
+            ["Content-Type" => "application/json"],
+            "{\"error\":{\"code\":400,\"message\":\"Invalid request\",\"status\":\"INVALID_ARGUMENT\"}}",
+        )
+    end
+
+    try
+        port = test_server_port(server)
+        model = Model(
+            id = "gemini-2.5-flash",
+            name = "gemini-2.5-flash",
+            api = "google-generative-ai",
+            provider = "google",
+            baseUrl = "http://127.0.0.1:$port",
+            reasoning = false,
+            input = ["text"],
+            cost = Dict("input" => 0.0, "output" => 0.0, "cacheRead" => 0.0, "cacheWrite" => 0.0),
+            contextWindow = 128000,
+            maxTokens = 32000,
+        )
+        agent = Agent(
+            id = "google-status-error-test",
+            prompt = "You are helpful.",
+            model = model,
+            apikey = "test-key",
+            tools = AgentTool[],
+        )
+
+        result = stream(ev -> (push!(seen_events, ev); ev), agent, AgentState(), "Say hello", Abort())
+        @test result.most_recent_stop_reason == :error
+        error_events = filter(ev -> ev isa Agentif.AgentErrorEvent, seen_events)
+        @test length(error_events) == 1
+        @test occursin("Invalid request", sprint(showerror, error_events[1].error))
+        # The assistant message is still started/finalized like the openai branches
+        @test count(ev -> ev isa Agentif.MessageStartEvent, seen_events) == 1
+        @test count(ev -> ev isa Agentif.MessageEndEvent, seen_events) == 1
+        @test result.messages[end] isa AssistantMessage
+    finally
+        close(server)
+    end
+end
+
 @testset "openai_codex websocket transport" begin
     Agentif.close_codex_websocket_pool!()
     request_headers = Ref(Dict{String, String}())
     request_body = Ref(Dict{String, Any}())
 
     ws_server = HTTP.WebSockets.listen!("127.0.0.1", 0) do ws
-        request_headers[] = Dict{String, String}(lowercase(String(k)) => String(v) for (k, v) in ws.request.headers)
+        request = test_websocket_request(ws)
+        request_headers[] = Dict{String, String}(lowercase(String(k)) => String(v) for (k, v) in request.headers)
         msg = HTTP.WebSockets.receive(ws)
         data = msg isa AbstractString ? String(msg) : String(msg)
         request_body[] = JSON.parse(data)
@@ -1362,8 +3565,7 @@ end
     end
 
     try
-        sock = HTTP.Sockets.getsockname(ws_server.listener.server)
-        port = sock[2]
+        port = test_server_port(ws_server)
         model = Model(
             id = "gpt-5.3-codex",
             name = "gpt-5.3-codex",
@@ -1409,7 +3611,8 @@ end
 
     ws_server = HTTP.WebSockets.listen!("127.0.0.1", 0) do ws
         connection_count[] += 1
-        headers = Dict{String, String}(lowercase(String(k)) => String(v) for (k, v) in ws.request.headers)
+        request = test_websocket_request(ws)
+        headers = Dict{String, String}(lowercase(String(k)) => String(v) for (k, v) in request.headers)
         push!(seen_session_headers, get(() -> "", headers, "session_id"))
         try
             while true
@@ -1448,8 +3651,7 @@ end
     end
 
     try
-        sock = HTTP.Sockets.getsockname(ws_server.listener.server)
-        port = sock[2]
+        port = test_server_port(ws_server)
         model = Model(
             id = "gpt-5.3-codex",
             name = "gpt-5.3-codex",

@@ -1,3 +1,13 @@
+const ToolArguments = Dict{String, Any}
+
+caught_exception(value, message::String)::Exception =
+    value isa Exception ? value : ErrorException(message)
+caught_exception_message(value, message::String)::String =
+    value isa Exception ? sprint(showerror, value) : message
+caught_backtrace() = Base.catch_backtrace()
+capture_caught_exception(value)::CapturedException =
+    capture(caught_exception(value, "Asynchronous agent operation failed."))
+
 mutable struct Future{T}
     const notify::Threads.Condition
     @atomic set::Int8 # if 0, result is undefined, 1 means result is T, 2 means result is an exception
@@ -6,16 +16,13 @@ mutable struct Future{T}
 end
 
 Future() = Future{Nothing}() # default future type
-Base.pointer(f::Future) = pointer_from_objref(f)
-Future(ptr::Ptr) = unsafe_pointer_to_objref(ptr)::Future
-Future{T}(ptr::Ptr) where {T} = unsafe_pointer_to_objref(ptr)::Future{T}
 
 function Future{T}(f) where {T}
     fut = Future{T}()
     Threads.@spawn try
         notify(fut, f())
     catch e
-        notify(fut, capture(e))
+        notify(fut, capture_caught_exception(e))
     end
     return fut
 end

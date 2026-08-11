@@ -54,8 +54,7 @@ end
 
 # Helper to count rows
 function count_rows(db, table)
-    result = iterate(SQLite.DBInterface.execute(db, "SELECT COUNT(*) as n FROM $table"))
-    return result[1].n
+    return Claw._fetch_one(db, "SELECT COUNT(*) as n FROM $table").n
 end
 
 # ============================================================================
@@ -109,6 +108,24 @@ end
         apikey = "test-key",
     )
     @test a_default.log_level === nothing
+
+    # Keep the pre-hardening keyword-only constructor API.
+    mktempdir() do dir
+        cd(dir) do
+            a_keyword = AgentAssistant(;
+                name = "compat",
+                provider = "openai-completions",
+                model_id = "gpt-4o-mini",
+                apikey = "test-key",
+            )
+            @test basename(a_keyword.db_path) == "compat.sqlite"
+            @test realpath(dirname(a_keyword.db_path)) == realpath(dir)
+            Claw.shutdown!(a_keyword; timeout_s = 5)
+        end
+    end
+
+    Claw.shutdown!(a_warn; timeout_s = 5)
+    Claw.shutdown!(a_default; timeout_s = 5)
 end
 
 # ============================================================================
@@ -169,6 +186,30 @@ end
     println("  ✓ Phase 2 passed")
 end
 
+@testset "Claw worker timeout cleanup" begin
+    a = make_test_assistant()
+    Claw.CURRENT_ASSISTANT[] = a
+    es = Claw.LLMToolsEventSource(a.config)
+    funcs = Dict(tool.name => tool.func for tool in Claw.get_tools(es))
+
+    started = funcs["start_worker"]("timeout-worker", "x = 1", nothing, false, 10)
+    @test occursin("started asynchronously", started)
+    @test timedwait(
+        () -> lock(es.lock) do
+            session = get(es.sessions, "timeout-worker", nothing)
+            session !== nothing && session.status == "completed"
+        end,
+        15.0,
+    ) == :ok
+
+    session = Claw._get_session(es, "timeout-worker", :worker)
+    @test_throws Claw.LLMTools.WorkerEvalTimeout funcs["eval_worker"](
+        "timeout-worker", "while true end", true, 1)
+    @test session.status == "error"
+    @test Claw.LLMTools.get_session(
+        Claw.LLMTools.WORKER_REGISTRY, session.registry_id) === nothing
+end
+
 # ============================================================================
 # SQLite schema & constructor
 # ============================================================================
@@ -186,7 +227,7 @@ end
     @test "claw_agent_metadata" in tables
     @test "session_entries" in tables  # from AgentifSQLiteExt
     @test "session_branches" in tables  # from AgentifSQLiteExt
-    @test "tempus_jobs" in tables  # from TempusSQLiteExt
+    @test "tempus_state" in tables  # Tempus 3 SQLite-backed store table
     println("  Tables: $tables")
 
     metadata_row = iterate(SQLite.DBInterface.execute(a.db,
@@ -197,8 +238,9 @@ end
     # Verify session store is SQLite-backed
     @test nameof(typeof(a.session_store)) === :SQLiteSessionStore
 
-    # Verify scheduler uses SQLite store
-    @test a.scheduler.store isa Tempus.SQLiteStore
+    # Verify scheduler uses SQLite store (Tempus 3: SQLiteStore is a compat
+    # constructor returning a Store over an AbstractStores.SQLStore backend)
+    @test a.scheduler.store isa Tempus.Store
 
     println("  ✓ SQLite schema & constructor passed")
 end
@@ -547,6 +589,8 @@ end
     @test count_rows(a1.db, "claw_event_types") == 1
 
     # Close first db to release lock, simulating process exit
+    Claw.close_writer!(a1._writer)
+    Claw.close_readers!(a1._readers)
     close(a1.db)
 
     # Second init with same db_path: simulates restart
@@ -557,7 +601,7 @@ end
     Claw.CURRENT_ASSISTANT[] = a2
 
     # Purge ephemeral tables (as init! does)
-    SQLite.DBInterface.execute(a2.db, "DELETE FROM claw_event_types")
+    Claw._exec!(a2.db, "DELETE FROM claw_event_types")
 
     @test isempty(a2._channels)  # fresh instance, no channels registered yet
     @test count_rows(a2.db, "claw_event_types") == 0  # purged
@@ -586,6 +630,9 @@ end
     @test occursin("es_handler", result)
 
     # Clean up temp file
+    Claw.close_writer!(a2._writer)
+    Claw.close_readers!(a2._readers)
+    close(a2.db)
     rm(db_path; force=true)
     rm(db_path * "-wal"; force=true)
     rm(db_path * "-shm"; force=true)
@@ -618,6 +665,13 @@ end
     @test Claw.get_name(ev) == "repl_input"
     @test Claw.get_channel(ev) === ch
     @test Claw.event_content(ev) == "hello world"
+
+    # close_channel must notify completion so a"..." never hangs when an
+    # evaluation errors out before finish_streaming runs.
+    ch2 = Claw.ReplChannel()
+    Agentif.close_channel(ch2)
+    waiter = @async wait(ch2.completion)
+    @test timedwait(() -> istaskdone(waiter), 5.0) == :ok
 
     println("  ✓ REPL EventSource passed")
 end

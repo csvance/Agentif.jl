@@ -71,11 +71,12 @@ The easiest REPL entrypoint is the `a"..."` macro:
 a"Say hello and explain what tools you have available."
 ```
 
-If you want the lower-level channel/event form, you can drive the queue directly with `ReplChannel` and `ReplInputEvent`:
+If you want the lower-level channel/event form, submit the event yourself with
+`ReplChannel` and `ReplInputEvent`:
 
 ```julia
 ch = Claw.ReplChannel()
-put!(assistant.event_queue, Claw.ReplInputEvent(
+Claw.submit_event!(assistant, Claw.ReplInputEvent(
     "Summarize the last reply in one sentence.",
     ch,
 ))
@@ -83,6 +84,12 @@ wait(ch.completion)
 ```
 
 That sends input through the assistant's event loop and streams output back to `stdout` via the `ReplChannel`.
+
+`submit_event!` persists the event to the `claw_events` inbox first and only then
+wakes the dispatcher, so events survive a crash. Never `put!` onto
+`assistant.event_queue` directly: it carries persisted rowids as wakeups, not events.
+Pass `dedup_key` when the upstream platform supplies a delivery id — redelivery of a
+key that is already in the table is then a no-op.
 
 ## Slack Event Source
 
@@ -172,9 +179,28 @@ Useful starting points in the repo:
 - `Claw/ext/slack_run.jl`
 - `Claw/ext/mattermost_run.jl`
 - `Claw/examples/mattermost_live_test.jl`
-- `Claw/examples/heartbeat_poll_source.jl`
 
 Examples live in `Claw/examples/`.
+
+## Watcher (dual-model supervision)
+
+An assistant can be configured with a second, cheaper "watcher" model that supervises
+every event-handler evaluation: evals are journaled to the `claw_evals` table, stalled
+or overrunning evals are aborted, and on failure the watcher composes a short note that
+is sent to the event's channel (with a hardcoded fallback if the watcher itself fails).
+No configured watcher = today's behavior, unchanged.
+
+```julia
+watcher = Claw.WatcherConfig(;
+    provider = "anthropic",          # encouraged: different from the primary
+    model_id = "claude-haiku-4-5",
+    apikey   = ENV["ANTHROPIC_API_KEY"],
+)
+assistant = Claw.init!(db_path; watcher)
+```
+
+See `Claw/docs/watcher.md` for the full design (timeouts, failure classification,
+journal schema, and the config-gated on-track checks).
 
 ## Tests
 
