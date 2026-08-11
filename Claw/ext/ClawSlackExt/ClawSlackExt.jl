@@ -276,6 +276,9 @@ Base.@kwdef mutable struct SlackEventSource <: Claw.EventSource
     recipient_team_id::String = get(ENV, "SLACK_STREAM_RECIPIENT_TEAM_ID", "")
     recipient_user_id::String = get(ENV, "SLACK_STREAM_RECIPIENT_USER_ID", "")
     web_client::Union{Nothing, Slack.WebClient} = nothing
+    socket_client::Union{Nothing, Slack.SocketModeClient} = nothing
+    _stopping::Threads.Atomic{Bool} = Threads.Atomic{Bool}(false)
+    _lock::ReentrantLock = ReentrantLock()
 end
 
 function _fetch_channels(source::SlackEventSource)
@@ -591,6 +594,10 @@ function Claw.start!(source::SlackEventSource, assistant::Claw.AgentAssistant)
     bot_token = strip(source.bot_token)
     isempty(app_token) && error("ClawSlackExt: missing SLACK_APP_TOKEN")
     isempty(bot_token) && error("ClawSlackExt: missing SLACK_BOT_TOKEN")
+    lock(source._lock) do
+        source.socket_client = nothing
+        source._stopping[] = false
+    end
 
     errormonitor(Threads.@spawn begin
         web_client = Slack.WebClient(; token=bot_token)
@@ -598,7 +605,7 @@ function Claw.start!(source::SlackEventSource, assistant::Claw.AgentAssistant)
         _register_slack_rehydrator!(source)
         # Register channels now that web_client is available
         # (get_channels returns [] during register_event_source! since web_client is still nothing)
-        Claw.register_channels!(assistant, Claw.get_channels(source))
+        Claw.register_channels!(assistant, Claw.get_channels(source); source)
         channel_type_cache = Dict{String, String}()
         bot_user_id = string(strip(source.bot_user_id))
         bot_username = lowercase(strip(source.bot_username))
@@ -606,19 +613,46 @@ function Claw.start!(source::SlackEventSource, assistant::Claw.AgentAssistant)
         recipient_user_id = let v = strip(source.recipient_user_id); isempty(v) ? nothing : String(v); end
         @info "ClawSlackExt: Starting Socket Mode"
 
-        Slack.run!(app_token; web_client=web_client) do socket_client, request
+        socket_client = Slack.SocketModeClient(app_token; web_client)
+        Slack.add_request_listener!(socket_client, function (client, request)
             # Persist before acknowledging: acking first meant a crash between the
             # ack and the eval lost the message with no redelivery.
             _handle_request(request, web_client, bot_user_id, bot_username, recipient_team_id, recipient_user_id, assistant, channel_type_cache)
             if request.envelope_id !== nothing
                 try
-                    Slack.ack!(socket_client, request)
+                    Slack.ack!(client, request)
                 catch e
                     @warn "ClawSlackExt: failed to ack request" exception=(e, catch_backtrace())
                 end
             end
+        end)
+        should_stop = lock(source._lock) do
+            source.socket_client = socket_client
+            source._stopping[]
+        end
+        should_stop && Slack.close!(socket_client)
+        try
+            Slack.run!(socket_client)
+        finally
+            Slack.close!(socket_client)
+            lock(source._lock) do
+                source.socket_client === socket_client && (source.socket_client = nothing)
+            end
         end
     end)
 end
+
+function Claw.stop!(source::SlackEventSource)
+    socket_client = lock(source._lock) do
+        source._stopping[] = true
+        source.socket_client
+    end
+    socket_client === nothing || Slack.close!(socket_client)
+    return nothing
+end
+
+# Loading the trigger package makes this integration enable-able by name
+# (list_integrations / enable_integration!).
+__init__() = Claw.register_integration!("slack", SlackEventSource)
 
 end # module ClawSlackExt

@@ -37,6 +37,8 @@ Base.@kwdef struct PipelineConfig
     scan_interval_s::Float64 = 1.0
     "Log lane wait time + depth once an item waited longer than this."
     lane_backlog_warn_s::Float64 = 2.0
+    "Max events one lane drain coalesces into a single evaluation (1 disables)."
+    max_coalesce::Int = 8
     "Retire an idle lane (and its worker task) after this long with no work."
     lane_idle_timeout_s::Float64 = 300.0
     "Emit at most one PTY output event per this interval."
@@ -51,6 +53,8 @@ Base.@kwdef struct PipelineConfig
     source_restart_backoff_s::Float64 = 1.0
     "How often `is_healthy` is polled per source."
     source_health_interval_s::Float64 = 300.0
+    "How long runtime disable waits for a source to finish cooperative cleanup."
+    source_stop_timeout_s::Float64 = 5.0
     "Default `shutdown!` drain budget."
     shutdown_timeout_s::Float64 = 30.0
     "Send a best-effort apology on the originating channel when an event dies."
@@ -100,6 +104,25 @@ SupervisedSource(es::EventSource, tag::String) = SupervisedSource(
     Threads.Atomic{Bool}(false), Threads.Atomic{Bool}(true), Threads.Atomic{Bool}(false),
     ReentrantLock(),
 )
+
+"""
+    IntegrationState
+
+Runtime bookkeeping for one enabled integration: the live source, its supervisor
+(when the pipeline is running), and exactly what `register_event_source!` added on
+its behalf — so `disable_integration!` can remove precisely that and nothing else.
+"""
+mutable struct IntegrationState
+    name::String
+    source::EventSource
+    supervised::Union{Nothing, SupervisedSource}
+    channel_ids::Vector{String}
+    event_type_names::Vector{String}
+    tool_names::Vector{String}
+    channels::Vector{Agentif.AbstractChannel}
+    event_types::Vector{EventType}
+    tools::Vector{Agentif.AgentTool}
+end
 
 # ─── Single writer task ───
 
@@ -294,7 +317,27 @@ end
 # the baseline tables are (idempotently) created, so the ladder below is the only
 # thing that ever has to change a live database.
 
-const CLAW_SCHEMA_VERSION = 3
+const CLAW_SCHEMA_VERSION = 5
+
+function _is_sensitive_integration_key(key)
+    normalized = replace(lowercase(String(key)), r"[^a-z0-9]" => "")
+    normalized in ("key", "auth", "authorization", "cookie", "credentials") && return true
+    return any(fragment -> occursin(fragment, normalized),
+        ("apikey", "privatekey", "accesskey", "authorization", "bearer",
+         "cookie", "token", "secret", "password", "passphrase", "credential"))
+end
+
+function _sanitize_integration_value(value)
+    if value isa AbstractDict
+        return Dict{String, Any}(String(k) => _sanitize_integration_value(v) for (k, v) in value
+            if !_is_sensitive_integration_key(k))
+    elseif value isa AbstractVector
+        return Any[_sanitize_integration_value(v) for v in value]
+    end
+    return value
+end
+
+_sanitize_integration_config(config::AbstractDict) = _sanitize_integration_value(config)
 
 function _get_user_version(db::SQLite.DB)
     version = 0
@@ -368,7 +411,55 @@ function _migration_3!(db::SQLite.DB)
     return nothing
 end
 
-const CLAW_MIGRATIONS = Dict{Int, Function}(2 => _migration_2!, 3 => _migration_3!)
+# Subscription filters (per-handler event matchers) and the persisted integration
+# enabled-set. The filter columns are NULL for existing rows, which decodes to "no
+# filter" — the exact pre-migration behavior.
+function _migration_4!(db::SQLite.DB)
+    _column_exists(db, "claw_event_handlers", "filter_kind") ||
+        _exec!(db, "ALTER TABLE claw_event_handlers ADD COLUMN filter_kind TEXT")
+    _column_exists(db, "claw_event_handlers", "filter_expr") ||
+        _exec!(db, "ALTER TABLE claw_event_handlers ADD COLUMN filter_expr TEXT")
+    _column_exists(db, "claw_event_handlers", "filter_pattern") ||
+        _exec!(db, "ALTER TABLE claw_event_handlers ADD COLUMN filter_pattern TEXT")
+    _exec!(db, """
+        CREATE TABLE IF NOT EXISTS claw_integrations (
+            name TEXT PRIMARY KEY,
+            enabled INTEGER NOT NULL DEFAULT 0,
+            config TEXT,
+            status TEXT,
+            updated_at REAL NOT NULL DEFAULT 0
+        )
+    """)
+    return nothing
+end
+
+# Version 4 persisted constructor config verbatim. Remove credential-like keys
+# from existing rows and discard old error text, which may quote those values.
+function _migration_5!(db::SQLite.DB)
+    rows = Tuple{String, Union{Nothing, String}}[]
+    for row in SQLite.DBInterface.execute(db, "SELECT name, config FROM claw_integrations")
+        config = (row.config === missing || row.config === nothing) ? nothing : String(row.config)
+        push!(rows, (String(row.name), config))
+    end
+    for (name, raw) in rows
+        sanitized = if raw === nothing || isempty(strip(raw))
+            nothing
+        else
+            parsed = try
+                JSON.parse(raw)
+            catch
+                nothing
+            end
+            parsed isa AbstractDict ? JSON.json(_sanitize_integration_config(parsed)) : nothing
+        end
+        _exec!(db, "UPDATE claw_integrations SET config = ?, status = NULL WHERE name = ?",
+            (sanitized, name))
+    end
+    return nothing
+end
+
+const CLAW_MIGRATIONS = Dict{Int, Function}(
+    2 => _migration_2!, 3 => _migration_3!, 4 => _migration_4!, 5 => _migration_5!)
 
 """
     _migrate_claw_schema!(db)

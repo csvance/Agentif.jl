@@ -30,9 +30,10 @@ startup.
 const UNTRUSTED_ALLOWED_TOOLS = Set{String}([
     # Local file reads
     "read", "grep", "find", "ls",
-    # Claw configuration discovery
+    # Claw configuration discovery (read-only; enable/disable_integration are
+    # standing-configuration mutations and stay denied)
     "list_channels", "list_event_types", "list_event_handlers",
-    "get_system_prompt", "list_jobs",
+    "get_system_prompt", "list_jobs", "list_integrations",
     # Local scratch space
     "db_store", "db_search", "db_list_keys", "db_list_tags", "db_remove",
     # Read-only JMAP operations
@@ -60,15 +61,15 @@ end
 
 The tool vector for one handler evaluation.
 
-- `tools = nothing` and `trust = :owner` (the defaults) returns `assistant.tools`
-  itself — byte-for-byte what the handler saw before this file existed. That
-  identity is the no-regression guarantee, and it is asserted in the test suite.
+- `tools = nothing` and `trust = :owner` (the defaults) returns a snapshot of the
+  full assistant tool set. A snapshot keeps runtime integration changes from
+  mutating the tool vector of an evaluation that is already starting.
 - A non-`nothing` `tools` narrows to that named subset.
 - `trust = :untrusted` then keeps only names in
   [`UNTRUSTED_ALLOWED_TOOLS`](@ref). Unknown and custom tools fail closed.
 """
 function resolve_handler_tools(assistant::AgentAssistant, handler)
-    tools = assistant.tools
+    tools = _tool_snapshot(assistant)
     names = _handler_tool_names(handler)
     if names !== nothing
         allowed = Set{String}(names)
@@ -184,7 +185,7 @@ function trust_exposure_report(assistant::AgentAssistant, sources)
             r === nothing || push!(reasons, "$et via $r")
         end
         if h.channel_id !== nothing
-            ch = get(assistant._channels, h.channel_id, nothing)
+            ch = _channel_get(assistant, h.channel_id)
             ch !== nothing && _channel_is_shared(ch) &&
                 push!(reasons, "replies into group/public channel $(h.channel_id)")
         end

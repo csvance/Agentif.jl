@@ -117,7 +117,7 @@ client should register something better.
 function channel_lookup_rehydrator(row::EventRow)
     cid = row.channel_id
     cid === nothing && return ReplayedEvent(row.name, row.content)
-    ch = get(row.assistant._channels, cid, nothing)
+    ch = _channel_get(row.assistant, cid)
     ch === nothing && return nothing
     return ReplayedChannelEvent(row.name, row.content, ch)
 end
@@ -126,8 +126,8 @@ end
     rehydrate_event(source_tag::String, row::EventRow) -> Union{Nothing, Event}
 
 Reconstruct a persisted event. Unregistered sources return `nothing` and log: the
-row stays `pending` until the owning source is registered, which is the honest
-behavior — silently dropping it would defeat the point of persisting it.
+row stays `pending` until the owning source is registered. A registered rehydrator
+that throws propagates to the pipeline retry ladder.
 """
 function rehydrate_event(source_tag::String, row::EventRow)
     f = lock(EVENT_REHYDRATORS_LOCK) do
@@ -137,12 +137,7 @@ function rehydrate_event(source_tag::String, row::EventRow)
         @warn "Claw: no rehydrator registered for event source; leaving event pending" source = source_tag event_id = row.id event_name = row.name maxlog = 20
         return nothing
     end
-    try
-        return f(row)
-    catch e
-        @error "Claw: rehydrate_event failed; leaving event pending" source = source_tag event_id = row.id exception = (e, catch_backtrace())
-        return nothing
-    end
+    return f(row)
 end
 
 # Built-in sources. Channel-backed replay for the REPL rebuilds a fresh stdout
@@ -553,19 +548,39 @@ function _lane_loop(assistant::AgentAssistant, lane::Lane)
                 break
             end
             Threads.atomic_sub!(lane.depth, 1)
-            assistant._state[] === :running || break
-            id, enqueued_at = item
-            waited = time() - enqueued_at
-            if waited > assistant.pipeline.lane_backlog_warn_s
-                @warn "Claw: lane backlog" lane = lane.key wait_s = round(waited; digits = 2) queue_depth = lane.depth[]
+            if assistant._state[] !== :running
+                _clear_wakeup!(assistant, item[1])
+                break
             end
+            # Coalesce: drain whatever else is already queued on this lane (up to
+            # max_coalesce), so a burst that piled up behind a slow evaluation is
+            # handled as one demarcated batch instead of N sequential evaluations.
+            # Only this worker consumes the queue, so isready/take! cannot race.
+            items = [item]
+            max_coalesce = max(assistant.pipeline.max_coalesce, 1)
+            while length(items) < max_coalesce && isready(lane.queue)
+                extra = try
+                    take!(lane.queue)
+                catch
+                    break
+                end
+                Threads.atomic_sub!(lane.depth, 1)
+                push!(items, extra)
+            end
+            waited = time() - items[1][2]
+            if waited > assistant.pipeline.lane_backlog_warn_s
+                @warn "Claw: lane backlog" lane = lane.key wait_s = round(waited; digits = 2) queue_depth = lane.depth[] drained = length(items)
+            end
+            ids = [id for (id, _) in items]
             lane.busy[] = true
             Base.acquire(assistant._sem)
             try
-                _process_event!(assistant, id)
+                _process_event_batch!(assistant, ids)
             catch e
-                @error "Claw: lane worker error" lane = lane.key event_id = id exception = (e, catch_backtrace())
-                _clear_wakeup!(assistant, id)
+                @error "Claw: lane worker error" lane = lane.key event_ids = ids exception = (e, catch_backtrace())
+                for id in ids
+                    _clear_wakeup!(assistant, id)
+                end
             finally
                 Base.release(assistant._sem)
                 lane.last_active[] = time()
@@ -595,7 +610,7 @@ function _dead_letter_channel(assistant::AgentAssistant, ev::Event, handlers)
     ev isa ChannelEvent && return get_channel(ev)
     for h in handlers
         h.channel_id === nothing && continue
-        ch = get(assistant._channels, h.channel_id, nothing)
+        ch = _channel_get(assistant, h.channel_id)
         ch === nothing && continue
         return ch
     end
@@ -616,7 +631,8 @@ function _dead_letter_notify!(assistant::AgentAssistant, id::Int, ev::Event, han
     return nothing
 end
 
-function _handle_event_failure!(assistant::AgentAssistant, row::EventRow, ev::Event, handlers, err)
+function _handle_event_failure!(assistant::AgentAssistant, row::EventRow, ev::Event, handlers, err;
+        notify::Bool = true)
     cfg = assistant.pipeline
     class = classify_eval_failure(err)
     action, delay = _retry_decision(cfg, class, row.attempts)
@@ -631,82 +647,257 @@ function _handle_event_failure!(assistant::AgentAssistant, row::EventRow, ev::Ev
     else
         @error "Claw: event dead-lettered" event_id = row.id event_name = row.name class attempts = row.attempts error = text
         _finish_event!(assistant, row.id, "dead"; last_error = text)
-        _dead_letter_notify!(assistant, row.id, ev, handlers, class, text)
+        notify && _dead_letter_notify!(assistant, row.id, ev, handlers, class, text)
         _forget_live_event!(assistant, row.id)
     end
+    return action
+end
+
+"""
+    _process_event_batch!(assistant, ids)
+
+Claim and process one lane drain. Event ids are split into runs of
+consecutive rows with the same event name. Each run is claimed only when the
+prior run is complete, so it does not spend its lease waiting for another event
+type. Its events go through the group's handler filters individually, and the
+survivors are folded into a single coalesced evaluation per handler.
+"""
+function _pending_event_name(assistant::AgentAssistant, id::Int)
+    return try
+        with_read(assistant._readers) do db
+            name = nothing
+            for row in SQLite.DBInterface.execute(db,
+                    "SELECT name, status FROM claw_events WHERE id = ?", (id,))
+                String(row.status) == "pending" && (name = String(row.name))
+            end
+            return name
+        end
+    catch e
+        @error "Claw: failed to resolve event name" event_id = id exception = (e, catch_backtrace())
+        return nothing
+    end
+end
+
+function _process_event_run!(assistant::AgentAssistant, ids::Vector{Int})
+    if assistant._state[] !== :running
+        foreach(id -> _clear_wakeup!(assistant, id), ids)
+        return nothing
+    end
+    claimed = Tuple{EventRow, Event}[]
+    for id in ids
+        row = try
+            _claim_event!(assistant, id)
+        catch e
+            @error "Claw: claim failed" event_id = id exception = (e, catch_backtrace())
+            nothing
+        end
+        if row === nothing
+            _clear_wakeup!(assistant, id)
+            continue
+        end
+
+        ev = lock(assistant._live_lock) do
+            get(assistant._live_events, id, nothing)
+        end
+        if ev === nothing
+            ev = try
+                rehydrate_event(row.source, row)
+            catch e
+                @error "Claw: rehydrate_event failed" source = row.source event_id = row.id exception = (e, catch_backtrace())
+                fallback = ReplayedEvent(row.name, row.content)
+                _handle_event_failure!(assistant, row, fallback, (), e)
+                _clear_wakeup!(assistant, id)
+                continue
+            end
+        end
+        if ev === nothing
+            # The owning source is not registered (or could not rebuild the channel).
+            # Leave the row pending and try again later rather than dropping it.
+            _release_claim!(assistant, id; delay = 60.0, last_error = "no rehydrator for source '$(row.source)'")
+            _clear_wakeup!(assistant, id)
+            continue
+        end
+        push!(claimed, (row, ev))
+    end
+    isempty(claimed) && return nothing
+
+    if assistant._state[] !== :running
+        for (row, _) in claimed
+            _release_claim!(assistant, row.id)
+            _clear_wakeup!(assistant, row.id)
+        end
+        _release_group_channels!(claimed, nothing)
+        return nothing
+    end
+    _process_claimed_group!(assistant, claimed)
     return nothing
 end
 
-function _process_event!(assistant::AgentAssistant, id::Int)
-    row = try
-        _claim_event!(assistant, id)
-    catch e
-        @error "Claw: claim failed" event_id = id exception = (e, catch_backtrace())
-        nothing
+function _process_event_batch!(assistant::AgentAssistant, ids::Vector{Int})
+    run = Int[]
+    run_name = nothing
+    for id in ids
+        name = _pending_event_name(assistant, id)
+        if name === nothing
+            _clear_wakeup!(assistant, id)
+            continue
+        end
+        if run_name !== nothing && name != run_name
+            _process_event_run!(assistant, run)
+            empty!(run)
+        end
+        run_name = name
+        push!(run, id)
     end
-    if row === nothing
-        _clear_wakeup!(assistant, id)
-        return nothing
-    end
+    isempty(run) || _process_event_run!(assistant, run)
+    return nothing
+end
 
-    ev = lock(assistant._live_lock) do
-        get(assistant._live_events, id, nothing)
-    end
-    if ev === nothing
-        ev = rehydrate_event(row.source, row)
-    end
-    if ev === nothing
-        # The owning source is not registered (or could not rebuild the channel).
-        # Leave the row pending and try again later rather than dropping it.
-        _release_claim!(assistant, id; delay = 60.0, last_error = "no rehydrator for source '$(row.source)'")
-        _clear_wakeup!(assistant, id)
-        return nothing
-    end
+_process_event!(assistant::AgentAssistant, id::Int) = _process_event_batch!(assistant, [id])
 
+function _process_claimed_group!(assistant::AgentAssistant, group::Vector{Tuple{EventRow, Event}})
+    name = group[1][1].name
     handlers = try
-        _event_handlers_for(assistant, row.name)
+        _event_handlers_for(assistant, name)
     catch e
-        @error "Claw: event handler lookup failed" event_id = id event = row.name exception = (e, catch_backtrace())
-        _release_claim!(assistant, id; delay = assistant.pipeline.min_refire_gap_s)
-        _clear_wakeup!(assistant, id)
+        @error "Claw: event handler lookup failed" event = name exception = (e, catch_backtrace())
+        notify = true
+        for (row, ev) in group
+            action = _handle_event_failure!(assistant, row, ev, (), e; notify)
+            action === :dead && (notify = false)
+            _clear_wakeup!(assistant, row.id)
+        end
+        _release_group_channels!(group, nothing)
         return nothing
     end
 
     if isempty(handlers)
-        @debug "Claw: no handlers for event" event_id = id event_name = row.name
-        _finish_event!(assistant, id, "done")
-        _forget_live_event!(assistant, id)
-        _clear_wakeup!(assistant, id)
+        for (row, _) in group
+            @debug "Claw: no handlers for event" event_id = row.id event_name = name
+            _finish_event!(assistant, row.id, "done")
+            _forget_live_event!(assistant, row.id)
+            _clear_wakeup!(assistant, row.id)
+        end
+        _release_group_channels!(group, nothing)
         return nothing
     end
 
     abort = Agentif.Abort()
     lock(assistant._inflight_lock) do
-        assistant._inflight[id] = abort
+        for (row, _) in group
+            assistant._inflight[row.id] = abort
+        end
     end
     started_at = time()
+    # Channels an evaluation actually streamed to; every other channel event in the
+    # group is released afterwards so nothing waits on a response that will never
+    # come (a coalesced member, or an event a filter rejected).
+    streamed = Base.IdSet{Any}()
     try
         for handler in handlers
-            @info "Claw: running handler" handler_id = handler.id event_name = row.name event_id = id attempt = row.attempts
+            kept = Event[]
+            for (row, ev) in group
+                # Filter errors (e.g. a :prompt filter that cannot reach the model)
+                # propagate: the group rides the retry ladder rather than the event
+                # being silently dropped or spuriously delivered.
+                passes_filter(assistant, handler, ev, row.extra) && push!(kept, ev)
+            end
+            if isempty(kept)
+                @debug "Claw: filter matched no events" handler_id = handler.id event_name = name group_size = length(group)
+                continue
+            end
+            ev_input = length(kept) == 1 ? kept[1] : _make_event_batch(name, kept)
+            @info "Claw: running handler" handler_id = handler.id event_name = name event_ids = [row.id for (row, _) in group] coalesced = length(kept)
             RUN_EVENT_HANDLER_FN[](
                 assistant,
-                ev,
+                ev_input,
                 handler;
                 level = assistant.log_level,
                 abort,
                 pipeline_managed = true,
             )
-            @info "Claw: handler completed" handler_id = handler.id event_name = row.name duration_s = round(time() - started_at; digits = 4)
+            ev_input isa ChannelEvent && push!(streamed, get_channel(ev_input))
+            @info "Claw: handler completed" handler_id = handler.id event_name = name duration_s = round(time() - started_at; digits = 4)
         end
-        _finish_event!(assistant, id, "done")
-        _forget_live_event!(assistant, id)
+        for (row, _) in group
+            _finish_event!(assistant, row.id, "done")
+            _forget_live_event!(assistant, row.id)
+        end
+        _release_group_channels!(group, streamed)
     catch e
-        _handle_event_failure!(assistant, row, ev, handlers, e)
+        # One failure fails the whole group: every row returns to the retry ladder
+        # together (same at-least-once semantics as a multi-handler single event).
+        # Only the first row sends a dead-letter notice, so a dead group does not
+        # spam its channel N times.
+        notify = true
+        for (row, ev) in group
+            action = _handle_event_failure!(assistant, row, ev, handlers, e; notify)
+            action === :dead && (notify = false)
+        end
+        _release_group_channels!(group, streamed)
     finally
         lock(assistant._inflight_lock) do
-            Base.delete!(assistant._inflight, id)
+            for (row, _) in group
+                Base.delete!(assistant._inflight, row.id)
+            end
         end
-        _clear_wakeup!(assistant, id)
+        for (row, _) in group
+            _clear_wakeup!(assistant, row.id)
+        end
+    end
+    return nothing
+end
+
+# Close channel-event channels that no evaluation streamed to (coalesced members
+# and filter-rejected events). `close_channel` flushes buffered transports and
+# unblocks REPL waiters; without this, `a"..."` would hang whenever its event was
+# coalesced into a batch whose response streamed to a newer channel object.
+function _release_group_channels!(group::Vector{Tuple{EventRow, Event}}, streamed)
+    for (_, ev) in group
+        ev isa ChannelEvent || continue
+        ch = try
+            get_channel(ev)
+        catch
+            continue
+        end
+        streamed !== nothing && ch in streamed && continue
+        try
+            Agentif.close_channel(ch)
+        catch e
+            @debug "Claw: failed to release coalesced channel" exception = (e,)
+        end
+    end
+    return nothing
+end
+
+# Release every still-live channel event at shutdown. This covers queued rows that
+# intake or a lane did not consume, retrying rows whose next attempt is in the
+# future, and any straggler that ignored its abort. The durable rows stay pending;
+# only their process-local response waiters are completed.
+function _release_live_event_channels!(assistant::AgentAssistant)
+    events = lock(assistant._live_lock) do
+        result = collect(values(assistant._live_events))
+        empty!(assistant._live_events)
+        result
+    end
+    channels = Base.IdSet{Any}()
+    for ev in events
+        ev isa ChannelEvent || continue
+        ch = try
+            get_channel(ev)
+        catch
+            continue
+        end
+        ch in channels && continue
+        push!(channels, ch)
+        try
+            Agentif.close_channel(ch)
+        catch e
+            @debug "Claw: failed to release live channel during shutdown" exception = (e,)
+        end
+    end
+    lock(assistant._wakeup_lock) do
+        empty!(assistant._pending_wakeups)
     end
     return nothing
 end
@@ -854,16 +1045,41 @@ function _sleep_interruptible(assistant::AgentAssistant, seconds::Real)
     return assistant._state[] === :running
 end
 
+function _retire_source!(assistant::AgentAssistant, ss::SupervisedSource)
+    inner = lock(ss.lock) do
+        ss.stopped[] = true
+        try
+            stop!(ss.source)
+        catch e
+            @warn "Claw: source stop! failed after restart budget exhaustion" source = ss.tag exception = (e,)
+        end
+        ss.inner
+    end
+    if inner !== nothing && !istaskdone(inner)
+        result = timedwait(() -> istaskdone(inner),
+            assistant.pipeline.source_stop_timeout_s; pollint = 0.05)
+        result == :timed_out && @error "Claw: retired source did not stop" source = ss.tag
+    end
+    return nothing
+end
+
 function _supervise_source!(assistant::AgentAssistant, ss::SupervisedSource)
     backoff = assistant.pipeline.source_restart_backoff_s
     while assistant._state[] === :running && !ss.stopped[]
         started = false
         try
-            result = start!(ss.source, assistant)
+            result, should_start = lock(ss.lock) do
+                if assistant._state[] !== :running || ss.stopped[]
+                    return (nothing, false)
+                end
+                value = start!(ss.source, assistant)
+                ss.inner = value isa Task ? value : nothing
+                return (value, true)
+            end
+            should_start || break
             started = true
             _journal_source!(assistant, ss.tag, "started")
             if result isa Task
-                ss.inner = result
                 wait(result)
                 _journal_source!(assistant, ss.tag, "exited", "source task returned")
             else
@@ -873,8 +1089,9 @@ function _supervise_source!(assistant::AgentAssistant, ss::SupervisedSource)
             end
         catch e
             unwrapped = _unwrap_error(e)
-            _journal_source!(assistant, ss.tag, started ? "crashed" : "start_failed", sprint(showerror, unwrapped))
-            @error "Claw: event source failed" source = ss.tag exception = (e, catch_backtrace())
+            detail = _source_error_detail(ss.source, unwrapped)
+            _journal_source!(assistant, ss.tag, started ? "crashed" : "start_failed", detail)
+            @error "Claw: event source failed" source = ss.tag error = detail
         end
         (assistant._state[] === :running && !ss.stopped[]) || break
         if ss.restart_requested[]
@@ -884,7 +1101,7 @@ function _supervise_source!(assistant::AgentAssistant, ss::SupervisedSource)
             _journal_source!(assistant, ss.tag, "restart_cap_exceeded",
                 "more than $(assistant.pipeline.source_restart_cap) restarts within $(assistant.pipeline.source_restart_window_s)s")
             @error "Claw: source exceeded its restart budget; giving up" source = ss.tag cap = assistant.pipeline.source_restart_cap
-            ss.stopped[] = true
+            _retire_source!(assistant, ss)
             break
         end
         _sleep_interruptible(assistant, min(backoff, 60.0)) || break
@@ -894,17 +1111,23 @@ function _supervise_source!(assistant::AgentAssistant, ss::SupervisedSource)
 end
 
 function _request_source_restart!(assistant::AgentAssistant, ss::SupervisedSource)
-    ss.restart_requested[] = true
-    try
-        stop!(ss.source)
-    catch e
-        @warn "Claw: source stop! failed" source = ss.tag exception = (e,)
-    end
-    inner = ss.inner
-    if inner !== nothing && !istaskdone(inner)
+    inner, stopped_ok = lock(ss.lock) do
+        ss.restart_requested[] = true
         try
-            schedule(inner, InterruptException(); error = true)
-        catch
+            stop!(ss.source)
+        catch e
+            @warn "Claw: source stop! failed" source = ss.tag exception = (e,)
+            ss.restart_requested[] = false
+            return (ss.inner, false)
+        end
+        return (ss.inner, true)
+    end
+    stopped_ok || return nothing
+    if inner !== nothing && !istaskdone(inner)
+        result = timedwait(() -> istaskdone(inner),
+            assistant.pipeline.source_stop_timeout_s; pollint = 0.05)
+        if result == :timed_out
+            @error "Claw: source did not stop; refusing to start a duplicate" source = ss.tag
         end
     end
     if ss.task === nothing || istaskdone(ss.task)
@@ -917,7 +1140,7 @@ function _health_loop(assistant::AgentAssistant)
     cfg = assistant.pipeline
     while assistant._state[] === :running
         _sleep_interruptible(assistant, cfg.source_health_interval_s) || break
-        for ss in assistant._sources
+        for ss in lock(() -> copy(assistant._sources), assistant._sources_lock)
             ss.stopped[] && continue
             ok = try
                 is_healthy(ss.source)
@@ -932,11 +1155,91 @@ function _health_loop(assistant::AgentAssistant)
             if !_record_restart!(assistant, ss)
                 _journal_source!(assistant, ss.tag, "restart_cap_exceeded", "unhealthy restart budget exhausted")
                 @error "Claw: unhealthy source exceeded its restart budget; giving up" source = ss.tag
-                ss.stopped[] = true
+                _retire_source!(assistant, ss)
                 continue
             end
             _request_source_restart!(assistant, ss)
         end
+    end
+    return nothing
+end
+
+function _ensure_health_loop!(assistant::AgentAssistant)
+    assistant._health_loop_started[] && return nothing
+    assistant._health_loop_started[] = true
+    push!(assistant._tasks, errormonitor(Threads.@spawn _health_loop(assistant)))
+    return nothing
+end
+
+"""
+    _start_supervised_source!(assistant, es) -> SupervisedSource
+
+Validate one source and start it in its own supervised task. A validation failure
+marks it stopped but never throws — one bad source must not take down the rest.
+"""
+function _start_supervised_source!(assistant::AgentAssistant, es::EventSource;
+        validated::Bool = false)
+    tag = _source_tag(es)
+    ss = SupervisedSource(es, tag)
+    lock(() -> push!(assistant._sources, ss), assistant._sources_lock)
+    lock(assistant._integrations_lock) do
+        for state in values(assistant._integrations)
+            state.source === es && (state.supervised = ss)
+        end
+    end
+    if !validated
+        try
+            validate_source(es)
+        catch e
+            ss.stopped[] = true
+            detail = _source_error_detail(es, e)
+            _journal_source!(assistant, tag, "invalid_config", detail)
+            @error "Claw: source configuration invalid; not started" source = tag error = detail
+            _ensure_health_loop!(assistant)
+            return ss
+        end
+    end
+    ss.task = errormonitor(Threads.@spawn _supervise_source!(assistant, ss))
+    _ensure_health_loop!(assistant)
+    return ss
+end
+
+"""
+    _stop_supervised_source!(assistant, ss)
+
+Stop one supervised source and drop it from supervision. `stop!` must make a
+task returned by `start!` finish within `source_stop_timeout_s`.
+"""
+function _stop_supervised_source!(assistant::AgentAssistant, ss::SupervisedSource)
+    timeout = assistant.pipeline.source_stop_timeout_s
+    deadline = time() + timeout
+    inner = lock(ss.lock) do
+        ss.stopped[] = true
+        try
+            stop!(ss.source)
+        catch e
+            @debug "Claw: source stop! failed" source = ss.tag exception = (e,)
+        end
+        ss.inner
+    end
+    if inner !== nothing && !istaskdone(inner)
+        timedwait(() -> istaskdone(inner), max(0.0, deadline - time());
+            pollint = 0.05)
+    end
+    supervisor = ss.task
+    if supervisor !== nothing && !istaskdone(supervisor)
+        result = timedwait(() -> istaskdone(supervisor),
+            max(0.0, deadline - time()); pollint = 0.05)
+        if result == :timed_out
+            # The source is still live. Restore supervision so the integration
+            # remains internally consistent and can be disabled again later.
+            ss.stopped[] = false
+            error("Source '$(ss.tag)' did not stop within $timeout seconds.")
+        end
+    end
+    lock(assistant._sources_lock) do
+        idx = findfirst(s -> s === ss, assistant._sources)
+        idx === nothing || deleteat!(assistant._sources, idx)
     end
     return nothing
 end
@@ -949,38 +1252,19 @@ One source failing must not abort `init!` or take down the others.
 """
 function start_sources!(assistant::AgentAssistant, sources)
     for es in sources
-        tag = _source_tag(es)
-        ss = SupervisedSource(es, tag)
-        push!(assistant._sources, ss)
-        try
-            validate_source(es)
-        catch e
-            ss.stopped[] = true
-            _journal_source!(assistant, tag, "invalid_config", sprint(showerror, _unwrap_error(e)))
-            @error "Claw: source configuration invalid; not started" source = tag exception = (e, catch_backtrace())
-            continue
-        end
-        ss.task = errormonitor(Threads.@spawn _supervise_source!(assistant, ss))
-    end
-    if !isempty(assistant._sources)
-        push!(assistant._tasks, errormonitor(Threads.@spawn _health_loop(assistant)))
+        _start_supervised_source!(assistant, es)
     end
     return assistant._sources
 end
 
 function _stop_sources!(assistant::AgentAssistant)
-    for ss in assistant._sources
-        ss.stopped[] = true
-        try
-            stop!(ss.source)
-        catch e
-            @debug "Claw: source stop! failed during shutdown" source = ss.tag exception = (e,)
-        end
-        inner = ss.inner
-        if inner !== nothing && !istaskdone(inner)
+    for ss in lock(() -> copy(assistant._sources), assistant._sources_lock)
+        lock(ss.lock) do
+            ss.stopped[] = true
             try
-                schedule(inner, InterruptException(); error = true)
-            catch
+                stop!(ss.source)
+            catch e
+                @debug "Claw: source stop! failed during shutdown" source = ss.tag exception = (e,)
             end
         end
     end
@@ -1010,10 +1294,15 @@ stragglers through their `Abort` handles, return unfinished claims to `pending`,
 and close the database. Idempotent; safe to call from an `atexit` hook.
 """
 function shutdown!(assistant::AgentAssistant; timeout_s::Real = assistant.pipeline.shutdown_timeout_s)
-    first_caller = lock(assistant._shutdown_lock) do
-        assistant._state[] in (:stopping, :stopped) && return false
-        assistant._state[] = :stopping
-        return true
+    # Serialize the state transition with runtime integration changes. An enable
+    # that won the lock first finishes adding its supervised source before shutdown
+    # snapshots sources; one that arrives later sees :stopping and fails closed.
+    first_caller = lock(assistant._integrations_lock) do
+        lock(assistant._shutdown_lock) do
+            assistant._state[] in (:stopping, :stopped) && return false
+            assistant._state[] = :stopping
+            return true
+        end
     end
     if !first_caller
         timedwait(() -> assistant._state[] === :stopped, Float64(timeout_s); pollint = 0.05)
@@ -1068,7 +1357,7 @@ function shutdown!(assistant::AgentAssistant; timeout_s::Real = assistant.pipeli
     end
 
     source_tasks = Task[]
-    for ss in assistant._sources
+    for ss in lock(() -> copy(assistant._sources), assistant._sources_lock)
         ss.task === nothing || push!(source_tasks, ss.task)
         ss.inner === nothing || push!(source_tasks, ss.inner)
     end
@@ -1079,6 +1368,7 @@ function shutdown!(assistant::AgentAssistant; timeout_s::Real = assistant.pipeli
     )
     timedwait(() -> all(istaskdone, all_tasks), 5.0; pollint = 0.05)
 
+    _release_live_event_channels!(assistant)
     _return_claims!(assistant)
 
     close_writer!(assistant._writer)

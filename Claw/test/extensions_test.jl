@@ -26,6 +26,21 @@ count_events(assistant, sql, params = ()) =
         params,
     ).n)
 
+mutable struct LockAwareCloser
+    lock::ReentrantLock
+    closed::Threads.Atomic{Bool}
+end
+
+function Base.close(closer::LockAwareCloser)
+    task = Threads.@spawn lock(closer.lock) do
+        closer.closed[] = true
+    end
+    timedwait(() -> istaskdone(task), 1.0) == :ok ||
+        error("close called while the source lock was held")
+    fetch(task)
+    return nothing
+end
+
 const HAS_GITHUB = try
     @eval using GitHub
     true
@@ -46,6 +61,14 @@ if HAS_GITHUB
     @test ext !== nothing
 
     source = ext.GitHubEventSource(; secret="test-secret", port=19876)
+    @test which(Claw.stop!, (typeof(source),)).module === ext
+    @test Claw.stop!(source) === nothing
+    @test source._stopping[]
+    lock_aware = ext.GitHubEventSource(; secret="test-secret", port=19877)
+    closer = LockAwareCloser(lock_aware._lock, Threads.Atomic{Bool}(false))
+    lock_aware._server = closer
+    @test Claw.stop!(lock_aware) === nothing
+    @test closer.closed[]
     event_types = Claw.get_event_types(source)
     et_names = Set(et.name for et in event_types)
 
@@ -126,10 +149,37 @@ if HAS_GITHUB
     @test occursin("LGTM!", content_comment)
     @test occursin("Bug report", content_comment)
     @test occursin("Direct mention: yes", content_comment)
+    @test startswith(Claw.event_prompt_content(ev_comment), Claw.UNTRUSTED_EVENT_OPEN)
     @test ev_comment.direct_ping
     comment_channel = Claw.get_channel(ev_comment)
     @test Agentif.channel_id(comment_channel) == "github:owner/repo:pr:7"
     @test Agentif.entry_id(comment_channel) == "17"
+
+    # Durable replay keeps the comment target. Installation credentials are
+    # recreated from source configuration and are never stored in the event row.
+    replay_payload = copy(ev_comment.payload)
+    replay_payload["installation"] = Dict{String, Any}("id" => 1234)
+    replay_event = ext.GitHubWebhookEvent(
+        "github_issue_comment", "issue_comment", "created", replay_payload,
+        "owner/repo", "eve"; auth)
+    replay_extra = Claw.event_extra(replay_event)
+    @test replay_extra["installation_id"] == 1234
+    @test !haskey(replay_extra, "auth")
+    replay_row = Claw.EventRow(
+        1, "github", Claw.get_name(replay_event), nothing,
+        Agentif.channel_id(Claw.get_channel(replay_event)),
+        Claw.event_content(replay_event), replay_extra,
+        Agentif.channel_id(Claw.get_channel(replay_event)), 1, nothing,
+    )
+    replayed = ext._rehydrate_github_event(source, replay_row)
+    @test replayed isa Claw.ChannelEvent
+    @test startswith(Claw.event_prompt_content(replayed), Claw.UNTRUSTED_EVENT_OPEN)
+    replayed_channel = Claw.get_channel(replayed)
+    @test Agentif.channel_id(replayed_channel) == "github:owner/repo:pr:7"
+    @test Agentif.entry_id(replayed_channel) == "17"
+    @test replayed_channel.source_reaction_path ==
+        "/repos/owner/repo/issues/comments/17/reactions"
+    @test replayed_channel.auth === nothing
 
     # Generic event fallback
     ev_star = ext.GitHubWebhookEvent("github_star", "star", "created", Dict{String,Any}("action" => "created"), "owner/repo", "fan")
@@ -181,6 +231,9 @@ if HAS_JMAP
     @test ext !== nothing
 
     source = ext.FastmailEventSource(; token="test-token")
+    @test which(Claw.stop!, (typeof(source),)).module === ext
+    @test Claw.stop!(source) === nothing
+    @test source._stopping[]
     assistant = Claw.AgentAssistant(":memory:";
         provider="openai-completions",
         model_id="gpt-4o-mini",
@@ -370,6 +423,9 @@ end
     @test ext !== nothing
 
     source = ext.SlackEventSource(; app_token="xapp-test", bot_token="xoxb-test")
+    @test which(Claw.stop!, (typeof(source),)).module === ext
+    @test Claw.stop!(source) === nothing
+    @test source._stopping[]
     event_types = Set(et.name for et in Claw.get_event_types(source))
     @test "slack_message" in event_types
     @test "slack_reaction" in event_types
@@ -693,8 +749,17 @@ end
 @testset "ClawMattermostExt channel + event mapping" begin
     ext = Base.get_extension(Claw, :ClawMattermostExt)
     @test ext !== nothing
+    withenv("MATTERMOST_TOKEN" => "mattermost-journal-secret") do
+        detail = Claw._source_error_detail(ext.MattermostEventSource(),
+            ErrorException("request used mattermost-journal-secret"))
+        @test !occursin("mattermost-journal-secret", detail)
+        @test occursin("[REDACTED]", detail)
+    end
 
     source = ext.MattermostEventSource()
+    @test which(Claw.stop!, (typeof(source),)).module === ext
+    @test Claw.stop!(source) === nothing
+    @test source._stopping[]
     event_types = Set(et.name for et in Claw.get_event_types(source))
     @test "mattermost_message" in event_types
     @test "mattermost_reaction" in event_types
@@ -942,6 +1007,9 @@ end
     @test ext !== nothing
 
     source = ext.SignalEventSource(; number="+15550000000", base_url="http://127.0.0.1:8080", auto_reconnect=false)
+    @test which(Claw.stop!, (typeof(source),)).module === ext
+    @test Claw.stop!(source) === nothing
+    @test source._stopping[]
     event_types = Set(et.name for et in Claw.get_event_types(source))
     @test event_types == Set(["signal_message"])
     handlers = Claw.get_event_handlers(source)
@@ -1016,6 +1084,9 @@ end
     @test ext !== nothing
 
     source = ext.MSTeamsEventSource(; app_id="app-id", app_password="secret")
+    @test which(Claw.stop!, (typeof(source),)).module === ext
+    @test Claw.stop!(source) === nothing
+    @test source._stopping[]
     event_types = Set(et.name for et in Claw.get_event_types(source))
     @test "msteams_message" in event_types
     @test "msteams_reaction" in event_types
@@ -1114,9 +1185,19 @@ end
 @testset "ClawTelegramExt durable replay" begin
     ext = Base.get_extension(Claw, :ClawTelegramExt)
     @test ext !== nothing
+    withenv("TELEGRAM_BOT_TOKEN" => "telegram-journal-secret") do
+        source = ext.TelegramEventSource()
+        detail = Claw._source_error_detail(source,
+            ErrorException("GET https://api.telegram.org/bottelegram-journal-secret/getMe"))
+        @test !occursin("telegram-journal-secret", detail)
+        @test occursin("[REDACTED]", detail)
+    end
 
     client = Telegram.Client("test-token", "https://example.invalid/")
     source = ext.TelegramEventSource(; client)
+    @test which(Claw.stop!, (typeof(source),)).module === ext
+    @test Claw.stop!(source) === nothing
+    @test source._stopping[]
     ch = ext.TelegramChannel(
         -100123,
         Int64(42),
