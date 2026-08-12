@@ -338,4 +338,41 @@ end
     @test count(Claw.UNTRUSTED_EVENT_OPEN, mp) == 1
 end
 
+# ─── EventType filterable-field docs + list_event_types rendering ───
+
+struct FieldsSource <: Claw.EventSource end
+Claw.get_event_types(::FieldsSource) = Claw.EventType[
+    Claw.EventType("documented_et", "with fields",
+        ["\$.extra.who" => "the sender", "\$.extra.level" => "severity"]),
+    Claw.EventType("plain_et", "no fields"),
+]
+
+@testset "EventType fields and list_event_types rendering" begin
+    # the 2-arg constructor every existing call site uses stays valid
+    @test Claw.EventType("x", "y").fields == Pair{String, String}[]
+
+    a = Claw.AgentAssistant(":memory:";
+        provider = "openai-completions", model_id = "gpt-4o-mini", apikey = "k", level = :error)
+    old = Claw.CURRENT_ASSISTANT[]
+    Claw.CURRENT_ASSISTANT[] = a
+    src = FieldsSource()
+    try
+        Claw.register_event_source!(a, src)
+        listing = Claw.list_event_types()
+        @test occursin("- documented_et: with fields", listing)
+        @test occursin("    \$.extra.who — the sender", listing)
+        @test occursin("    \$.extra.level — severity", listing)
+        @test occursin("- plain_et: no fields", listing)
+        # the undocumented type gets no field lines
+        lines = split(listing, "\n")
+        plain_idx = findfirst(l -> startswith(l, "- plain_et"), lines)
+        @test plain_idx !== nothing
+        @test plain_idx == length(lines) || !startswith(lines[plain_idx + 1], "    \$")
+    finally
+        Claw.CURRENT_ASSISTANT[] = old
+        lock(() -> delete!(Claw.EVENT_SOURCES, src), Claw.EVENT_SOURCES_LOCK)
+        Claw.shutdown!(a; timeout_s = 5)
+    end
+end
+
 end # module FiltersTests

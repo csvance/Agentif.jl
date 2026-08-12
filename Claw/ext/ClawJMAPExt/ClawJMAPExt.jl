@@ -61,9 +61,13 @@ end
 
 # ─── Event types ───
 
+# Filterable-field declarations mirror `event_extra` above; keep them in sync.
 const NEW_EMAIL_EVENT_TYPE = Claw.EventType(
     "jmap_new_email",
     "A new email arrived in the inbox",
+    ["\$.extra.account_id" => "JMAP account the email arrived in",
+     "\$.extra.email_id" => "JMAP email id (usable with the email_* tools)",
+     "\$.extra.thread_id" => "JMAP thread id, or null"],
 )
 
 # ─── Session holder (set during start!) ───

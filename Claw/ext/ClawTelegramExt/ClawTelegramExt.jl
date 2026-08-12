@@ -259,8 +259,19 @@ end
 
 # ─── Event Types & Handlers ───
 
-const MESSAGE_EVENT_TYPE = Claw.EventType("telegram_message", "A new message in a Telegram chat")
-const REACTION_EVENT_TYPE = Claw.EventType("telegram_reaction", "An emoji reaction added to a message in Telegram")
+# Filterable-field declarations mirror `event_extra` below; keep them in sync.
+const MESSAGE_EVENT_TYPE = Claw.EventType("telegram_message", "A new message in a Telegram chat",
+    ["\$.extra.direct_ping" => "true when the bot was mentioned or the chat is private",
+     "\$.extra.message_id" => "Telegram message id",
+     "\$.extra.user_id" => "sender's Telegram user id",
+     "\$.extra.user_name" => "sender's display name",
+     "\$.extra.chat_type" => "one of private, group, supergroup, channel"])
+const REACTION_EVENT_TYPE = Claw.EventType("telegram_reaction", "An emoji reaction added to a message in Telegram",
+    ["\$.extra.emoji" => "reaction emoji",
+     "\$.extra.message_id" => "id of the message reacted to",
+     "\$.extra.user_id" => "reactor's Telegram user id",
+     "\$.extra.user_name" => "reactor's display name",
+     "\$.extra.chat_type" => "one of private, group, supergroup, channel"])
 
 const REACTION_HANDLER_PROMPT = """
 A user reacted to one of your messages with an emoji. Interpret the reaction and respond appropriately:

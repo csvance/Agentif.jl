@@ -693,13 +693,24 @@ const GITHUB_WEBHOOK_KINDS = [
 const GITHUB_WEBHOOK_KINDS_WITHOUT_PULL_REQUEST =
     [k for k in GITHUB_WEBHOOK_KINDS if k != "pull_request"]
 
+const GITHUB_EVENT_FIELDS = Pair{String, String}[
+    # Mirrors `event_extra(::GitHubWebhookEvent)`; keep them in sync.
+    "\$.extra.kind" => "webhook kind (push, pull_request, issues, issue_comment, release, workflow_run, star, fork, ping, ...)",
+    "\$.extra.action" => "webhook action (opened, closed, created, ...; empty for kinds without one)",
+    "\$.extra.repo" => "repository full name, owner/name",
+    "\$.extra.sender" => "GitHub login that triggered the event",
+    "\$.extra.issue_number" => "issue number, or null",
+    "\$.extra.pull_request_number" => "pull request number, or null",
+    "\$.extra.installation_id" => "GitHub App installation id, or null",
+]
+
 const GITHUB_PR_SYNTHETIC_EVENT_TYPES = Claw.EventType[
-    Claw.EventType("GitHubPRReady", "Pull request ready for review: non-draft open, reopened when not draft, or ready_for_review."),
-    Claw.EventType("GitHubPRDone", "Pull request closed (merged or unmerged)."),
+    Claw.EventType("GitHubPRReady", "Pull request ready for review: non-draft open, reopened when not draft, or ready_for_review.", GITHUB_EVENT_FIELDS),
+    Claw.EventType("GitHubPRDone", "Pull request closed (merged or unmerged).", GITHUB_EVENT_FIELDS),
 ]
 
 const ALL_EVENT_TYPES = vcat(
-    [Claw.EventType("github_$k", "GitHub $k webhook event") for k in GITHUB_WEBHOOK_KINDS_WITHOUT_PULL_REQUEST],
+    [Claw.EventType("github_$k", "GitHub $k webhook event", GITHUB_EVENT_FIELDS) for k in GITHUB_WEBHOOK_KINDS_WITHOUT_PULL_REQUEST],
     GITHUB_PR_SYNTHETIC_EVENT_TYPES,
 )
 

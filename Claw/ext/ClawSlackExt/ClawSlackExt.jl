@@ -256,8 +256,19 @@ Claw.event_extra(ev::SlackReactionEvent) = Dict{String, Any}(
 
 # ─── Event Types & Handlers ───
 
-const MESSAGE_EVENT_TYPE = Claw.EventType("slack_message", "A new message in a Slack conversation")
-const REACTION_EVENT_TYPE = Claw.EventType("slack_reaction", "An emoji reaction added to a Slack message")
+# Filterable-field declarations mirror `event_extra` above; keep them in sync.
+const MESSAGE_EVENT_TYPE = Claw.EventType("slack_message", "A new message in a Slack conversation",
+    ["\$.extra.direct_ping" => "true when the bot was @-mentioned or the message is a DM",
+     "\$.extra.user_id" => "Slack user id of the sender",
+     "\$.extra.user_name" => "sender's username",
+     "\$.extra.channel_type" => "one of channel, group, im, mpim",
+     "\$.extra.ts" => "message timestamp id"])
+const REACTION_EVENT_TYPE = Claw.EventType("slack_reaction", "An emoji reaction added to a Slack message",
+    ["\$.extra.emoji" => "reaction emoji name (e.g. thumbsup)",
+     "\$.extra.user_id" => "Slack user id of the reactor",
+     "\$.extra.user_name" => "reactor's username",
+     "\$.extra.channel_type" => "one of channel, group, im, mpim",
+     "\$.extra.reacted_to_ts" => "timestamp id of the message reacted to"])
 
 const REACTION_HANDLER_PROMPT = """
 A user reacted to one of your messages with an emoji. Interpret the reaction and respond appropriately:

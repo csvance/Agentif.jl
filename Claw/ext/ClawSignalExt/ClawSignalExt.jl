@@ -104,7 +104,13 @@ end
 
 # ─── Event Types & Handlers ───
 
-const MESSAGE_EVENT_TYPE = Claw.EventType("signal_message", "A new Signal message")
+# Filterable-field declarations mirror `event_extra` below; keep them in sync.
+const MESSAGE_EVENT_TYPE = Claw.EventType("signal_message", "A new Signal message",
+    ["\$.extra.direct_ping" => "true when the message is a DM or mentions the bot",
+     "\$.extra.user_id" => "sender's Signal identifier",
+     "\$.extra.user_name" => "sender's display name",
+     "\$.extra.is_group" => "true for group chats",
+     "\$.extra.source_timestamp" => "sender-side message timestamp"])
 
 Base.@kwdef mutable struct SignalEventSource <: Claw.EventSource
     number::String = get(ENV, "SIGNAL_NUMBER", "")

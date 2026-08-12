@@ -101,8 +101,20 @@ end
 
 # ─── Event Types & Handlers ───
 
-const MESSAGE_EVENT_TYPE = Claw.EventType("msteams_message", "A new message activity in Microsoft Teams")
-const REACTION_EVENT_TYPE = Claw.EventType("msteams_reaction", "A reaction added or removed in Microsoft Teams")
+# Filterable-field declarations mirror `event_extra` below; keep them in sync.
+const MESSAGE_EVENT_TYPE = Claw.EventType("msteams_message", "A new message activity in Microsoft Teams",
+    ["\$.extra.direct_ping" => "true when the bot was mentioned or the conversation is personal",
+     "\$.extra.user_id" => "sender's Teams user id",
+     "\$.extra.user_name" => "sender's display name",
+     "\$.extra.message_id" => "Teams activity/message id",
+     "\$.extra.activity" => "raw Bot Framework activity object (advanced)"])
+const REACTION_EVENT_TYPE = Claw.EventType("msteams_reaction", "A reaction added or removed in Microsoft Teams",
+    ["\$.extra.reaction" => "reaction type (e.g. like, heart)",
+     "\$.extra.action" => "added or removed",
+     "\$.extra.user_id" => "reactor's Teams user id",
+     "\$.extra.user_name" => "reactor's display name",
+     "\$.extra.message_id" => "Teams activity/message id",
+     "\$.extra.activity" => "raw Bot Framework activity object (advanced)"])
 
 const REACTION_HANDLER_PROMPT = """
 A user reacted to one of your messages. Interpret the reaction and respond appropriately:

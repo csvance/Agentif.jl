@@ -217,6 +217,10 @@ EventFilter(:prompt, "a real person wrote it")  # one-shot LLM classifier per ev
 
 JSONPath filters evaluate against `{"name": ..., "content": ... (parsed as JSON
 when possible), "extra": ...}` with a `$.a.b`, `['name']`, `[0]`, `[*]` subset.
+Each source documents its filterable fields on its `EventType` declarations
+(`EventType(name, description, ["$.extra.repo" => "owner/name", ...])`), and
+`list_event_types` renders them — so the agent can write paths without guessing
+key names.
 Filters run per event *before* coalescing; a `:prompt` filter that cannot reach
 the model sends the event to the pipeline's retry ladder rather than silently
 dropping or delivering it. The `add_event_handler` tool takes

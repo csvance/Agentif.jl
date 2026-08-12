@@ -137,10 +137,24 @@ include("filters.jl")
 
 # ─── Core types ───
 
+"""
+    EventType(name, description, fields = Pair{String, String}[])
+
+An event type a source can produce. `fields` documents the JSONPath-addressable
+values a `:jsonpath` [`EventFilter`](@ref) can match for this type — each entry is
+`path => short description` with paths as the agent would write them (usually
+`"\$.extra.<key>"`, occasionally `"\$.content..."`). Purely descriptive: it feeds
+`list_event_types` so subscription filters can be written without guessing key
+names. Sources should keep the declarations next to their `event_extra` methods.
+"""
 struct EventType
     name::String
     description::String
+    fields::Vector{Pair{String, String}}
 end
+
+EventType(name::AbstractString, description::AbstractString) =
+    EventType(String(name), String(description), Pair{String, String}[])
 
 """
     EventHandler(id, event_types, prompt, channel_id = nothing; tools = nothing, trust = :owner)
@@ -829,16 +843,36 @@ const LIST_EVENT_TYPES_TOOL = @tool """List all registered event types with thei
 
 Event types define the kinds of events the system can produce (e.g., "repl_input", "jmap_new_email", "tempus_job:daily-report"). Each event type can have event handlers attached to it via add_event_handler.
 
-When to use: Before calling add_event_handler, to see what event types are available to listen for.
+When to use: Before calling add_event_handler, to see what event types are available to listen for — and, when writing a "jsonpath" subscription filter, which fields each type carries.
 
 Arguments: none.
 
-Returns one line per event type: "- name: description".""" function list_event_types()
+Returns one line per event type ("- name: description"), followed by that type's filterable fields (indented "path — description" lines) when the source documents them. Those paths are exactly what a "jsonpath" filter_expr in add_event_handler can match against.""" function list_event_types()
     a = get_current_assistant()
     a === nothing && return "No assistant initialized"
+    # Field documentation lives on the live sources' EventType declarations (the
+    # claw_event_types table stores only name + description, and is purged and
+    # re-seeded from sources at init anyway).
+    fields_by_type = Dict{String, Vector{Pair{String, String}}}()
+    lock(EVENT_SOURCES_LOCK) do
+        for es in EVENT_SOURCES
+            ets = try
+                get_event_types(es)
+            catch e
+                @debug "Claw: get_event_types failed while listing" source = typeof(es) exception = (e,)
+                EventType[]
+            end
+            for et in ets
+                isempty(et.fields) || (fields_by_type[et.name] = et.fields)
+            end
+        end
+    end
     lines = String[]
     for row in SQLite.DBInterface.execute(a.db, "SELECT name, description FROM claw_event_types")
         push!(lines, "- $(row.name): $(row.description)")
+        for (path, desc) in get(() -> Pair{String, String}[], fields_by_type, String(row.name))
+            push!(lines, "    $path — $desc")
+        end
     end
     isempty(lines) ? "No event types registered" : join(lines, "\n")
 end
@@ -926,7 +960,7 @@ Arguments:
 Optional subscription filter (narrows which events fire the handler; omit all three for every event):
 - filter_type (String, optional): One of "regex", "jsonpath", "prompt".
   - "regex": filter_expr is a regex matched against the event's text content. Example: expr="(?i)urgent|asap".
-  - "jsonpath": filter_expr is a JSONPath (subset: \$.name, ['name'], [0], [*]) evaluated against {"name": event type, "content": event content (parsed as JSON when possible), "extra": source metadata}. Without filter_pattern, passes when the path matches any value; with filter_pattern (a regex), at least one matched value's string form must match it. Example: expr="\$.extra.repo", pattern="^quinnj/".
+  - "jsonpath": filter_expr is a JSONPath (subset: \$.name, ['name'], [0], [*]) evaluated against {"name": event type, "content": event content (parsed as JSON when possible), "extra": source metadata}. Without filter_pattern, passes when the path matches any value; with filter_pattern (a regex), at least one matched value's string form must match it. Example: expr="\$.extra.repo", pattern="^quinnj/". Use list_event_types to see each event type's documented filterable fields before writing a path — do not guess key names.
   - "prompt": filter_expr is natural-language criteria judged per event by a one-shot LLM classifier. Costs one small model call per event. Example: expr="the email is from a real person, not an automated notification".
 - filter_expr (String, required with filter_type): the pattern/path/criteria.
 - filter_pattern (String, optional): only for "jsonpath" — regex applied to extracted values.

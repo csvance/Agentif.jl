@@ -226,8 +226,19 @@ Claw.event_extra(ev::MattermostReactionEvent) = Dict{String, Any}(
 
 # ─── Event Types & Handlers ───
 
-const MESSAGE_EVENT_TYPE = Claw.EventType("mattermost_message", "A new message posted in a Mattermost channel")
-const REACTION_EVENT_TYPE = Claw.EventType("mattermost_reaction", "An emoji reaction added to a message in Mattermost")
+# Filterable-field declarations mirror `event_extra` above; keep them in sync.
+const MESSAGE_EVENT_TYPE = Claw.EventType("mattermost_message", "A new message posted in a Mattermost channel",
+    ["\$.extra.direct_ping" => "true when the bot was @-mentioned or the message is a DM",
+     "\$.extra.user_id" => "sender's Mattermost user id",
+     "\$.extra.user_name" => "sender's username",
+     "\$.extra.channel_type" => "Mattermost channel type (O public, P private, D direct, G group)",
+     "\$.extra.post_id" => "id of the triggering post"])
+const REACTION_EVENT_TYPE = Claw.EventType("mattermost_reaction", "An emoji reaction added to a message in Mattermost",
+    ["\$.extra.emoji" => "reaction emoji name",
+     "\$.extra.user_id" => "reactor's Mattermost user id",
+     "\$.extra.user_name" => "reactor's username",
+     "\$.extra.channel_type" => "Mattermost channel type (O public, P private, D direct, G group)",
+     "\$.extra.post_id" => "id of the post reacted to"])
 
 const REACTION_HANDLER_PROMPT = """
 A user reacted to one of your messages with an emoji. Interpret the reaction and respond appropriately:

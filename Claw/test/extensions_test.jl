@@ -1229,4 +1229,83 @@ end
     @test !isempty(Agentif.create_channel_tools(replayed_channel))
 end
 
+# ─── Declared filterable fields match event_extra ───
+#
+# Every "$.extra.<key>" an EventType documents must actually appear in that
+# event's `event_extra`, and every documented path must parse as a valid
+# :jsonpath filter path — otherwise list_event_types teaches the agent paths
+# that can never match.
+
+_declared_extra_keys(et::Claw.EventType) =
+    [String(chopprefix(p.first, "\$.extra.")) for p in et.fields if startswith(p.first, "\$.extra.")]
+
+function _check_event_fields(et::Claw.EventType, ev::Claw.Event)
+    @test !isempty(et.fields)
+    for (path, desc) in et.fields
+        @test Claw._parse_jsonpath(path) isa Vector
+        @test !isempty(desc)
+    end
+    actual = Set(String.(keys(Claw.event_extra(ev))))
+    for key in _declared_extra_keys(et)
+        @test key in actual
+    end
+end
+
+@testset "declared filterable fields match event_extra" begin
+    slack_ext = Base.get_extension(Claw, :ClawSlackExt)
+    wc = Slack.WebClient(; token = "xoxb-test")
+    sch = slack_ext.SlackChannel("C1", "1700000000.100", "1700000000.100", "1700000000.100",
+        wc, nothing, nothing, "U1", "alice", "channel", nothing, nothing, "")
+    _check_event_fields(slack_ext.MESSAGE_EVENT_TYPE, slack_ext.SlackMessageEvent(sch, "hi", true))
+    _check_event_fields(slack_ext.REACTION_EVENT_TYPE,
+        slack_ext.SlackReactionEvent(sch, "thumbsup", "alice", "1700000000.100"))
+
+    tg_ext = Base.get_extension(Claw, :ClawTelegramExt)
+    tg_client = Telegram.Client("test-token", "https://example.invalid/")
+    tch = tg_ext.TelegramChannel(-100123, Int64(42), tg_client, IOBuffer(), "user-1", "Alice", "supergroup")
+    _check_event_fields(tg_ext.MESSAGE_EVENT_TYPE, tg_ext.TelegramMessageEvent(tch, "hello", true))
+    _check_event_fields(tg_ext.REACTION_EVENT_TYPE,
+        tg_ext.TelegramReactionEvent(tch, "thumbsup", "Alice", Int64(42)))
+
+    sig_ext = Base.get_extension(Claw, :ClawSignalExt)
+    sig_client = Signal.Client("+15550000000", "http://127.0.0.1:8080")
+    sigch = sig_ext.SignalChannel("+15550000000", sig_client, nothing, "u-1", "Alice", false, "1700000000", "Alice")
+    _check_event_fields(sig_ext.MESSAGE_EVENT_TYPE, sig_ext.SignalMessageEvent(sigch, "hi", true))
+
+    mm_ext = Base.get_extension(Claw, :ClawMattermostExt)
+    mm_client = Mattermost.Client("test-token", "https://example.invalid/api/v4/")
+    mch = mm_ext.MattermostChannel("chan-1", "root-1", "post-1", "post-1", mm_client,
+        nothing, nothing, "user-1", "alice", "D", "Test Channel")
+    _check_event_fields(mm_ext.MESSAGE_EVENT_TYPE, mm_ext.MattermostMessageEvent(mch, "hello", true))
+    _check_event_fields(mm_ext.REACTION_EVENT_TYPE,
+        mm_ext.MattermostReactionEvent(mch, "thumbsup", "alice", "post-1"))
+
+    ms_ext = Base.get_extension(Claw, :ClawMSTeamsExt)
+    ms_client = MSTeams.BotClient(; app_id = "app-id", app_password = "secret")
+    activity = Dict{String, Any}(
+        "type" => "message", "id" => "activity-1", "text" => "hello",
+        "from" => Dict("id" => "user-1", "name" => "Alice"),
+        "conversation" => Dict("id" => "conv-1", "conversationType" => "channel"),
+    )
+    msch = ms_ext.MSTeamsChannel(ms_client, activity, "user-1", "Alice", "conv-1", "channel", "activity-1", nothing, "Alice")
+    _check_event_fields(ms_ext.MESSAGE_EVENT_TYPE, ms_ext.MSTeamsMessageEvent(msch, "hi", true))
+    _check_event_fields(ms_ext.REACTION_EVENT_TYPE, ms_ext.MSTeamsReactionEvent(msch, "like", "Alice", "added"))
+
+    if HAS_GITHUB
+        gh_ext = Base.get_extension(Claw, :ClawGitHubExt)
+        gh_ev = gh_ext.GitHubWebhookEvent("github_push", "push", "",
+            Dict{String, Any}("ref" => "refs/heads/main"), "owner/repo", "alice")
+        for et in Claw.get_event_types(gh_ext.GitHubEventSource(; secret = "s"))
+            _check_event_fields(et, gh_ev)
+        end
+    end
+
+    if HAS_JMAP
+        jm_ext = Base.get_extension(Claw, :ClawJMAPExt)
+        jm_ev = jm_ext.JMAPNewEmailEvent("acc-1", "email-1", "thread-1", ["mb-1"],
+            "a@example.com", "Subject", "2026-01-01T00:00:00Z", "preview", true, false)
+        _check_event_fields(jm_ext.NEW_EMAIL_EVENT_TYPE, jm_ev)
+    end
+end
+
 end # module ExtensionTests
