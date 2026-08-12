@@ -34,12 +34,40 @@ using Juco
 Juco.repl()                      # interactive session
 Juco.evaluate("fix the bug")     # one programmatic turn
 Juco.main(["-p", "explain this repo", "--preset", "pi"])  # CLI form
+Juco.install_cli()               # write a `juco` shell launcher to ~/.local/bin
 ```
 
-Configuration via environment: `JUCO_MODEL_PROVIDER` / `JUCO_MODEL` select the model
-(defaults: `anthropic` / `claude-sonnet-4-5`); the API key comes from the provider's
-conventional env var (`ANTHROPIC_API_KEY`, `XAI_API_KEY`, ...) or `JUCO_API_KEY`.
-See `Juco.main(["-h"])` for all CLI flags.
+On Julia 1.12 or later, the package entry point also runs directly:
+
+```sh
+julia --project=. -m Juco --help
+```
+
+Or live inside the standard Julia REPL, Pkg-style:
+
+```julia
+using Juco, ReplMaker
+Juco.repl_mode!()   # press } at an empty julia> prompt for a juco> mode
+```
+
+The REPL shows tool calls as compact one-liners (`▸ bash julia test.jl ✓ 0.4s`),
+streams model reasoning dimmed as it happens, renders final answers as Markdown,
+and prints a per-turn usage line (`⏱ 12s · 5 tools · 18k in (38% cached) · $0.002`).
+Slash commands: `/help`, `/new`, `/sessions`, `/resume`, `/model`, `/skills`, `/memories`.
+End a line with `\\` to continue on the next line. Ctrl-C interrupts the current
+response, not the session; `NO_COLOR` is respected.
+
+Interactive sessions use the model state stored in SQLite. A new database starts
+in OpenRouter mode with `deepseek/deepseek-v4-flash-0731`; use `/model` to select
+and persist another OpenRouter or Codex model. Codex mode requires a prior
+`LLMOAuth.codex_login()`.
+
+For `Juco.evaluate` and one-shot CLI calls, `JUCO_MODEL_PROVIDER` / `JUCO_MODEL`
+select the model (defaults: `anthropic` / `claude-sonnet-4-5`). The API key comes
+from the provider's conventional environment variable (`ANTHROPIC_API_KEY`,
+`OPENROUTER_API_KEY`, ...) or `JUCO_API_KEY`. `JUCO_REASONING` sets reasoning
+effort. `JUCO_OPENROUTER_ORDER` pins OpenRouter endpoint routing. See
+`Juco.main(["-h"])` for all CLI flags.
 
 ## Eval
 

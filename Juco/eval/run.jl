@@ -5,27 +5,73 @@
 #   julia --project=. Juco/eval/run.jl --preset juco         # one preset
 #   julia --project=. Juco/eval/run.jl --task fix-bug -v     # one task, verbose
 #
-# Model selection: JUCO_PROVIDER / JUCO_MODEL / JUCO_API_KEY (or provider key env).
+# Model selection: JUCO_MODEL_PROVIDER / JUCO_MODEL / JUCO_API_KEY (or provider key env).
 #
 # Each run gets a fresh temp working directory and a fresh temp sqlite db, so
 # runs are independent (no memory/session bleed between tasks).
 
 using Juco
+using Agentif
 
 include(joinpath(@__DIR__, "tasks.jl"))
 
-function run_one(task, preset::Symbol; verbose::Bool = false, max_turns::Int = 25, kw...)
+# Transcript writer: records assistant reasoning/text/tool calls and tool
+# results to a plain-text file so eval runs can be analyzed closely.
+# Tool events fire from concurrent tasks, so writes are serialized by a lock.
+function transcript_recorder(io::IO)
+    lk = ReentrantLock()
+    return function (event)
+        lock(lk) do
+            _record_event(io, event)
+        end
+    end
+end
+
+function _record_event(io::IO, event)
+        if event isa Agentif.MessageEndEvent && event.message isa Agentif.AssistantMessage
+            for block in event.message.content
+                if block isa Agentif.ThinkingContent && !isempty(block.thinking)
+                    println(io, "--- reasoning ---\n", block.thinking)
+                elseif block isa Agentif.TextContent && !isempty(block.text)
+                    println(io, "--- assistant ---\n", block.text)
+                end
+            end
+        elseif event isa Agentif.ToolExecutionStartEvent
+            println(io, "--- tool call: ", event.tool_call.name, " ---\n", event.tool_call.arguments)
+        elseif event isa Agentif.ToolExecutionEndEvent
+            text = join((b.text for b in event.result.content if b isa Agentif.TextContent), "\n")
+            length(text) > 3000 && (text = first(text, 3000) * "\n...[transcript-truncated]")
+            println(io, "--- tool result", event.result.is_error ? " (ERROR)" : "",
+                " (", event.duration_ms, "ms) ---\n", text)
+    elseif event isa Agentif.AgentErrorEvent
+        println(io, "--- agent error ---\n", event.error)
+    end
+    flush(io)
+    return nothing
+end
+
+function run_one(task, preset::Symbol; verbose::Bool = false, max_turns::Int = 25,
+        transcript_dir::Union{Nothing, String} = nothing, kw...)
     mktempdir() do dir
         task.setup(dir)
-        jdb = Juco.opendb(joinpath(mktempdir(), "eval.sqlite"))
         io = verbose ? stdout : devnull
+        tio = transcript_dir === nothing ? nothing :
+            open(joinpath(transcript_dir, "$(preset)-$(task.name).txt"), "w")
         t0 = time()
         result = try
-            Juco.evaluate(task.prompt;
-                base_dir = dir, jdb, preset, io, show_tools = verbose, max_turns, kw...)
+            mktempdir() do db_dir
+                Juco.with_jdb(joinpath(db_dir, "eval.sqlite")) do jdb
+                    Juco.evaluate(task.prompt;
+                        base_dir = dir, jdb, preset, io, show_tools = verbose, max_turns,
+                        on_event = tio === nothing ? nothing : transcript_recorder(tio), kw...)
+                end
+            end
         catch e
             verbose && showerror(stderr, e, catch_backtrace())
+            tio === nothing || println(tio, "--- runner exception ---\n", sprint(showerror, e))
             nothing
+        finally
+            tio === nothing || close(tio)
         end
         elapsed = time() - t0
         passed = try
@@ -40,16 +86,19 @@ function run_one(task, preset::Symbol; verbose::Bool = false, max_turns::Int = 2
             aborted = result === nothing ? true : result.aborted,
             tokens_in = usage === nothing ? 0 : usage.input + usage.cacheRead + usage.cacheWrite,
             tokens_out = usage === nothing ? 0 : usage.output,
+            tokens_cached = usage === nothing ? 0 : usage.cacheRead,
             seconds = round(elapsed; digits = 1),
         )
     end
 end
 
-function run_eval(; presets = [:bash, :juco, :pi], tasks = TASKS, verbose::Bool = false, kw...)
+function run_eval(; presets = [:bash, :juco, :pi], tasks = TASKS, verbose::Bool = false,
+        transcript_dir::Union{Nothing, String} = nothing, kw...)
+    transcript_dir === nothing || mkpath(transcript_dir)
     results = []
     for preset in presets, task in tasks
         print(stderr, "running $(preset)/$(task.name) ... ")
-        r = run_one(task, preset; verbose, kw...)
+        r = run_one(task, preset; verbose, transcript_dir, kw...)
         println(stderr, r.passed ? "PASS" : "FAIL", " ($(r.tool_calls) calls, $(r.seconds)s)")
         push!(results, r)
     end

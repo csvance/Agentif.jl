@@ -2,7 +2,32 @@
 
 default_provider() = get(ENV, "JUCO_MODEL_PROVIDER", "anthropic")
 default_model() = get(ENV, "JUCO_MODEL", "claude-sonnet-4-5")
+default_reasoning() = let v = get(ENV, "JUCO_REASONING", ""); isempty(v) ? nothing : v end
+# Coding agents want low-variance sampling; JUCO_TEMPERATURE="" disables the pin.
+function default_temperature()
+    raw = get(ENV, "JUCO_TEMPERATURE", "0.2")
+    isempty(raw) && return nothing
+    value = tryparse(Float64, raw)
+    value === nothing && throw(ArgumentError("JUCO_TEMPERATURE must be a number or empty"))
+    return value
+end
 const DEFAULT_MAX_TURNS = 50
+
+# OpenRouter routing preferences. Sorting by price keeps routing stable so
+# upstream prompt caches stay warm across a session's turns (round-robin
+# routing defeats them) — but with a quality floor: endpoints must support all
+# request parameters (tools!) and fp4-class quantizations are excluded, since
+# an fp4 endpoint was observed emitting raw tool-call markup as text.
+# JUCO_OPENROUTER_ORDER pins specific endpoint tags, comma-separated.
+function openrouter_provider_prefs()
+    order = get(ENV, "JUCO_OPENROUTER_ORDER", "")
+    isempty(order) || return Dict{String, Any}("order" => strip.(split(order, ",")), "allow_fallbacks" => true)
+    return Dict{String, Any}(
+        "sort" => "price",
+        "require_parameters" => true,
+        "quantizations" => ["fp8", "int8", "fp16", "bf16", "unknown"],
+    )
+end
 
 const PROVIDER_KEY_ENV = Dict(
     "anthropic" => "ANTHROPIC_API_KEY",
@@ -21,20 +46,54 @@ function resolve_apikey(provider::String)
     error("No API key found: set JUCO_API_KEY$(isempty(env_var) ? "" : " or $env_var")")
 end
 
-# ─── Terminal channel: routes streamed assistant text to an IO, and gives the
-# session middleware a stable branch id (= the Juco session id). ───
+# ─── Terminal channel: collects streamed assistant text and gives the session
+# middleware a stable branch id (= the Juco session id). Text is buffered per
+# assistant message and rendered as Markdown when the message completes — tool
+# activity and reasoning stream live in between (see display.jl), so the
+# terminal stays responsive while answers come out cleanly formatted. ───
 
 struct TerminalChannel <: Agentif.AbstractChannel
     session_id::String
     io::IO
+    buf::IOBuffer
+    markdown::Bool
+    io_lock::ReentrantLock
 end
+
+TerminalChannel(session_id::String, io::IO; markdown::Bool = true,
+        io_lock::ReentrantLock = ReentrantLock()) =
+    TerminalChannel(session_id, io, IOBuffer(), markdown, io_lock)
 
 Agentif.channel_id(ch::TerminalChannel) = ch.session_id
 Agentif.start_streaming(::TerminalChannel) = nothing
-Agentif.append_to_stream(ch::TerminalChannel, delta) = (print(ch.io, delta); flush(ch.io))
-Agentif.finish_streaming(ch::TerminalChannel) = println(ch.io)
-Agentif.send_message(ch::TerminalChannel, msg) = println(ch.io, msg)
-Agentif.close_channel(::TerminalChannel) = nothing
+Agentif.append_to_stream(ch::TerminalChannel, delta) = lock(ch.io_lock) do
+    write(ch.buf, delta)
+end
+
+function render_text(ch::TerminalChannel)
+    lock(ch.io_lock) do
+        text = strip(String(take!(ch.buf)))
+        isempty(text) && return
+        if ch.markdown && use_color(ch.io)
+            try
+                show(IOContext(ch.io, :color => true), MIME("text/plain"), Markdown.parse(String(text)))
+                println(ch.io)
+            catch
+                println(ch.io, text)
+            end
+        else
+            println(ch.io, text)
+        end
+        flush(ch.io)
+    end
+    return
+end
+
+Agentif.finish_streaming(ch::TerminalChannel) = render_text(ch)
+Agentif.send_message(ch::TerminalChannel, msg) = lock(ch.io_lock) do
+    println(ch.io, msg)
+end
+Agentif.close_channel(ch::TerminalChannel) = render_text(ch)  # flush any tail text
 
 # ─── Agent construction ───
 
@@ -46,108 +105,591 @@ function build_agent(;
         model_id::String = default_model(),
         apikey::String = "",
         memory_limit::Int = 50,
+        max_turns::Union{Nothing, Int} = nothing,
     )
     model = getModel(provider, model_id)
     model === nothing && error("Unknown model: provider=$(repr(provider)) model_id=$(repr(model_id))")
     isempty(apikey) && (apikey = resolve_apikey(provider))
     mems = (jdb !== nothing && preset === :juco) ? memories(jdb; limit = memory_limit) : String[]
     return Agentif.Agent(
-        prompt = build_prompt(base_dir, preset; memories = mems),
+        prompt = build_prompt(base_dir, preset; memories = mems, max_turns),
         model = model,
         apikey = apikey,
         tools = toolset(preset, base_dir, jdb),
     )
 end
 
+# Tool instrumentation: appended to each tool result as needed —
+#   - budget notice: warn the model when the tool-call budget runs low, so it
+#     wraps up instead of being cut off mid-flight (SWE-agent's pattern)
+#   - steering: user messages typed while the model works are delivered with
+#     the next completed tool result (`on_steer` fires at delivery, so the UI
+#     can show exactly when a queued message became active)
+const BUDGET_WARN_MARGIN = 5
+
+function instrument_tool(tool::Agentif.AgentTool{F, T}, counter::Threads.Atomic{Int}, max_turns::Int,
+        steer::Union{Nothing, Channel{String}}, on_steer::Union{Nothing, Function},
+        steer_lock::ReentrantLock = ReentrantLock()) where {F, T}
+    wrapped = function (args...)
+        result = tool.func(args...)
+        result isa String || return result
+        if steer !== nothing
+            texts = drain_steering!(steer, steer_lock)
+            if !isempty(texts)
+                on_steer === nothing || foreach(on_steer, texts)
+                result *= "\n\n[the user interjected with new instructions — take them into account now]:\n" *
+                    join(texts, "\n")
+            end
+        end
+        used = counter[]
+        if used >= max_turns - BUDGET_WARN_MARGIN
+            remaining = max(0, max_turns - used)
+            result *= "\n\n[harness: only $(remaining) tool calls remain — wrap up now: make your final change and verify]"
+        end
+        return result
+    end
+    return Agentif.AgentTool{typeof(wrapped), T}(;
+        name = tool.name, description = tool.description, strict = tool.strict, func = wrapped)
+end
+
+function drain_steering!(steer::Channel{String}, steer_lock::ReentrantLock)
+    return lock(steer_lock) do
+        texts = String[]
+        while isready(steer)
+            push!(texts, take!(steer))
+        end
+        texts
+    end
+end
+
+# kept for API/tests compatibility: budget-only instrumentation
+with_budget_notice(tool::Agentif.AgentTool, counter::Threads.Atomic{Int}, max_turns::Int) =
+    instrument_tool(tool, counter, max_turns, nothing, nothing)
+
 # ─── One-shot evaluation (used by the REPL per turn, and by the eval harness) ───
 
 """
-    Juco.evaluate(input; kw...) -> (; state, session_id, tool_calls, aborted)
+    Juco.evaluate(input; kw...) -> (; state, session_id, tool_calls, aborted, ctx_pct)
 
 Run one agent turn. Session history is persisted to (and reloaded from) the
 SQLite db under `session_id`, so repeated calls with the same `session_id`
 continue the conversation.
 """
 function evaluate(input::AbstractString;
-        base_dir::AbstractString = pwd(),
         db_path::AbstractString = DEFAULT_DB_PATH,
-        jdb::JucoDB = opendb(db_path),
+        jdb::Union{Nothing, JucoDB} = nothing,
+        kw...,
+    )
+    jdb === nothing && return with_jdb(db_path) do owned_jdb
+        _evaluate(input; jdb = owned_jdb, kw...)
+    end
+    return _evaluate(input; jdb, kw...)
+end
+
+function _evaluate(input::AbstractString;
+        base_dir::AbstractString = pwd(),
+        jdb::JucoDB,
         session_id::Union{Nothing, AbstractString} = nothing,
         io::IO = stdout,
         show_tools::Bool = true,
+        show_reasoning::Bool = true,
+        show_usage::Bool = false,
         max_turns::Int = DEFAULT_MAX_TURNS,
+        reasoning_effort::Union{Nothing, String} = default_reasoning(),
+        temperature::Union{Nothing, Real} = default_temperature(),
+        on_event::Union{Nothing, Function} = nothing,
+        abort::Agentif.Abort = Agentif.Abort(),
+        steer::Union{Nothing, Channel{String}} = nothing,
+        on_steer::Union{Nothing, Function} = nothing,
+        io_lock::ReentrantLock = ReentrantLock(),
         level = nothing,
         kw...,
     )
     sid = session_id === nothing ? "juco-" * string(Agentif.UID8()) : String(session_id)
-    touch_session!(jdb, sid; title = first(String(input), 80), cwd = abspath(base_dir))
-    agent = build_agent(; base_dir, jdb, kw...)
-    ch = TerminalChannel(sid, io)
-    abort = Agentif.Abort()
+    agent = build_agent(; base_dir, jdb, max_turns, kw...)
+    ch = TerminalChannel(sid, io; io_lock)
     # tool executions run on concurrent tasks, so the counter must be atomic
     tool_calls = Threads.Atomic{Int}(0)
+    steer_lock = ReentrantLock()
+    agent = Agentif.with_tools(agent,
+        Agentif.AgentTool[instrument_tool(t, tool_calls, max_turns, steer, on_steer, steer_lock) for t in agent.tools])
+    disp = show_tools ? display_handler(io; show_reasoning, io_lock) : nothing
+    fatal_error = Ref{Union{Nothing, Exception}}(nothing)
     handler = function (event)
         if event isa Agentif.ToolExecutionStartEvent
             n = Threads.atomic_add!(tool_calls, 1) + 1
-            if n > max_turns
-                Agentif.abort!(abort)
-            elseif show_tools
-                args = replace(event.tool_call.arguments, '\n' => "\\n")
-                println(io, "\e[2m[$(event.tool_call.name)] $(first(args, 160))\e[0m")
-            end
-        elseif event isa Agentif.AgentErrorEvent && show_tools
-            println(io, "\e[31m[error] $(event.error)\e[0m")
+            n > max_turns && Agentif.abort!(abort)
         end
+        fatal = event isa Agentif.AgentErrorEvent &&
+            !startswith(sprint(showerror, event.error), "SSE stream interrupted:")
+        fatal && (fatal_error[] = event.error)
+        (disp === nothing || fatal) || disp(event)
+        on_event === nothing || on_event(event)
         return nothing
     end
+    eval_kw = reasoning_options(agent.model, reasoning_effort)
+    is_openrouter = agent.model.provider == "openrouter"
+    is_openrouter && (eval_kw = merge(eval_kw, (; provider = openrouter_provider_prefs())))
+    # codex manages its own sampling; other completions APIs take a temperature pin
+    temperature !== nothing && agent.model.provider != "openai-codex" &&
+        (eval_kw = merge(eval_kw, (; temperature = Float64(temperature))))
+    t0 = time()
     state = Agentif.evaluate(handler, agent, String(input);
-        session_store = jdb.session_store, channel = ch, abort, level)
-    return (; state, session_id = sid, tool_calls = tool_calls[], aborted = Agentif.isaborted(abort))
+        session_store = jdb.session_store, channel = ch, abort, level, eval_kw...)
+    fatal_error[] === nothing || throw(fatal_error[])
+    touch_session!(jdb, sid; title = first(String(input), 80), cwd = abspath(base_dir))
+    ctx_pct = context_percent(agent, state)
+    if show_usage
+        lock(io_lock) do
+            println(io, dim(io, usage_line(state.usage, agent.model, tool_calls[], time() - t0; ctx_pct)))
+        end
+    end
+    return (; state, session_id = sid, tool_calls = tool_calls[],
+        aborted = Agentif.isaborted(abort), ctx_pct)
+end
+
+# OpenRouter enables some reasoning models by default. An omitted setting does
+# not mean "none", so send the user's disabled selection explicitly.
+function reasoning_options(model, reasoning_effort::Union{Nothing, AbstractString})
+    if model.provider == "openrouter" && model.reasoning
+        return (; reasoning = Dict("effort" => something(reasoning_effort, "none")))
+    elseif reasoning_effort === nothing
+        return (;)
+    end
+    return (; reasoning_effort = String(reasoning_effort))
+end
+
+# Estimated share of the model's context window occupied by the conversation.
+function context_percent(agent::Agentif.Agent, state::Agentif.AgentState)
+    cw = agent.model.contextWindow
+    cw > 0 || return nothing
+    est = Agentif.estimate_context_tokens(state.messages) + cld(ncodeunits(agent.prompt), 4)
+    return clamp(round(Int, 100 * est / cw), 0, 100)
 end
 
 # ─── REPL / CLI ───
 
+const REPL_TIPS = [
+    "type \$ then tab in juco> mode to inject a skill into your prompt",
+    "keep typing while I work — your message steers me at the next tool boundary",
+    "/model picks the mode, model, and reasoning level; the choice persists",
+    "/copy puts my last answer on the clipboard; /compact folds old context",
+    "end a line with \\ to keep typing on the next line",
+]
+
+const REPL_HELP = """
+/help                 show this help
+/new                  start a new session
+/sessions             list recent sessions
+/resume [id]          pick a past session to resume (menu when no id)
+/model [mode] [id]    choose model mode, model, and reasoning (menus when no args)
+/skills               list \$skills discovered from ~/.agent/skills and ./.agent/skills
+/memories             list saved memories
+/copy                 copy the last answer to the clipboard
+/compact              fold older context into a summary on the next message
+/quit                 exit (also: exit, quit, ctrl-d)
+Use \$skill-name in a prompt to inject a skill (tab-completes in juco> mode).
+Typing while the model works queues a steering message for the next tool boundary.
+End a line with \\ to continue typing on the next line.
+Ctrl-C during a response interrupts that response, not the REPL."""
+
+# Mutable REPL state threaded through slash commands. Model selection is
+# persistent (sqlite config); skills are re-discovered each launch.
+mutable struct ReplState
+    jdb::JucoDB
+    session_id::String
+    mode::String
+    model_id::String
+    reasoning::Union{Nothing, String}
+    skills::Vector{Skill}
+    base_dir::String
+    quit::Bool
+    force_compact::Bool
+    last_answer::String
+    last_ctx_pct::Union{Nothing, Int}
+end
+
+function ReplState(jdb::JucoDB, session_id::String; base_dir::AbstractString = pwd())
+    mode, model_id, reasoning = load_model_state(jdb)
+    return ReplState(jdb, session_id, mode, model_id, reasoning,
+        discover_skills(base_dir), String(abspath(base_dir)), false, false, "", nothing)
+end
+
+model_label(st::ReplState) =
+    "$(st.mode) · $(st.model_id)" * (st.reasoning === nothing ? "" : " · $(st.reasoning)")
+
+function switch_session!(st::ReplState, session_id::AbstractString)
+    st.session_id = String(session_id)
+    st.force_compact = false
+    st.last_answer = ""
+    st.last_ctx_pct = nothing
+    return nothing
+end
+
+function handle_command(st::ReplState, input::AbstractString, io::IO)
+    parts = split(strip(input))
+    cmd = parts[1]
+    if cmd == "/help"
+        println(io, REPL_HELP)
+    elseif cmd == "/new"
+        switch_session!(st, "juco-" * string(Agentif.UID8()))
+        println(io, dim(io, "new session $(st.session_id)"))
+    elseif cmd == "/sessions"
+        sessions = list_sessions(st.jdb)
+        isempty(sessions) && return println(io, "No sessions.")
+        for s in sessions
+            ts = Dates.format(Dates.unix2datetime(s.updated_at), "yyyy-mm-dd HH:MM")
+            marker = s.id == st.session_id ? "* " : "  "
+            println(io, marker, s.id, dim(io, "  $(ts)  $(first(s.title, 60))"))
+        end
+    elseif cmd == "/resume"
+        if length(parts) >= 2
+            switch_session!(st, parts[2])
+            println(io, dim(io, "resumed $(st.session_id)"))
+        else
+            resume_menu!(st, io)
+        end
+    elseif cmd == "/model"
+        if length(parts) == 1
+            model_menu!(st, io)
+        else
+            length(parts) <= 3 || return println(io, red(io,
+                "usage: /model [mode] [model-id]"))
+            mode, mid = if length(parts) == 3
+                String(parts[2]), String(parts[3])
+            elseif parts[2] in MODEL_MODES
+                String(parts[2]), MODE_DEFAULT_MODEL[String(parts[2])]
+            else
+                st.mode, String(parts[2])
+            end
+            mode in MODEL_MODES || return println(io, red(io, "unknown mode: $(mode) (expected $(join(MODEL_MODES, " or ")))"))
+            getModel(mode_provider(mode), mid) === nothing && return println(io, red(io, "unknown model: $(mode)/$(mid)"))
+            st.mode, st.model_id = mode, mid
+            st.reasoning in reasoning_levels(mode, mid) || (st.reasoning = nothing)
+            save_model_state!(st.jdb, st.mode, st.model_id, st.reasoning)
+            println(io, dim(io, "model set: $(model_label(st))"))
+        end
+    elseif cmd == "/skills"
+        isempty(st.skills) && return println(io, "No skills found in $(join(skill_dirs(st.base_dir), " or ")).")
+        for s in st.skills
+            println(io, "\$", s.name, dim(io, isempty(s.description) ? "" : "  — $(s.description)"))
+        end
+    elseif cmd == "/memories"
+        mems = memories(st.jdb)
+        isempty(mems) && return println(io, "No memories.")
+        foreach(m -> println(io, "- ", m), mems)
+    elseif cmd == "/copy"
+        isempty(st.last_answer) && return println(io, "Nothing to copy yet.")
+        clip = Sys.isapple() ? `pbcopy` : Sys.iswindows() ? `clip` : `xclip -selection clipboard`
+        ok = try
+            open(clip, "w") do p
+                write(p, st.last_answer)
+            end
+            true
+        catch
+            false
+        end
+        println(io, ok ? dim(io, "copied the last answer ($(length(st.last_answer)) chars)") :
+            red(io, "clipboard tool unavailable ($(clip.exec[1]))"))
+    elseif cmd == "/compact"
+        st.force_compact = true
+        println(io, dim(io, "⇣ compaction armed — older context folds into a summary on your next message"))
+    elseif cmd == "/quit"
+        st.quit = true
+    else
+        println(io, red(io, "unknown command $(cmd)"), " — /help for commands")
+    end
+    return nothing
+end
+
+# Read one logical input: trailing backslash continues on the next line.
+# Returns nothing on EOF. When context usage is high, the prompt says so
+# (e.g. `juco 72%>`), pointing at /compact before quality degrades.
+function read_input(io::IO; ctx_pct::Union{Nothing, Int} = nothing)
+    label = ctx_pct !== nothing && ctx_pct >= 60 ? "juco $(ctx_pct)%> " : "juco> "
+    print(io, bold(io, label))
+    raw = readline(stdin; keep = true)
+    isempty(raw) && return nothing
+    input = String(strip(raw))
+    while endswith(input, "\\")
+        input = chop(input; tail = 1)
+        print(io, bold(io, "  ..> "))
+        raw = readline(stdin; keep = true)
+        isempty(raw) && break
+        input *= "\n" * strip(raw)
+    end
+    return String(strip(input))
+end
+
+# Run one turn on a worker task so ctrl-c aborts the TURN (via Abort), not the
+# REPL. A second ctrl-c while aborting force-detaches.
+#
+# While the turn runs, a pump task reads stdin lines into the steering channel:
+# each line is shown as queued immediately, then echoed again (via on_steer)
+# at the moment a completed tool call actually delivers it to the model.
+function root_task_exception(e)
+    while e isa TaskFailedException
+        inner = e.task.exception
+        inner === e && break
+        e = inner
+    end
+    return e
+end
+
+function locked_println(io::IO, io_lock::ReentrantLock, xs...)
+    lock(io_lock) do
+        println(io, xs...)
+        flush(io)
+    end
+    return nothing
+end
+
+function turn_error_summary(e)
+    first_line = first(split(sprint(showerror, e), '\n'))
+    if occursin("No stored Codex credentials", first_line) ||
+            occursin("Stored Codex credentials were rejected", first_line)
+        return "Codex login required: run `using LLMOAuth; LLMOAuth.codex_login()`"
+    end
+    return first_line
+end
+
+function wait_turn(turn::Task, abort::Agentif.Abort, io::IO;
+        io_lock::ReentrantLock = ReentrantLock())
+    while true
+        try
+            return fetch(turn)
+        catch e
+            if e isa InterruptException
+                Agentif.abort!(abort)
+                locked_println(io, io_lock,
+                    "\n^C interrupting — waiting for the turn to stop (ctrl-c again to detach)")
+                status = try
+                    timedwait(() -> istaskdone(turn), 10.0; pollint = 0.1)
+                catch wait_error
+                    wait_error isa InterruptException || rethrow()
+                    locked_println(io, io_lock, "^C detached from the running turn")
+                    return nothing
+                end
+                status === :ok || return nothing
+            elseif e isa TaskFailedException
+                inner = root_task_exception(e)
+                inner isa InterruptException && return nothing
+                locked_println(io, io_lock, red(io, "error: " * turn_error_summary(inner)))
+                locked_println(io, io_lock, dim(io, "the session is intact — try again or rephrase"))
+                return nothing
+            else
+                rethrow()
+            end
+        end
+    end
+end
+
+function run_turn(st::ReplState, input::String, io::IO;
+        steering::Bool = stdin isa Base.TTY,
+        evaluator::Function = evaluate,
+        kw...,
+    )
+    expanded, used = expand_skills(input, st.skills)
+    isempty(used) || println(io, dim(io, "⚡ skills: " * join(used, ", ")))
+    abort = Agentif.Abort()
+    io_lock = ReentrantLock()
+    steer = steering ? Channel{String}(32) : nothing
+    steered = Threads.Atomic{Int}(0)
+    on_steer = steer === nothing ? nothing :
+        text -> begin
+            Threads.atomic_add!(steered, 1)
+            locked_println(io, io_lock, steer_active_line(io, text))
+        end
+    model = getModel(mode_provider(st.mode), st.model_id)
+    extra_kw = (;)
+    if st.force_compact
+        st.force_compact = false
+        cw = model === nothing ? 128_000 : model.contextWindow
+        extra_kw = (; compaction_config = Agentif.CompactionConfig(;
+            reserve_tokens = max(cw - 1_000, 1_000), keep_recent_tokens = 2_000))
+    end
+    t0 = time()
+    turn = @async evaluator(expanded; jdb = st.jdb, session_id = st.session_id,
+        base_dir = st.base_dir,
+        provider = mode_provider(st.mode), model_id = st.model_id,
+        apikey = mode_apikey(st.mode), reasoning_effort = st.reasoning,
+        io, show_usage = true, abort, steer, on_steer, io_lock, extra_kw..., kw...)
+    pump = steer === nothing ? nothing : @async begin
+        try
+            while !istaskdone(turn)
+                raw = readline(stdin; keep = true)
+                isempty(raw) && break  # EOF
+                s = strip(raw)
+                isempty(s) && continue
+                put!(steer, String(s))
+                locked_println(io, io_lock, steer_queued_line(io, s))
+            end
+        catch
+            # interrupted at turn end, or stdin closed — either way we're done
+        end
+    end
+    try
+        result = wait_turn(turn, abort, io; io_lock)
+        if result !== nothing
+            note_turn_result!(st, result, model)
+            steered[] > 0 && locked_println(io, io_lock,
+                dim(io, "↳ $(steered[]) steering message$(steered[] == 1 ? "" : "s") delivered"))
+        end
+        # ring the bell after long turns so a tabbed-away user notices
+        if time() - t0 > 30 && stdin isa Base.TTY
+            lock(io_lock) do
+                print(io, "\a")
+                flush(io)
+            end
+        end
+        return result
+    finally
+        steer === nothing || !isopen(steer) || close(steer)
+        if pump !== nothing
+            if !istaskdone(pump)
+                try
+                    schedule(pump, InterruptException(); error = true)
+                catch
+                end
+            end
+            try
+                wait(pump)
+            catch
+            end
+        end
+    end
+end
+
+# Record what the REPL wants to know about a finished turn: the final answer
+# text (/copy) and the estimated context share (prompt indicator).
+function note_turn_result!(st::ReplState, result, model)
+    msg = Agentif.last_assistant_message(result.state)
+    msg === nothing || (st.last_answer = Agentif.message_text(msg))
+    if hasproperty(result, :ctx_pct)
+        st.last_ctx_pct = result.ctx_pct
+    elseif model !== nothing && model.contextWindow > 0
+        est = Agentif.estimate_context_tokens(result.state.messages)
+        st.last_ctx_pct = clamp(round(Int, 100 * est / model.contextWindow), 0, 100)
+    end
+    return nothing
+end
+
 function repl(;
         db_path::AbstractString = DEFAULT_DB_PATH,
         continue_last::Bool = false,
+        base_dir::AbstractString = pwd(),
+        io::IO = stdout,
         kw...,
     )
-    jdb = opendb(db_path)
+    return with_jdb(db_path) do jdb
+        _repl(jdb; db_path, continue_last, base_dir, io, kw...)
+    end
+end
+
+function _repl(jdb::JucoDB;
+        db_path::AbstractString,
+        continue_last::Bool,
+        base_dir::AbstractString,
+        io::IO,
+        kw...,
+    )
     session_id = continue_last ? latest_session(jdb) : nothing
-    continue_last && session_id === nothing && println("No previous session found; starting a new one.")
+    continue_last && session_id === nothing && println(io, "No previous session found; starting a new one.")
     session_id === nothing && (session_id = "juco-" * string(Agentif.UID8()))
-    println("juco · session $(session_id) · db $(abspath(db_path)) · type 'exit' to quit")
-    while true
-        print("\e[1mjuco>\e[0m ")
-        # keep=true distinguishes an empty line ("\n") from EOF ("")
-        raw = try
-            readline(stdin; keep = true)
-        catch e
-            e isa InterruptException ? "\n" : rethrow()
+    st = ReplState(jdb, session_id; base_dir)
+    println(io, bold(io, "juco"), dim(io, " · $(model_label(st)) · session $(session_id)"))
+    skills_note = isempty(st.skills) ? "" : " · $(length(st.skills)) skill$(length(st.skills) == 1 ? "" : "s")"
+    println(io, dim(io, "db $(abspath(db_path))$(skills_note) · /help for commands · exit to quit"))
+    println(io, dim(io, "tip: " * REPL_TIPS[1 + mod(Dates.dayofyear(Dates.today()), length(REPL_TIPS))]))
+    isa(stdin, Base.TTY) && Base.exit_on_sigint(false)
+    try
+        while !st.quit
+            input = try
+                read_input(io; ctx_pct = st.last_ctx_pct)
+            catch e
+                e isa InterruptException ? "" : rethrow()
+            end
+            input === nothing && break  # EOF (ctrl-d)
+            isempty(input) && continue
+            input in ("exit", "quit") && break
+            if startswith(input, "/")
+                handle_command(st, input, io)
+            else
+                run_turn(st, input, io; kw...)
+                println(io)
+            end
         end
-        isempty(raw) && break  # EOF (ctrl-d)
-        input = strip(raw)
-        isempty(input) && continue
-        input in ("exit", "quit") && break
-        try
-            evaluate(input; jdb, session_id, kw...)
-        catch e
-            e isa InterruptException || showerror(stderr, e, catch_backtrace())
-            println(stderr)
-        end
-        println()
+    finally
+        isa(stdin, Base.TTY) && Base.exit_on_sigint(true)
+    end
+    return nothing
+end
+
+# ─── In-REPL mode (implemented in the ReplMaker package extension) ───
+
+"""
+    Juco.repl_mode!(; db_path = DEFAULT_DB_PATH, start_key = '}')
+
+Register a `juco>` mode in the current Julia REPL (like Pkg's `]`): press
+`}` at an empty `julia>` prompt to talk to Juco, backspace to leave. Slash
+commands (`/help`, `/sessions`, ...) work inside the mode.
+
+Requires ReplMaker: `using Juco, ReplMaker; Juco.repl_mode!()`.
+"""
+function repl_mode! end
+
+mode_state(db_path::AbstractString = DEFAULT_DB_PATH; base_dir::AbstractString = pwd()) =
+    ReplState(opendb(db_path), "juco-" * string(Agentif.UID8()); base_dir)
+
+function mode_eval(st::ReplState, input::AbstractString; kw...)
+    s = String(strip(input))
+    isempty(s) && return nothing
+    if startswith(s, "/")
+        handle_command(st, s, stdout)
+    else
+        run_turn(st, s, stdout; kw...)
     end
     return nothing
 end
 
 function print_sessions(db_path::AbstractString)
-    jdb = opendb(db_path)
-    sessions = list_sessions(jdb)
-    isempty(sessions) && return println("No sessions.")
-    for s in sessions
-        ts = Dates.format(Dates.unix2datetime(s.updated_at), "yyyy-mm-dd HH:MM")
-        println("$(s.id)  $(ts)  $(s.cwd)  $(s.title)")
+    return with_jdb(db_path) do jdb
+        sessions = list_sessions(jdb)
+        isempty(sessions) && return println("No sessions.")
+        for s in sessions
+            ts = Dates.format(Dates.unix2datetime(s.updated_at), "yyyy-mm-dd HH:MM")
+            println("$(s.id)  $(ts)  $(s.cwd)  $(s.title)")
+        end
     end
+end
+
+shell_project_argument(project::AbstractString) =
+    Base.shell_escape_posixly("--project=$(project)")
+
+function active_project_dir()
+    project = Base.active_project()
+    project === nothing && error("no active Julia project; start Julia with --project before installing the launcher")
+    return dirname(project)
+end
+
+"""
+    Juco.install_cli(; dir = joinpath(homedir(), ".local", "bin"))
+
+Write a `juco` launcher script to `dir` so the agent can be started from any
+shell. The script runs the active Julia environment that loaded Juco.
+"""
+function install_cli(; dir::AbstractString = joinpath(homedir(), ".local", "bin"))
+    project = active_project_dir()
+    mkpath(dir)
+    path = joinpath(dir, "juco")
+    write(path, """
+        #!/bin/sh
+        exec julia $(shell_project_argument(project)) --startup-file=no -e 'using Juco; Juco.main(ARGS)' -- "\$@"
+        """)
+    chmod(path, 0o755)
+    occursin(abspath(dir), get(ENV, "PATH", "")) ||
+        @info "add $(dir) to your PATH to use `juco` directly"
+    return path
 end
 
 const CLI_HELP = """
@@ -163,13 +705,15 @@ Flags:
   -p, --prompt <text>       one-shot prompt
   --db <path>               sqlite db path (default: ~/.juco/juco.sqlite)
   --dir <path>              working directory for tools (default: pwd)
-  --provider <name>         model provider (default: \$JUCO_MODEL_PROVIDER or anthropic)
-  --model <id>              model id (default: \$JUCO_MODEL or claude-sonnet-4-5)
+  --provider <name>         one-shot only: model provider override
+  --model <id>              one-shot only: model id override
   --preset <name>           toolset preset: juco | pi | bash (default: juco)
   -h, --help                show this help
+
+The interactive session uses the persisted model selection (see /model).
 """
 
-function main(args::Vector{String} = ARGS)
+function parse_cli_args(args::Vector{String})
     db_path = DEFAULT_DB_PATH
     base_dir = pwd()
     provider = default_provider()
@@ -177,38 +721,63 @@ function main(args::Vector{String} = ARGS)
     preset = :juco
     continue_last = false
     prompt = nothing
+    list = false
+    help = false
     i = 1
     while i <= length(args)
         a = args[i]
         if a in ("-h", "--help")
-            return print(CLI_HELP)
+            help = true
+            break
         elseif a in ("-c", "--continue")
             continue_last = true
         elseif a in ("-l", "--list")
-            return print_sessions(db_path)
+            list = true
         elseif a in ("-p", "--prompt")
+            i < length(args) || throw(ArgumentError("$a requires a value"))
             i += 1; prompt = args[i]
         elseif a == "--db"
+            i < length(args) || throw(ArgumentError("$a requires a value"))
             i += 1; db_path = args[i]
         elseif a == "--dir"
+            i < length(args) || throw(ArgumentError("$a requires a value"))
             i += 1; base_dir = args[i]
         elseif a == "--provider"
+            i < length(args) || throw(ArgumentError("$a requires a value"))
             i += 1; provider = args[i]
         elseif a == "--model"
+            i < length(args) || throw(ArgumentError("$a requires a value"))
             i += 1; model_id = args[i]
         elseif a == "--preset"
+            i < length(args) || throw(ArgumentError("$a requires a value"))
             i += 1; preset = Symbol(args[i])
         else
-            error("Unknown flag: $a (see juco --help)")
+            throw(ArgumentError("Unknown flag: $a (see juco --help)"))
         end
         i += 1
     end
-    if prompt !== nothing
-        jdb = opendb(db_path)
-        session_id = continue_last ? latest_session(jdb) : nothing
-        evaluate(prompt; jdb, session_id, base_dir, provider, model_id, preset)
+    preset in (:juco, :pi, :bash) ||
+        throw(ArgumentError("unknown preset: $preset (expected juco, pi, or bash)"))
+    list && prompt !== nothing && throw(ArgumentError("--list and --prompt cannot be used together"))
+    return (; db_path, base_dir, provider, model_id, preset, continue_last, prompt, list, help)
+end
+
+function main(args::Vector{String} = ARGS)
+    opts = parse_cli_args(args)
+    opts.help && return print(CLI_HELP)
+    opts.list && return print_sessions(opts.db_path)
+    if opts.prompt !== nothing
+        (; db_path, base_dir, provider, model_id, preset, continue_last, prompt) = opts
+        with_jdb(db_path) do jdb
+            session_id = continue_last ? latest_session(jdb) : nothing
+            evaluate(prompt; jdb, session_id, base_dir, provider, model_id, preset)
+        end
     else
-        repl(; db_path, continue_last, base_dir, provider, model_id, preset)
+        repl(; db_path = opts.db_path, continue_last = opts.continue_last,
+            base_dir = opts.base_dir, preset = opts.preset)
     end
     return nothing
 end
+
+# Entry point for `julia -m Juco` and the Pkg app shim (`pkg> app add Juco`).
+(@main)(args) = (main(collect(String, args)); Cint(0))

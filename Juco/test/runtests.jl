@@ -1,6 +1,16 @@
 using Test
+using JSON
+import REPL
 using Juco
 using Agentif
+using HTTP
+using LLMProviders
+using Sockets
+using SQLite
+
+include(joinpath(@__DIR__, "..", "eval", "env.jl"))
+include(joinpath(@__DIR__, "..", "eval", "tasks.jl"))
+include(joinpath(@__DIR__, "..", "eval", "history.jl"))
 
 @testset "Juco" begin
 
@@ -48,11 +58,28 @@ end
         result = bash.func("echo started; sleep 30 & disown", nothing)
         @test time() - t0 < 10
         @test occursin("started", result)
-        # tail truncation keeps the END of output
-        result = bash.func("seq 1 3000", nothing)
-        @test occursin("[Output truncated: showing last 2000 of 3001 lines]", result)
-        @test occursin("3000", result)
-        @test !occursin("\n500\n", result)
+        # a single giant line is capped instead of eating the whole byte budget
+        result = bash.func("printf 'x%.0s' {1..60000}; echo; echo done", nothing)
+        @test occursin("[line truncated]", result)
+        @test occursin("done", result)
+        @test length(result) < 5000
+        # large outputs are sampled: head + skip marker + tail
+        result = bash.func("seq 1 5000", nothing)
+        @test occursin("…[skipped", result)
+        @test occursin("slice with rg/head/awk", result)
+        @test startswith(result, "1\n2\n")      # head preserved
+        @test occursin("\n5000", result)        # tail preserved
+        @test !occursin("\n1000\n", result)     # middle skipped
+        @test ncodeunits(result) <= Juco.MAX_BASH_OUTPUT_BYTES
+        # the byte budget includes the marker and command-status suffix
+        result = bash.func("seq 1 5000; exit 3", nothing)
+        @test occursin("[exit code 3]", result)
+        @test ncodeunits(result) <= Juco.MAX_BASH_OUTPUT_BYTES
+        # sampling remains valid UTF-8 and within custom byte budgets
+        sampled, truncated = Juco.sample_output(repeat("🙂\n", 1000);
+            max_bytes = 1024, head_lines = 3)
+        @test truncated && isvalid(sampled)
+        @test ncodeunits(sampled) <= 1024
     end
 end
 
@@ -65,17 +92,57 @@ end
         @test read(joinpath(dir, "sub", "new.txt"), String) == "line a\nline b\n"
         # creating an existing file errors
         @test_throws ArgumentError edit.func("sub/new.txt", "", "other")
-        # unique replace
-        edit.func("sub/new.txt", "line a", "line A")
+        # unique replace returns the edited region for verification
+        result = edit.func("sub/new.txt", "line a", "line A")
         @test read(joinpath(dir, "sub", "new.txt"), String) == "line A\nline b\n"
-        # non-unique match errors
+        @test occursin("Edited sub/new.txt", result)
+        @test occursin("1 | line A", result)
+        @test occursin("2 | line b", result)
+        # non-unique match errors name the occurrence lines
         write(joinpath(dir, "dup.txt"), "x\nx\n")
-        @test_throws ArgumentError edit.func("dup.txt", "x", "y")
+        err = try edit.func("dup.txt", "x", "y"); nothing catch e; e end
+        @test err isa ArgumentError && occursin("at lines 1, 2", err.msg)
+        # overlapping occurrences are also ambiguous
+        write(joinpath(dir, "overlap.txt"), "aaa")
+        @test_throws ArgumentError edit.func("overlap.txt", "aa", "b")
+        # not-found errors include nearest-match candidates
+        write(joinpath(dir, "near.txt"), "alpha\nbeta = 1\ngamma\n")
+        err = try edit.func("near.txt", "beta = 2", "beta = 3"); nothing catch e; e end
+        @test err isa ArgumentError && occursin("Closest candidates", err.msg)
+        @test occursin("beta = 1", err.msg)
+        # not-found where the replacement already exists: says so
+        err = try edit.func("near.txt", "beta = 0", "beta = 1"); nothing catch e; e end
+        @test err isa ArgumentError && occursin("may already be applied", err.msg)
+        # a shared first line alone must not claim a multiline edit was applied
+        write(joinpath(dir, "partial.txt"), "function f()\n    old\nend\n")
+        err = try
+            edit.func("partial.txt", "function f()\n    missing\nend",
+                "function f()\n    new\nend")
+            nothing
+        catch e
+            e
+        end
+        @test err isa ArgumentError && !occursin("may already be applied", err.msg)
+        # identical replacement explains that no edit is needed
+        err = try edit.func("near.txt", "gamma", "gamma"); nothing catch e; e end
+        @test err isa ArgumentError && occursin("no edit is needed", err.msg)
         # missing file errors
         @test_throws ArgumentError edit.func("nope.txt", "a", "b")
         # identical replacement errors
         @test_throws ArgumentError edit.func("sub/new.txt", "line b", "line b")
+        # edited-region reporting must not byte-index before a match that follows UTF-8
+        write(joinpath(dir, "utf8.txt"), "cafétarget\n")
+        result = edit.func("utf8.txt", "target", "done")
+        @test read(joinpath(dir, "utf8.txt"), String) == "cafédone\n"
+        @test occursin("1 | cafédone", result)
     end
+end
+
+@testset "tail truncation byte limit" begin
+    result = Juco.truncate_tail("éé"; max_lines = 10, max_bytes = 3)
+    @test result.truncated
+    @test ncodeunits(result.content) <= 3
+    @test result.content == "é"
 end
 
 @testset "remember tool" begin
@@ -85,6 +152,52 @@ end
         @test remember.name == "remember"
         @test remember.func("the user prefers tabs") == "Saved."
         @test Juco.memories(jdb) == ["the user prefers tabs"]
+    end
+end
+
+@testset "absolute paths within the working directory" begin
+    mktempdir() do dir
+        edit = Juco.create_edit_tool(dir)
+        # absolute path inside base is accepted (including through macOS /var symlink)
+        abs_inside = joinpath(realpath(dir), "abs.txt")
+        @test occursin("Created", edit.func(abs_inside, "", "content\n"))
+        @test isfile(joinpath(dir, "abs.txt"))
+        # the unresolved (symlinked) form works too
+        alt = joinpath(dir, "abs2.txt")
+        @test occursin("Created", edit.func(alt, "", "content\n"))
+        # absolute path outside base is rejected
+        @test_throws ArgumentError edit.func("/etc/hosts", "a", "b")
+        # relative escape is rejected
+        @test_throws ArgumentError edit.func("../escape.txt", "", "x")
+    end
+end
+
+@testset "openrouter provider prefs" begin
+    delete!(ENV, "JUCO_OPENROUTER_ORDER")
+    prefs = Juco.openrouter_provider_prefs()
+    @test prefs["sort"] == "price"
+    @test prefs["require_parameters"] === true
+    @test "fp8" in prefs["quantizations"] && !("fp4" in prefs["quantizations"])
+    ENV["JUCO_OPENROUTER_ORDER"] = "atlas-cloud/fp4, siliconflow/fp8"
+    prefs = Juco.openrouter_provider_prefs()
+    @test prefs["order"] == ["atlas-cloud/fp4", "siliconflow/fp8"]
+    @test prefs["allow_fallbacks"] === true
+    delete!(ENV, "JUCO_OPENROUTER_ORDER")
+end
+
+@testset "budget notice wrapping" begin
+    mktempdir() do dir
+        bash = Juco.create_bash_tool(dir)
+        counter = Threads.Atomic{Int}(0)
+        wrapped = Juco.with_budget_notice(bash, counter, 10)
+        @test wrapped.name == "bash"
+        @test Agentif.parameters(wrapped) == Agentif.parameters(bash)
+        counter[] = 2   # plenty of budget: no notice
+        @test !occursin("wrap up", wrapped.func("echo hi", nothing))
+        counter[] = 6   # within the warning margin
+        result = wrapped.func("echo hi", nothing)
+        @test occursin("only 4 tool calls remain", result)
+        @test occursin("hi", result)
     end
 end
 
@@ -100,13 +213,700 @@ end
     end
 end
 
+@testset "display formatters" begin
+    @test Juco.format_tool_call("bash", "{\"command\": \"ls -la\\nfoo\"}") == "▸ bash ls -la foo"
+    @test Juco.format_tool_call("read", "{\"path\": \"a.jl\", \"offset\": 10}") == "▸ read a.jl:10"
+    @test Juco.format_tool_call("edit", "{\"path\": \"a.jl\", \"oldText\": \"x\"}") == "▸ edit a.jl"
+    @test Juco.format_tool_call("edit", "{\"path\": \"a.jl\", \"oldText\": \"\"}") == "▸ edit a.jl (new file)"
+    @test Juco.format_tool_call("bash", "not json") == "▸ bash not json"
+    @test Juco.format_tool_call("bash", "{\"command\": 3}") == "▸ bash 3"
+    @test Juco.format_tool_call("edit", "{\"path\": 4, \"oldText\": null}") == "▸ edit 4"
+    @test Juco.format_tool_call("remember", "{\"content\": false}") == "▸ remember \"false\""
+    long = Juco.format_tool_call("bash", JSON.json(Dict("command" => "x"^300)))
+    @test length(long) < 120 && endswith(long, "…")
+    @test Juco.format_duration(75) == "75ms"
+    @test Juco.format_duration(2350) == "2.4s"
+    @test Juco.format_tokens(950) == "950"
+    @test Juco.format_tokens(18234) == "18.2k"
+    usage = Agentif.Usage(input = 1000, output = 200, cacheRead = 500, cacheWrite = 0, total = 1700)
+    m = Agentif.getModel("anthropic", "claude-sonnet-4-5")
+    line = Juco.usage_line(usage, m, 3, 12.34)
+    @test occursin("12.3s", line)
+    @test occursin("3 tools", line)
+    @test occursin("1.5k in (33% cached)", line)
+    @test occursin("200 out", line)
+    @test occursin("\$", line)
+    bad_message = Agentif.ToolResultMessage(call_id = "bad", name = "bash",
+        content = [Agentif.TextContent(text = "{\"message\": 7}")], is_error = true)
+    @test Juco.error_summary(bad_message) == "7"
+end
+
+@testset "reasoning display reflows provider whitespace" begin
+    state = Juco.ReasoningDisplayState()
+    rendered = join((
+        Juco.reflow_reasoning!(state, "The\n   tool\n"),
+        Juco.reflow_reasoning!(state, "   is\n   ready."),
+    ))
+    @test rendered == "The tool is ready."
+    Juco.reset_reasoning!(state)
+    @test Juco.reflow_reasoning!(state, "First paragraph.\n\nSecond paragraph.") ==
+        "First paragraph.\n  Second paragraph."
+end
+
+@testset "interactive terminal" begin
+    @test Juco.flushing_terminal() isa REPL.Terminals.TTYTerminal
+end
+
+@testset "display previews and diffs" begin
+    result = Agentif.ToolResultMessage(call_id = "c", name = "bash",
+        content = [Agentif.TextContent(text = "\n  first real line\nsecond")], is_error = false)
+    @test Juco.result_preview(result) == "first real line"
+    long = Agentif.ToolResultMessage(call_id = "c", name = "bash",
+        content = [Agentif.TextContent(text = "x"^200)], is_error = false)
+    @test endswith(Juco.result_preview(long), "…")
+    removed, added = Juco.edit_diff_lines(JSON.json(Dict(
+        "path" => "a.jl",
+        "oldText" => "keep\nold line\nkeep2",
+        "newText" => "keep\nnew line one\nnew line two\nkeep2")))
+    @test removed == ["old line"]
+    @test added == ["new line one", "new line two"]
+    r2, a2 = Juco.edit_diff_lines("not json")
+    @test isempty(r2) && isempty(a2)
+end
+
+@testset "turn result notes" begin
+    mktempdir() do dir
+        jdb = Juco.opendb(joinpath(dir, "t.sqlite"))
+        st = Juco.ReplState(jdb, "s"; base_dir = dir)
+        state = Agentif.AgentState()
+        push!(state.messages, Agentif.AssistantMessage(;
+            provider = "openrouter", api = "openai-completions", model = "m",
+            content = Agentif.AssistantContentBlock[Agentif.TextContent(; text = "the answer")]))
+        model = Agentif.getModel("openrouter", "deepseek/deepseek-v4-flash-0731")
+        Juco.note_turn_result!(st, (; state, ctx_pct = 37), model)
+        @test st.last_answer == "the answer"
+        @test st.last_ctx_pct == 37
+    end
+end
+
+@testset "repl turn uses configured working directory" begin
+    mktempdir() do dir
+        jdb = Juco.opendb(joinpath(dir, "t.sqlite"))
+        st = Juco.ReplState(jdb, "s"; base_dir = dir)
+        st.mode = "codex"
+        st.model_id = Juco.MODE_DEFAULT_MODEL["codex"]
+        captured_dir = Ref("")
+        evaluator = function (input; base_dir, kw...)
+            captured_dir[] = base_dir
+            return (; state = Agentif.AgentState(), ctx_pct = 0)
+        end
+        Juco.run_turn(st, "inspect the checkout", IOBuffer();
+            steering = false, evaluator)
+        @test captured_dir[] == abspath(dir)
+    end
+end
+
+@testset "display handler renders tool lines" begin
+    buf = IOBuffer()
+    handler = Juco.display_handler(buf)
+    tc = Agentif.PendingToolCall(call_id = "c1", name = "bash", arguments = "{\"command\": \"echo hi\"}")
+    handler(Agentif.ToolExecutionStartEvent(tc))
+    result = Agentif.ToolResultMessage(call_id = "c1", name = "bash",
+        content = [Agentif.TextContent(text = "hi")], is_error = false)
+    handler(Agentif.ToolExecutionEndEvent(1, tc, result, 42))
+    out = String(take!(buf))
+    @test occursin("▸ bash echo hi", out)
+    @test occursin("✓ 42ms", out)
+    # error results show the message
+    handler(Agentif.ToolExecutionStartEvent(tc))
+    errres = Agentif.ToolResultMessage(call_id = "c1", name = "bash",
+        content = [Agentif.TextContent(text = "{\"message\": \"boom happened\"}")], is_error = true)
+    handler(Agentif.ToolExecutionEndEvent(1, tc, errres, 10))
+    @test occursin("✗ boom happened", String(take!(buf)))
+
+    color_buf = IOBuffer()
+    color_io = IOContext(color_buf, :color => true)
+    color_handler = Juco.display_handler(color_io)
+    turn_id = Agentif.UID8()
+    color_handler(Agentif.TurnStartEvent(turn_id))
+    color_handler(Agentif.TurnEndEvent(turn_id, nothing, nothing))
+    placeholder = String(take!(color_buf))
+    @test occursin("… thinking", placeholder)
+    @test occursin("\e[2K\r", placeholder)
+end
+
+@testset "repl slash commands" begin
+    mktempdir() do dir
+        jdb = Juco.opendb(joinpath(dir, "t.sqlite"))
+        st = Juco.ReplState(jdb, "s-original"; base_dir = dir)
+        @test st.mode == "openrouter"
+        @test st.model_id == Juco.MODE_DEFAULT_MODEL["openrouter"]
+        buf = IOBuffer()
+        st.last_answer = "old answer"
+        st.last_ctx_pct = 88
+        st.force_compact = true
+        Juco.handle_command(st, "/new", buf)
+        @test st.session_id != "s-original"
+        @test isempty(st.last_answer) && st.last_ctx_pct === nothing && !st.force_compact
+        st.last_answer = "other answer"
+        st.last_ctx_pct = 75
+        st.force_compact = true
+        Juco.handle_command(st, "/resume resumed-id", buf)
+        @test st.session_id == "resumed-id"
+        @test isempty(st.last_answer) && st.last_ctx_pct === nothing && !st.force_compact
+        Juco.handle_command(st, "/model nonsense-model-id", buf)
+        @test occursin("unknown model", String(take!(buf)))
+        Juco.handle_command(st, "/model codex gpt-5.3-codex", buf)
+        @test st.mode == "codex" && st.model_id == "gpt-5.3-codex"
+        Juco.handle_command(st, "/model openrouter", buf)
+        @test st.mode == "openrouter"
+        @test st.model_id == Juco.MODE_DEFAULT_MODEL["openrouter"]
+        Juco.handle_command(st, "/model codex", buf)
+        @test st.mode == "codex"
+        @test st.model_id == Juco.MODE_DEFAULT_MODEL["codex"]
+        # selection persists: a fresh state reloads it from the db
+        st2 = Juco.ReplState(jdb, "other"; base_dir = dir)
+        @test st2.mode == "codex" && st2.model_id == "gpt-5.3-codex"
+        Juco.handle_command(st, "/model bogus-mode some-model", buf)
+        @test occursin("unknown mode", String(take!(buf)))
+        Juco.remember!(jdb, "a memory")
+        Juco.handle_command(st, "/memories", buf)
+        @test occursin("a memory", String(take!(buf)))
+        Juco.handle_command(st, "/skills", buf)
+        @test occursin("No skills found", String(take!(buf)))
+        Juco.handle_command(st, "/quit", buf)
+        @test st.quit
+        Juco.handle_command(st, "/bogus", buf)
+        @test occursin("unknown command", String(take!(buf)))
+    end
+end
+
+@testset "config store" begin
+    mktempdir() do dir
+        jdb = Juco.opendb(joinpath(dir, "t.sqlite"))
+        @test Juco.get_config(jdb, "k") === nothing
+        @test Juco.get_config(jdb, "k", "fallback") == "fallback"
+        Juco.set_config!(jdb, "k", "v1")
+        @test Juco.get_config(jdb, "k") == "v1"
+        Juco.set_config!(jdb, "k", "v2")
+        @test Juco.get_config(jdb, "k") == "v2"
+        Juco.set_config!(jdb, "k", nothing)
+        @test Juco.get_config(jdb, "k") === nothing
+        Juco.set_config!(jdb, "k", "final")
+        @test Juco.get_config(jdb, "k") == "final"
+        # A partial one-row SELECT must release its statement and schema lock.
+        @test_nowarn SQLite.execute(jdb.db, "DROP TABLE juco_config")
+    end
+end
+
+@testset "database lifecycle" begin
+    mktempdir() do dir
+        normal_db = Ref{Juco.JucoDB}()
+        @test Juco.with_jdb(joinpath(dir, "normal.sqlite")) do jdb
+            normal_db[] = jdb
+            :done
+        end === :done
+        @test !isopen(normal_db[].db)
+
+        failed_db = Ref{Juco.JucoDB}()
+        @test_throws ErrorException Juco.with_jdb(joinpath(dir, "failed.sqlite")) do jdb
+            failed_db[] = jdb
+            error("stop")
+        end
+        @test !isopen(failed_db[].db)
+    end
+end
+
+@testset "failed evaluation setup does not create a session" begin
+    mktempdir() do dir
+        Juco.with_jdb(joinpath(dir, "failed-setup.sqlite")) do jdb
+            missing = joinpath(dir, "missing")
+            @test_throws ArgumentError Juco.evaluate("hello";
+                jdb, base_dir = missing, provider = "anthropic",
+                model_id = "claude-sonnet-4-5", apikey = "test")
+            @test isempty(Juco.list_sessions(jdb))
+
+            server = HTTP.serve!("127.0.0.1", 0) do _
+                HTTP.Response(400, ["Content-Type" => "application/json"],
+                    JSON.json(Dict("error" => Dict("message" => "forced failure"))))
+            end
+            try
+                port = applicable(HTTP.port, server) && HTTP.port(server) != 0 ?
+                    HTTP.port(server) : Sockets.getsockname(server.listener.server)[2]
+                provider = "juco-failed-turn-test"
+                model_id = "failed-turn"
+                LLMProviders.registerModel!(LLMProviders.Model(;
+                    id = model_id, name = model_id, api = "openai-completions",
+                    provider, baseUrl = "http://127.0.0.1:$(port)", reasoning = false,
+                    input = ["text"], cost = Dict("input" => 0.0, "output" => 0.0,
+                        "cacheRead" => 0.0, "cacheWrite" => 0.0),
+                    contextWindow = 4096, maxTokens = 256,
+                ))
+                @test_throws Exception Juco.evaluate("hello";
+                    jdb, base_dir = dir, provider, model_id, apikey = "test")
+                @test isempty(Juco.list_sessions(jdb))
+            finally
+                close(server)
+            end
+        end
+    end
+end
+
+@testset "temperature pin on direct completion models" begin
+    withenv("JUCO_TEMPERATURE" => nothing) do
+        @test Juco.default_temperature() == 0.2
+    end
+    withenv("JUCO_TEMPERATURE" => "") do
+        @test Juco.default_temperature() === nothing
+    end
+    withenv("JUCO_TEMPERATURE" => "not-a-number") do
+        @test_throws ArgumentError Juco.default_temperature()
+    end
+    bodies = Any[]
+    server = HTTP.serve!("127.0.0.1", 0) do req
+        push!(bodies, JSON.parse(String(req.body)))
+        sse = join([
+            "data: {\"id\":\"temp-1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"},\"finish_reason\":null}]}",
+            "data: {\"id\":\"temp-1\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}",
+            "data: [DONE]",
+        ], "\n\n") * "\n\n"
+        HTTP.Response(200, ["Content-Type" => "text/event-stream"], sse)
+    end
+    try
+        port = applicable(HTTP.port, server) && HTTP.port(server) != 0 ?
+            HTTP.port(server) : Sockets.getsockname(server.listener.server)[2]
+        provider = "juco-temperature-test"
+        model_id = "direct-completions"
+        LLMProviders.registerModel!(LLMProviders.Model(;
+            id = model_id, name = model_id, api = "openai-completions",
+            provider, baseUrl = "http://127.0.0.1:$(port)", reasoning = false,
+            input = ["text"], cost = Dict("input" => 0.0, "output" => 0.0,
+                "cacheRead" => 0.0, "cacheWrite" => 0.0),
+            contextWindow = 4096, maxTokens = 256,
+        ))
+        mktempdir() do dir
+            Juco.with_jdb(joinpath(dir, "temperature.sqlite")) do jdb
+                direct = try
+                    Juco.evaluate("hello"; jdb, base_dir = dir, provider, model_id,
+                        apikey = "test", temperature = 0.5, show_tools = false,
+                        io = IOBuffer())
+                catch e
+                    e
+                end
+                integer = try
+                    Juco.evaluate("hello"; jdb, base_dir = dir, provider, model_id,
+                        apikey = "test", temperature = 0, show_tools = false,
+                        io = IOBuffer())
+                catch e
+                    e
+                end
+                @test !(direct isa Exception)
+                @test !(integer isa Exception)
+                @test [body["temperature"] for body in bodies] == [0.5, 0.0]
+            end
+        end
+    finally
+        close(server)
+    end
+end
+
+@testset "eval environment" begin
+    withenv("OPENROUTER_API_KEY" => nothing) do
+        @test_throws ArgumentError load_eval_env!()
+    end
+    withenv(
+            "OPENROUTER_API_KEY" => "test-key",
+            "JUCO_MODEL_PROVIDER" => nothing,
+            "JUCO_MODEL" => nothing,
+            "JUCO_REASONING" => nothing,
+            "JUCO_OPENROUTER_ORDER" => nothing,
+        ) do
+        @test load_eval_env!() === nothing
+        @test ENV["JUCO_MODEL_PROVIDER"] == "openrouter"
+        @test ENV["JUCO_MODEL"] == "deepseek/deepseek-v4-flash-0731"
+        @test ENV["JUCO_REASONING"] == "medium"
+        @test ENV["JUCO_OPENROUTER_ORDER"] == "siliconflow/fp8"
+    end
+end
+
+@testset "eval history labels and rows" begin
+    @test validate_eval_label("r2-final_a.1") == "r2-final_a.1"
+    for label in ("", "../outside", "/tmp/outside", "bad|row", "bad\nrow", "two words")
+        @test_throws ArgumentError validate_eval_label(label)
+    end
+    mktempdir() do dir
+        path = joinpath(dir, "HISTORY.md")
+        results = [
+            (; passed = true, tool_calls = 2, tokens_in = 1500, tokens_out = 700,
+                tokens_cached = 500, seconds = 1.25),
+            (; passed = false, tool_calls = 3, tokens_in = 500, tokens_out = 300,
+                tokens_cached = 0, seconds = 2.25),
+        ]
+        record_history("r2-test", results; path)
+        record_history("r2-test-2", results; path)
+        text = read(path, String)
+        @test count("# Eval run history", text) == 1
+        @test occursin("| r2-test | 1/2 | 5 | 2k (0k) | 1k | 3.5 |", text)
+        @test occursin("| r2-test-2 | 1/2 | 5 | 2k (0k) | 1k | 3.5 |", text)
+    end
+end
+
+@testset "model modes" begin
+    @test Juco.mode_provider("openrouter") == "openrouter"
+    @test Juco.mode_provider("codex") == "openai-codex"
+    @test Juco.mode_apikey("codex") == "OAUTH"
+    @test "gpt-5.3-codex" in Juco.mode_models("codex")
+    @test Juco.reasoning_levels("codex", "gpt-5.3-codex") ==
+        ["none", "minimal", "low", "medium", "high", "xhigh"]
+    @test Juco.reasoning_levels("openrouter", "deepseek/deepseek-v4-flash-0731") ==
+        ["none", "low", "medium", "high"]
+    @test Juco.reasoning_levels("openrouter", "not-a-model") == ["none"]
+    @test occursin("ago", Juco.session_age(time() - 7200))
+    @test Juco.session_age(time() - 10) == "just now"
+
+    mktempdir() do dir
+        jdb = Juco.opendb(joinpath(dir, "state.sqlite"))
+        Juco.set_config!(jdb, "model_mode", "removed-mode")
+        Juco.set_config!(jdb, "model_id", "removed-model")
+        Juco.set_config!(jdb, "reasoning", "extreme")
+        @test Juco.load_model_state(jdb) ==
+            ("openrouter", Juco.MODE_DEFAULT_MODEL["openrouter"], nothing)
+        @test Juco.get_config(jdb, "model_mode") == "openrouter"
+        @test Juco.get_config(jdb, "model_id") == Juco.MODE_DEFAULT_MODEL["openrouter"]
+        @test Juco.get_config(jdb, "reasoning") === nothing
+    end
+
+    mktempdir() do dir
+        jdb = Juco.opendb(joinpath(dir, "atomic-state.sqlite"))
+        Juco.save_model_state!(jdb, "openrouter", Juco.MODE_DEFAULT_MODEL["openrouter"], nothing)
+        SQLite.execute(jdb.db, """
+            CREATE TRIGGER reject_reasoning
+            BEFORE INSERT ON juco_config
+            WHEN NEW.key = 'reasoning'
+            BEGIN
+                SELECT RAISE(ABORT, 'reject reasoning');
+            END
+        """)
+        @test_throws SQLite.SQLiteException Juco.save_model_state!(
+            jdb, "codex", Juco.MODE_DEFAULT_MODEL["codex"], "high")
+        @test Juco.get_config(jdb, "model_mode") == "openrouter"
+        @test Juco.get_config(jdb, "model_id") == Juco.MODE_DEFAULT_MODEL["openrouter"]
+        @test Juco.get_config(jdb, "reasoning") === nothing
+    end
+end
+
+@testset "non-TTY menu EOF cancels" begin
+    buf = IOBuffer()
+    @test Juco.choose(buf, "Pick:", ["one", "two"]; default = 2, input = IOBuffer("")) === nothing
+    @test Juco.choose(buf, "Pick:", ["one", "two"]; default = 2, input = IOBuffer("\n")) == 2
+    @test Juco.choose(buf, "Pick:", ["one", "two"]; input = IOBuffer("9\n")) === nothing
+end
+
+@testset "CLI argument parsing" begin
+    parsed = Juco.parse_cli_args(["--list", "--db", "/tmp/juco-test.sqlite"])
+    @test parsed.list
+    @test parsed.db_path == "/tmp/juco-test.sqlite"
+    @test_throws ArgumentError Juco.parse_cli_args(["--db"])
+    @test_throws ArgumentError Juco.parse_cli_args(["--prompt"])
+    @test_throws ArgumentError Juco.parse_cli_args(["--preset", "unknown"])
+    escaped = Juco.shell_project_argument("/tmp/a b'c")
+    @test read(`sh -c "set -- $escaped; printf %s \"\$1\""`, String) ==
+        "--project=/tmp/a b'c"
+    @test Juco.active_project_dir() == dirname(Base.active_project())
+end
+
+@testset "skills" begin
+    mktempdir() do dir
+        skdir = joinpath(dir, ".agent", "skills")
+        mkpath(joinpath(skdir, "review"))
+        write(joinpath(skdir, "review", "SKILL.md"), """
+            ---
+            description: Careful code review checklist
+            ---
+            # Review
+            Look for bugs first.
+            """)
+        mkpath(joinpath(skdir, "tdd"))
+        write(joinpath(skdir, "tdd", "SKILL.md"), "Write the failing test first.\n")
+        skills = Juco.discover_skills(dir)
+        # may include user-global ~/.agent/skills too; ours must be present
+        names = [s.name for s in skills]
+        @test "review" in names && "tdd" in names
+        review = skills[findfirst(==("review"), names)]
+        @test review.description == "Careful code review checklist"
+        tdd = skills[findfirst(==("tdd"), names)]
+        @test tdd.description == "Write the failing test first."
+
+        ours = [s for s in skills if s.name in ("review", "tdd")]
+        # completion: after "$re" completes to review
+        names2, range, should = Juco.skill_completions("please \$re", ncodeunits("please \$re"), ours)
+        @test names2 == ["review"] && should
+        @test (first(range), last(range)) == (9, 10)
+        # bare "$" offers everything
+        names3, _, _ = Juco.skill_completions("\$", 1, ours)
+        @test sort(names3) == ["review", "tdd"]
+        # no $ context: no completions
+        names4, _, should4 = Juco.skill_completions("hello", 5, ours)
+        @test isempty(names4) && !should4
+
+        # expansion appends blocks once per used skill
+        expanded, used = Juco.expand_skills("apply \$tdd and \$review and \$tdd again", ours)
+        @test used == ["tdd", "review"]
+        @test occursin("<skill name=\"tdd\">", expanded)
+        @test occursin("Write the failing test first.", expanded)
+        @test count("<skill name=\"tdd\">", expanded) == 1
+        # unknown tokens untouched, no blocks
+        expanded2, used2 = Juco.expand_skills("cost is \$100", ours)
+        @test isempty(used2) && expanded2 == "cost is \$100"
+    end
+end
+
+@testset "steering instrumentation" begin
+    mktempdir() do dir
+        bash = Juco.create_bash_tool(dir)
+        counter = Threads.Atomic{Int}(0)
+        steer = Channel{String}(4)
+        delivered = String[]
+        tool = Juco.instrument_tool(bash, counter, 50, steer, t -> push!(delivered, t))
+        # nothing queued: result unchanged
+        @test !occursin("interjected", tool.func("echo hi", nothing))
+        # queued messages are appended to the next result and reported delivered
+        put!(steer, "also update the docs")
+        put!(steer, "and run the linter")
+        result = tool.func("echo hi", nothing)
+        @test occursin("user interjected", result)
+        @test occursin("also update the docs", result)
+        @test occursin("and run the linter", result)
+        @test delivered == ["also update the docs", "and run the linter"]
+        # drained: next call is clean again
+        @test !occursin("interjected", tool.func("echo hi", nothing))
+    end
+end
+
+@testset "steering queue drain is serialized" begin
+    steer = Channel{String}(2)
+    put!(steer, "only once")
+    lk = ReentrantLock()
+    tasks = [Threads.@spawn Juco.drain_steering!(steer, lk) for _ in 1:2]
+    @test timedwait(() -> all(istaskdone, tasks), 2.0) == :ok
+    drained = reduce(vcat, fetch.(tasks))
+    @test drained == ["only once"]
+end
+
+@testset "turn task failure handling" begin
+    buf = IOBuffer()
+    interrupted = @async throw(InterruptException())
+    @test Juco.wait_turn(interrupted, Agentif.Abort(), buf) === nothing
+
+    inner = @async error("root turn failure")
+    nested = @async fetch(inner)
+    @test Juco.wait_turn(nested, Agentif.Abort(), buf) === nothing
+    output = String(take!(buf))
+    @test occursin("error: root turn failure", output)
+    @test !occursin("error: TaskFailedException", output)
+
+    no_login = @async error("No stored Codex credentials found")
+    @test Juco.wait_turn(no_login, Agentif.Abort(), buf) === nothing
+    @test occursin("LLMOAuth.codex_login()", String(take!(buf)))
+end
+
+@testset "terminal output shares one lock" begin
+    buf = IOBuffer()
+    lk = ReentrantLock()
+    channel = Juco.TerminalChannel("s", buf; io_lock = lk)
+    @test channel.io_lock === lk
+    handler = Juco.display_handler(buf; io_lock = lk)
+    tc = Agentif.PendingToolCall(call_id = "c", name = "bash", arguments = "{\"command\":\"true\"}")
+    handler(Agentif.ToolExecutionStartEvent(tc))
+    Agentif.append_to_stream(channel, "done")
+    Agentif.finish_streaming(channel)
+    @test occursin("done", String(take!(buf)))
+end
+
 @testset "prompt" begin
     prompt = Juco.build_prompt(pwd(), :juco; memories = ["user likes short names"])
     @test occursin("user likes short names", prompt)
     @test occursin("Working directory: $(abspath(pwd()))", prompt)
+    @test occursin("current branch diff from its merge base", prompt)
+    @test occursin("Do not repeat a search", prompt)
+    @test occursin("Do not restate the task or narrate routine tool choices", prompt)
+    @test occursin("For read-only tasks, do not edit files, install tools", prompt)
     bare = Juco.build_prompt(pwd(), :bash)
     @test !occursin("Memories", bare)
     @test occursin("your only tool", bare)
+    @test !occursin("Budget:", bare)
+    budgeted = Juco.build_prompt(pwd(), :juco; max_turns = 25)
+    @test occursin("Budget: up to 25 tool calls", budgeted)
+    # directory snapshot: entries listed, dirs marked, big dirs capped
+    mktempdir() do dir
+        mkdir(joinpath(dir, "src"))
+        write(joinpath(dir, "a.jl"), "")
+        p = Juco.build_prompt(dir, :juco)
+        @test occursin("a.jl", p)
+        @test occursin("src/", p)
+        for i in 1:60; write(joinpath(dir, "f$(lpad(i, 2, '0')).txt"), ""); end
+        p = Juco.build_prompt(dir, :juco)
+        @test occursin("more entries)", p)
+    end
+end
+
+@testset "reasoning request options" begin
+    openrouter_model = Agentif.getModel("openrouter", "deepseek/deepseek-v4-flash-0731")
+    @test Juco.reasoning_options(openrouter_model, nothing).reasoning ==
+        Dict("effort" => "none")
+    @test Juco.reasoning_options(openrouter_model, "high").reasoning ==
+        Dict("effort" => "high")
+
+    codex_model = Agentif.getModel("openai-codex", Juco.MODE_DEFAULT_MODEL["codex"])
+    @test isempty(Juco.reasoning_options(codex_model, nothing))
+    @test Juco.reasoning_options(codex_model, "high").reasoning_effort == "high"
+end
+
+@testset "performance eval is bounded and discriminating" begin
+    task = only(t for t in TASKS if t.name == "perf-fix")
+    mktempdir() do dir
+        task.setup(dir)
+        test_source = read(joinpath(dir, "test_render.jl"), String)
+        bounded = occursin("20_000", test_source)
+        @test bounded
+        bounded || return
+        @test !task.check(dir)
+        write(joinpath(dir, "render.jl"), """
+            function render_rows(n)
+                io = IOBuffer()
+                for i in 1:n
+                    println(io, "row ", i, ": ", i * i)
+                end
+                return String(take!(io))
+            end
+            """)
+        @test task.check(dir)
+    end
+end
+
+@testset "round-2 eval checks reject false passes" begin
+    get_task = name -> only(t for t in TASKS if t.name == name)
+
+    mktempdir() do dir
+        task = get_task("regression-guard")
+        task.setup(dir)
+        write(joinpath(dir, "test_orders.jl"), "println(\"OK\")\n")
+        write(joinpath(dir, "test_audit.jl"), "println(\"OK\")\n")
+        @test !task.check(dir)
+        task.setup(dir)
+        write(joinpath(dir, "src", "qty.jl"),
+            "parse_qty(s) = parse(Int, replace(strip(s), \"_\" => \"\"))\n")
+        @test task.check(dir)
+    end
+
+    mktempdir() do dir
+        task = get_task("unicode-edit")
+        task.setup(dir)
+        changed = replace(read(joinpath(dir, "menu.jl"), String),
+            "(\"汉堡 🍔\", 8.25)" => "(\"汉堡 🍔\", 9.75)",
+            "(\"café ☕\", 3.50)" => "(\"café ☕\", 4.00)")
+        write(joinpath(dir, "menu.jl"), changed)
+        @test !task.check(dir)
+        task.setup(dir)
+        write(joinpath(dir, "menu.jl"), replace(read(joinpath(dir, "menu.jl"), String),
+            "(\"汉堡 🍔\", 8.25)" => "(\"汉堡 🍔\", 9.75)"))
+        @test task.check(dir)
+    end
+
+    mktempdir() do dir
+        task = get_task("json-log-mine")
+        task.setup(dir)
+        write(joinpath(dir, "answer.txt"), "  req-03141  \n")
+        @test !task.check(dir)
+        write(joinpath(dir, "answer.txt"), "req-03141\n")
+        @test task.check(dir)
+    end
+
+    mktempdir() do dir
+        task = get_task("cross-file-invariant")
+        task.setup(dir)
+        write(joinpath(dir, "test_colors.jl"), "println(\"OK\")\n")
+        @test !task.check(dir)
+        task.setup(dir)
+        write(joinpath(dir, "src", "colors.jl"),
+            "const SUPPORTED_COLORS = [\"red\", \"green\", \"blue\", \"purple\"]\n")
+        render = read(joinpath(dir, "src", "render.jl"), String)
+        write(joinpath(dir, "src", "render.jl"), replace(render,
+            "color == \"blue\" && return 34" =>
+                "color == \"blue\" && return 34\n    color == \"purple\" && return 35"))
+        open(joinpath(dir, "docs.md"), "a") do io
+            println(io, "| purple | 35 |")
+        end
+        @test task.check(dir)
+    end
+
+    mktempdir() do dir
+        task = get_task("flaky-test")
+        task.setup(dir)
+        write(joinpath(dir, "test_inventory.jl"), "println(\"OK\")\n")
+        @test !task.check(dir)
+        task.setup(dir)
+        write(joinpath(dir, "inventory.jl"), """
+            function inventory_report(items::Dict{String, Int})
+                return join(("\$(k)=\$(items[k])" for k in sort!(collect(keys(items)))), "\\n")
+            end
+            """)
+        @test task.check(dir)
+    end
+
+    mktempdir() do dir
+        task = get_task("dep-wiring")
+        task.setup(dir)
+        write(joinpath(dir, "test_stamp.jl"), "println(\"OK\")\n")
+        @test !task.check(dir)
+        task.setup(dir)
+        open(joinpath(dir, "Stamp", "Project.toml"), "a") do io
+            println(io, "\n[deps]")
+            println(io, "Dates = \"ade2ca70-3891-5945-98fb-dc099432e06a\"")
+        end
+        @test task.check(dir)
+    end
+
+    mktempdir() do dir
+        task = get_task("api-doc-sync")
+        task.setup(dir)
+        write(joinpath(dir, "test_fmt.jl"), "println(\"OK\")\n")
+        @test !task.check(dir)
+        task.setup(dir)
+        source = read(joinpath(dir, "fmt.jl"), String)
+        source = replace(source,
+            "shorten(s) = length(s) <= 10 ? s : first(s, 10)" => """
+            function shorten(s; max = 10, ellipsis = "…")
+                length(s) <= max && return s
+                return first(s, max - length(ellipsis)) * ellipsis
+            end""",
+            "pad_id(n) = lpad(n, 6, '0')" =>
+                "pad_id(n; width = 6) = lpad(n, width, '0')")
+        write(joinpath(dir, "fmt.jl"), source)
+        @test task.check(dir)
+    end
+
+    mktempdir() do dir
+        task = get_task("deep-trace")
+        task.setup(dir)
+        write(joinpath(dir, "test_pipeline.jl"), "println(\"OK\")\n")
+        @test !task.check(dir)
+        task.setup(dir)
+        path = joinpath(dir, "src", "b_config.jl")
+        write(path, replace(read(path, String), "scale = 0.0" => "scale = 1.0"))
+        @test task.check(dir)
+    end
+
+    mktempdir() do dir
+        task = get_task("big-file-precision")
+        task.setup(dir)
+        path = joinpath(dir, "validators.jl")
+        source = replace(read(path, String), "x > 157" => "x > 250")
+        write(path, source)
+        @test !task.check(dir)  # the requested comment update is still missing
+        write(path, validators_source(; widened = true))
+        @test task.check(dir)
+    end
 end
 
 end

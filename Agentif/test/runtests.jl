@@ -88,6 +88,29 @@ function test_force_close_stream(http)
     error("Unable to find the test server stream transport")
 end
 
+@testset "evaluate interruption is not logged as a failure" begin
+    interrupted_handler = Agentif.evaluate_middleware(
+        (f, agent, state, input, abort; kw...) -> throw(InterruptException()))
+    logger = Test.TestLogger(; min_level = Logging.Error)
+    @test_throws InterruptException Logging.with_logger(logger) do
+        interrupted_handler(_ -> nothing, make_agent(), AgentState(), "stop", Abort())
+    end
+    @test isempty(logger.logs)
+end
+
+@testset "evaluate failures log only at debug level" begin
+    failed_handler = Agentif.evaluate_middleware(
+        (f, agent, state, input, abort; kw...) -> error("expected failure"))
+    logger = Test.TestLogger(; min_level = Logging.Debug)
+    @test_throws ErrorException Logging.with_logger(logger) do
+        failed_handler(_ -> nothing, make_agent(), AgentState(), "fail", Abort())
+    end
+    failure_logs = filter(log -> log.message == "Agent evaluate failed", logger.logs)
+    @test length(failure_logs) == 1
+    @test only(failure_logs).level == Logging.Debug
+    @test all(log -> log.level < Logging.Error, logger.logs)
+end
+
 function fake_jwt(payload::AbstractDict)
     encoded = Base64.base64encode(JSON.json(payload))
     encoded = replace(encoded, '+' => '-', '/' => '_')
@@ -3692,4 +3715,160 @@ end
         Agentif.close_codex_websocket_pool!()
         close(ws_server)
     end
+end
+
+@testset "openrouter reasoning_details deltas are not double-appended" begin
+    # OpenRouter mirrors each reasoning token into BOTH delta.reasoning and
+    # delta.reasoning_details[].text. The details stream is canonical; the
+    # plain field must be skipped for those deltas or every token doubles.
+    chunks = String[]
+    for tok in ("Let", " me", " think")
+        push!(chunks, "data: " * JSON.json((; choices = [(; index = 0,
+            delta = (; reasoning = tok,
+                reasoning_details = [Dict("type" => "reasoning.text", "text" => tok)]),
+            finish_reason = nothing)])))
+    end
+    # Details without usable text must not suppress the plain reasoning fallback.
+    push!(chunks, "data: " * JSON.json((; choices = [(; index = 0,
+        delta = (; reasoning = " fallback",
+            reasoning_details = [Dict("type" => "reasoning.text", "text" => "")]),
+        finish_reason = nothing)])))
+    push!(chunks, "data: " * JSON.json((; choices = [(; index = 0,
+        delta = (; content = "42"), finish_reason = nothing)])))
+    push!(chunks, "data: " * JSON.json((; choices = [(; index = 0, delta = (;), finish_reason = "stop")])))
+    push!(chunks, "data: [DONE]")
+    body = join(chunks, "\n\n") * "\n\n"
+
+    server = HTTP.serve!("127.0.0.1", 0) do req
+        return HTTP.Response(200, ["Content-Type" => "text/event-stream"], body)
+    end
+    try
+        port = test_server_port(server)
+        model = Model(
+            id = "test-reasoning", name = "test-reasoning", api = "openai-completions",
+            provider = "openrouter", baseUrl = "http://127.0.0.1:$port", reasoning = true,
+            input = ["text"],
+            cost = Dict("input" => 0.0, "output" => 0.0, "cacheRead" => 0.0, "cacheWrite" => 0.0),
+            contextWindow = 128000, maxTokens = 4096,
+            compat = Dict{String, Any}("thinkingFormat" => "openrouter"),
+        )
+        agent = Agent(prompt = "p", model = model, apikey = "k")
+        reasoning_deltas = String[]
+        state = stream(agent, AgentState(), "q", Abort()) do event
+            if event isa MessageUpdateEvent && event.kind == :reasoning
+                push!(reasoning_deltas, event.delta)
+            end
+        end
+        msg = state.messages[end]
+        thinking_blocks = [b for b in msg.content if b isa Agentif.ThinkingContent]
+        thinking = join((b.thinking for b in thinking_blocks), "")
+        @test thinking == "Let me think fallback"
+        @test join(reasoning_deltas, "") == "Let me think fallback"
+        @test Agentif.message_text(msg) == "42"
+        details = JSON.parse(only(thinking_blocks).thinkingSignature)
+        @test [get(d, "text", nothing) for d in details] == ["Let", " me", " think", ""]
+    finally
+        close(server)
+    end
+end
+
+@testset "openrouter non-streaming reasoning falls back from metadata-only details" begin
+    body = JSON.json((;
+        id = "chatcmpl-test", object = "chat.completion", created = 0,
+        model = "test-reasoning",
+        choices = [(; index = 0,
+            message = (; role = "assistant", content = "42", reasoning = "fallback",
+                reasoning_details = [Dict("type" => "reasoning.encrypted", "data" => "sig")]),
+            finish_reason = "stop")],
+        usage = (; prompt_tokens = 1, completion_tokens = 2, total_tokens = 3),
+    ))
+    server = HTTP.serve!("127.0.0.1", 0) do req
+        return HTTP.Response(200, ["Content-Type" => "application/json"], body)
+    end
+    try
+        port = test_server_port(server)
+        model = Model(
+            id = "test-reasoning", name = "test-reasoning", api = "openai-completions",
+            provider = "openrouter", baseUrl = "http://127.0.0.1:$port", reasoning = true,
+            input = ["text"],
+            cost = Dict("input" => 0.0, "output" => 0.0, "cacheRead" => 0.0, "cacheWrite" => 0.0),
+            contextWindow = 128000, maxTokens = 4096,
+            compat = Dict{String, Any}("thinkingFormat" => "openrouter"),
+        )
+        agent = Agent(prompt = "p", model = model, apikey = "k")
+        state = stream(_ -> nothing, agent, AgentState(), "q", Abort(); stream = false)
+        msg = state.messages[end]
+        thinking_blocks = [b for b in msg.content if b isa Agentif.ThinkingContent]
+        thinking = join((b.thinking for b in thinking_blocks), "")
+        @test thinking == "fallback"
+        @test Agentif.message_text(msg) == "42"
+        @test JSON.parse(only(thinking_blocks).thinkingSignature) ==
+            [Dict("type" => "reasoning.encrypted", "data" => "sig")]
+    finally
+        close(server)
+    end
+end
+
+@testset "openrouter reasoning replay is round-scoped" begin
+    model = Model(
+        id = "test-rr", name = "test-rr", api = "openai-completions",
+        provider = "openrouter", baseUrl = "http://localhost", reasoning = true,
+        input = ["text"],
+        cost = Dict("input" => 0.0, "output" => 0.0, "cacheRead" => 0.0, "cacheWrite" => 0.0),
+        contextWindow = 128000, maxTokens = 4096,
+        compat = Dict{String, Any}("thinkingFormat" => "openrouter"),
+    )
+    agent = Agent(prompt = "p", model = model, apikey = "k")
+    old_details = [Dict("type" => "reasoning.text", "text" => "old thinking")]
+    current_details = [Dict("type" => "reasoning.encrypted", "data" => "current-sig")]
+    state = AgentState()
+    push!(state.messages, Agentif.UserMessage([Agentif.TextContent(; text = "round one")]))
+    push!(state.messages, AssistantMessage(;
+        provider = "other", api = "openai-completions", model = "other-model",
+        content = Agentif.AssistantContentBlock[
+            # Cross-model and unsigned thinking becomes text in transform_messages;
+            # round scoping must remove it before that conversion.
+            Agentif.ThinkingContent(; thinking = "old unsigned thinking"),
+            Agentif.TextContent(; text = "answer one"),
+            Agentif.ToolCallContent(; id = "old-call", name = "bash", arguments = Dict("command" => "true"),
+                thoughtSignature = JSON.json(only(old_details))),
+        ]))
+    push!(state.messages, Agentif.ToolResultMessage(;
+        call_id = "old-call", name = "bash", content = [Agentif.TextContent(; text = "ok")], is_error = false))
+    push!(state.messages, Agentif.UserMessage([Agentif.TextContent(; text = "round two")]))
+    push!(state.messages, AssistantMessage(;
+        provider = "openrouter", api = "openai-completions", model = "test-rr",
+        content = Agentif.AssistantContentBlock[
+            Agentif.ThinkingContent(; thinking = "current thinking",
+                thinkingSignature = JSON.json(current_details)),
+            Agentif.ToolCallContent(; id = "current-call", name = "bash",
+                arguments = Dict("command" => "true")),
+        ]))
+
+    messages, _ = Agentif.openai_completions_build_messages(agent, state, [Agentif.ToolResultMessage(;
+        call_id = "current-call", name = "bash", content = [Agentif.TextContent(; text = "ok")], is_error = false)], model)
+    assistants = [m for m in messages if m.role == "assistant"]
+    @test length(assistants) == 2
+    # prior-round reasoning dropped; current-round reasoning replayed
+    first_content = assistants[1].content
+    @test !occursin("old unsigned thinking", JSON.json(first_content))
+    @test assistants[1].reasoning_details === nothing
+    @test assistants[2].reasoning_details == current_details
+
+    compacted = AgentState(messages = Agentif.StoredAgentMessage[
+        Agentif.CompactionSummaryMessage(; summary = "summary", tokens_before = 100, compacted_at = time()),
+        AssistantMessage(;
+            provider = "openrouter", api = "openai-completions", model = "test-rr",
+            content = Agentif.AssistantContentBlock[
+                Agentif.ThinkingContent(; thinking = "after summary",
+                    thinkingSignature = JSON.json(current_details)),
+                Agentif.ToolCallContent(; id = "summary-call", name = "bash",
+                    arguments = Dict("command" => "true")),
+            ]),
+    ])
+    compacted_messages, _ = Agentif.openai_completions_build_messages(
+        agent, compacted, [Agentif.ToolResultMessage(;
+            call_id = "summary-call", name = "bash",
+            content = [Agentif.TextContent(; text = "ok")], is_error = false)], model)
+    @test only(m.reasoning_details for m in compacted_messages if m.role == "assistant") == current_details
 end
