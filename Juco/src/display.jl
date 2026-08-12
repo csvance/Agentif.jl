@@ -11,36 +11,57 @@ yellow(io::IO, s) = use_color(io) ? "\e[33m$(s)\e[0m" : String(s)
 bold(io::IO, s) = use_color(io) ? "\e[1m$(s)\e[22m" : String(s)
 
 # Provider reasoning streams use arbitrary chunk and whitespace boundaries.
-# Reflow them as terminal prose while preserving real paragraph breaks.
+# Some OpenRouter backends even put one or two newlines between streamed token
+# fragments while retaining the token's leading space. Render reasoning as one
+# terminal paragraph. Natural terminal wrapping is enough for this transient
+# output, and it avoids turning provider delimiters into a wall of short lines.
 mutable struct ReasoningDisplayState
     started::Bool
-    pending_space::Bool
-    pending_newlines::Int
+    pending_horizontal_space::Bool
+    pending_newline::Bool
+    last_char::Char
 end
 
-ReasoningDisplayState() = ReasoningDisplayState(false, false, 0)
+ReasoningDisplayState() = ReasoningDisplayState(false, false, false, '\0')
 
 function reset_reasoning!(state::ReasoningDisplayState)
     state.started = false
-    state.pending_space = false
-    state.pending_newlines = 0
+    state.pending_horizontal_space = false
+    state.pending_newline = false
+    state.last_char = '\0'
     return nothing
+end
+
+reasoning_word_char(char::Char) = isletter(char) || isnumeric(char) || char == '_'
+
+# A newline without horizontal whitespace is often an injected token boundary.
+# Join lexical fragments and attached punctuation. Otherwise use one space.
+function reasoning_fragments_attach(left::Char, right::Char)
+    return (reasoning_word_char(left) && reasoning_word_char(right)) ||
+        ispunct(right) || left in ('(', '[', '{', '\'', '"', '`', '/', '\\', '-', '_')
 end
 
 function reflow_reasoning!(state::ReasoningDisplayState, delta::AbstractString)
     buf = IOBuffer()
     for char in delta
         if isspace(char)
-            state.pending_space = true
-            char == '\n' && (state.pending_newlines += 1)
+            if char == '\n' || char == '\r'
+                state.pending_newline = true
+            else
+                state.pending_horizontal_space = true
+            end
             continue
         end
-        if state.pending_space && state.started
-            state.pending_newlines >= 2 ? print(buf, "\n  ") : print(buf, ' ')
+        if state.started && (state.pending_horizontal_space || state.pending_newline)
+            if state.pending_horizontal_space ||
+                    !reasoning_fragments_attach(state.last_char, char)
+                print(buf, ' ')
+            end
         end
-        state.pending_space = false
-        state.pending_newlines = 0
+        state.pending_horizontal_space = false
+        state.pending_newline = false
         state.started = true
+        state.last_char = char
         print(buf, char)
     end
     return String(take!(buf))

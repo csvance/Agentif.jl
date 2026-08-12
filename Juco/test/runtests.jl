@@ -250,7 +250,22 @@ end
     @test rendered == "The tool is ready."
     Juco.reset_reasoning!(state)
     @test Juco.reflow_reasoning!(state, "First paragraph.\n\nSecond paragraph.") ==
-        "First paragraph.\n  Second paragraph."
+        "First paragraph. Second paragraph."
+
+    # Some OpenRouter endpoints delimit streamed token fragments with newlines.
+    # Leading spaces still mark real word boundaries; newline-only boundaries
+    # can split identifiers, filenames, and punctuation.
+    Juco.reset_reasoning!(state)
+    rendered = join((
+        Juco.reflow_reasoning!(state, "The\n\n fmt\n.j\n"),
+        Juco.reflow_reasoning!(state, "l\n\n file\n\n shows\n my\n\n edit\n to\n pad\n"),
+        Juco.reflow_reasoning!(state, "_id\n\n reverted\n?\n The\n current\n file\n has\n `pad\n"),
+        Juco.reflow_reasoning!(state, "_id(n)\n =\nlpad(n,\n 6,\n '0')`\n again\n."),
+    ))
+    @test rendered ==
+        "The fmt.jl file shows my edit to pad_id reverted? " *
+        "The current file has `pad_id(n) = lpad(n, 6, '0')` again."
+    @test !occursin('\n', rendered)
 end
 
 @testset "interactive terminal" begin
