@@ -7,10 +7,14 @@
 # these tools do the same, so `find` and `grep` agree with what a developer sees
 # and with each other.
 #
-# Rules are read only from within the tool's base directory: a `.gitignore` above
-# it belongs to a tree the tools may not touch, and reaching for it would leak
-# the sandbox boundary. Everything below the base directory is honoured, each
-# `.gitignore` applying to its own subtree the way git applies it.
+# Rules are looked for only at paths within the tool's base directory: a
+# `.gitignore` above it belongs to a tree the tools may not touch, and reaching
+# for it would leak the sandbox boundary. Everything below the base directory is
+# honoured, each `.gitignore` applying to its own subtree the way git applies it.
+# Note the boundary is on the path, not on the bytes: a `.gitignore` that is
+# itself a symlink out of the tree is followed, like any other file the tools
+# read. Pattern text is never echoed to output, so the only thing that crosses is
+# which entries were hidden.
 
 const IGNORE_FILE_NAME = ".gitignore"
 
@@ -66,8 +70,14 @@ print_regex_literal(io::IO, char::AbstractChar) =
     char in IGNORE_REGEX_META ? print(io, '\\', char) : print(io, char)
 
 # Translate a bracket expression starting at `idx` (the `[`). Returns the
-# character index just past the closing `]`, or nothing when there is none, in
-# which case git treats the `[` as a literal.
+# character index just past the closing `]`, or nothing when the expression
+# cannot be translated faithfully, which makes the whole pattern inert.
+#
+# `nothing` covers two cases, and git makes both inert too: an unterminated `[`,
+# where git's `wildmatch` returns WM_ABORT_ALL so the pattern matches nothing,
+# and a `[=equiv=]` or `[.collating.]` element, which PCRE does not implement.
+# Guessing at either is worse than matching nothing, because a pattern that
+# quietly matches the wrong set hides files the caller needed.
 function translate_char_class(out::IO, pattern::AbstractString, idx::Int)
     last_idx = lastindex(pattern)
     cursor = nextind(pattern, idx)
@@ -84,6 +94,19 @@ function translate_char_class(out::IO, pattern::AbstractString, idx::Int)
         if char == ']' && !at_start
             print(out, "[", negated ? "^" : "", String(take!(body)), "]")
             return nextind(pattern, cursor)
+        end
+        if char == '['
+            # A POSIX class such as `[:digit:]` is legal in a gitignore pattern
+            # and is also PCRE syntax, so it passes through verbatim. Escaping
+            # the `[` instead turned `[[:digit:]]` into a class of the six
+            # characters in ":digit" followed by a literal `]`.
+            after_posix = _copy_posix_class(body, pattern, cursor)
+            if after_posix !== nothing
+                cursor = after_posix
+                at_start = false
+                continue
+            end
+            _is_collating_element(pattern, cursor) && return nothing
         end
         if char == '\\'
             escaped = nextind(pattern, cursor)
@@ -103,6 +126,36 @@ function translate_char_class(out::IO, pattern::AbstractString, idx::Int)
     return nothing
 end
 
+# `[:name:]` at `cursor`: copy it through and return the index past it, or
+# nothing when this is not one.
+function _copy_posix_class(body::IO, pattern::AbstractString, cursor::Int)
+    last_idx = lastindex(pattern)
+    open_colon = nextind(pattern, cursor)
+    (open_colon <= last_idx && pattern[open_colon] == ':') || return nothing
+    probe = nextind(pattern, open_colon)
+    name = IOBuffer()
+    while probe <= last_idx
+        if pattern[probe] == ':'
+            close_bracket = nextind(pattern, probe)
+            (close_bracket <= last_idx && pattern[close_bracket] == ']') || return nothing
+            print(body, "[:", String(take!(name)), ":]")
+            return nextind(pattern, close_bracket)
+        end
+        isletter(pattern[probe]) || return nothing
+        print(name, pattern[probe])
+        probe = nextind(pattern, probe)
+    end
+    return nothing
+end
+
+# `[=x=]` or `[.x.]`, which git supports and PCRE does not.
+function _is_collating_element(pattern::AbstractString, cursor::Int)
+    last_idx = lastindex(pattern)
+    marker = nextind(pattern, cursor)
+    marker <= last_idx || return false
+    return pattern[marker] == '=' || pattern[marker] == '.'
+end
+
 """
     ignore_glob_to_regex(pattern, anchored) -> Regex
 
@@ -113,6 +166,12 @@ at any depth, which is git's rule for a pattern containing no `/`.
 `*` and `?` stop at a separator; `**/`, `/**/` and a trailing `/**` cross them.
 Stepping is by character index rather than by byte, because a byte-stepped loop
 throws `StringIndexError` on a non-ASCII pattern.
+
+Returns nothing for a pattern git treats as inert, matching nothing: an
+untranslatable bracket expression, a trailing lone backslash, or a body whose
+regex will not compile. A `.gitignore` is untrusted input from whatever
+repository the caller happens to be standing in, and one unusable line must cost
+that line only, not the whole tool.
 """
 function ignore_glob_to_regex(pattern::AbstractString, anchored::Bool)
     out = IOBuffer()
@@ -125,13 +184,11 @@ function ignore_glob_to_regex(pattern::AbstractString, anchored::Bool)
         char = pattern[idx]
         next_idx = nextind(pattern, idx)
         if char == '\\'
-            if next_idx <= last_idx
-                print_regex_literal(out, pattern[next_idx])
-                idx = nextind(pattern, next_idx)
-            else
-                print(out, "\\\\")
-                idx = next_idx
-            end
+            # A pattern ending in a lone backslash is inert in git, not a literal
+            # backslash: `wildmatch` aborts on the unterminated escape.
+            next_idx > last_idx && return nothing
+            print_regex_literal(out, pattern[next_idx])
+            idx = nextind(pattern, next_idx)
             continue
         elseif char == '*'
             run_end = idx
@@ -162,27 +219,34 @@ function ignore_glob_to_regex(pattern::AbstractString, anchored::Bool)
             continue
         elseif char == '['
             after_class = translate_char_class(out, pattern, idx)
-            if after_class === nothing
-                print(out, "\\[")
-                idx = next_idx
-            else
-                idx = after_class
-            end
+            after_class === nothing && return nothing
+            idx = after_class
             continue
         end
         print_regex_literal(out, char)
         idx = next_idx
     end
     print(out, "\$")
-    return Regex(String(take!(out)))
+    source = String(take!(out))
+    return try
+        Regex(source)
+    catch
+        # An invalid range such as `[c-a]` is a PCRE compilation error. git leaves
+        # such a pattern inert rather than failing, and so must this: the
+        # alternative is that one bad line in one `.gitignore` throws out of every
+        # ls, find and grep over the whole tree.
+        nothing
+    end
 end
 
-# Strip the trailing whitespace git strips, which is everything unescaped. A
+# Strip the trailing whitespace git strips, which is unescaped SPACES only. A
 # backslash before the last space quotes it, so `foo\ ` really does mean a name
-# ending in a space.
+# ending in a space. Tabs are deliberately not stripped: git's
+# `trim_trailing_spaces` switches on ' ' alone, so a pattern ending in a tab
+# matches a filename ending in a tab.
 function strip_unescaped_trailing_space(line::AbstractString)
     stop = lastindex(line)
-    while stop >= firstindex(line) && (line[stop] == ' ' || line[stop] == '\t')
+    while stop >= firstindex(line) && line[stop] == ' '
         previous = prevind(line, stop)
         # Count the backslashes immediately before this run; an odd number means
         # the whitespace is quoted and the stripping stops here.
@@ -205,7 +269,10 @@ Compile one `.gitignore` line, or return nothing for a blank line or a comment.
 Leading whitespace is significant to git and is kept.
 """
 function parse_ignore_line(line::AbstractString)
-    body = strip_unescaped_trailing_space(rstrip(line, '\r'))
+    # Exactly one CR, which is the CRLF that `eachsplit` left behind. Stripping
+    # every trailing CR would turn `a.txt\r\r` into the pattern `a.txt`, where
+    # git reads it as `a.txt\r` and matches nothing.
+    body = strip_unescaped_trailing_space(endswith(line, '\r') ? chop(line) : line)
     isempty(body) && return nothing
     startswith(body, "#") && return nothing
     negated = false
@@ -225,18 +292,24 @@ function parse_ignore_line(line::AbstractString)
     anchored = occursin('/', body)
     startswith(body, "/") && (body = body[nextind(body, firstindex(body)):end])
     isempty(body) && return nothing
-    return IgnorePattern(ignore_glob_to_regex(body, anchored), negated, dir_only)
+    regex = ignore_glob_to_regex(body, anchored)
+    regex === nothing && return nothing
+    return IgnorePattern(regex, negated, dir_only)
 end
 
 function load_ignore_patterns(path::AbstractString, prefix::AbstractString)
-    isfile(path) || return nothing
     content = try
-        read(path, String)
+        # `isfile` and the read are both inside the guard: a directory the process
+        # cannot traverse makes even the stat throw EACCES, and probing for a
+        # `.gitignore` must never be the thing that fails a tool call.
+        isfile(path) ? read(path, String) : nothing
     catch
-        # An unreadable ignore file is not worth failing the tool call over;
-        # the caller just sees more than it otherwise would.
-        return nothing
+        nothing
     end
+    content === nothing && return nothing
+    # A BOM would otherwise become part of the first pattern, making it dead.
+    # Windows editors write them.
+    startswith(content, '\ufeff') && (content = content[nextind(content, firstindex(content)):end])
     patterns = IgnorePattern[]
     for line in eachsplit(content, '\n')
         pattern = parse_ignore_line(line)
@@ -246,8 +319,22 @@ function load_ignore_patterns(path::AbstractString, prefix::AbstractString)
     return IgnoreRules(String(prefix), patterns)
 end
 
-load_ignore_rules(dir::AbstractString, prefix::AbstractString) =
-    load_ignore_patterns(joinpath(dir, IGNORE_FILE_NAME), prefix)
+"""
+    load_dir_rules(dir, prefix) -> Vector{IgnoreRules}
+
+Everything `dir` contributes: its repository-local excludes first, then its
+`.gitignore`, which is the precedence git gives them. A directory contributes
+both because a repository nested below the base directory is still a repository:
+picking up its `.gitignore` but not its excludes would honour half its rules.
+"""
+function load_dir_rules(dir::AbstractString, prefix::AbstractString)
+    rules = IgnoreRules[]
+    excludes = load_ignore_patterns(joinpath(dir, GIT_EXCLUDE_PATH...), prefix)
+    excludes === nothing || push!(rules, excludes)
+    own = load_ignore_patterns(joinpath(dir, IGNORE_FILE_NAME), prefix)
+    own === nothing || push!(rules, own)
+    return rules
+end
 
 # A path relative to the ignore root, `/`-separated, "" for the root itself.
 function root_relative(root::AbstractString, path::AbstractString)
@@ -266,18 +353,14 @@ function ignore_context(base::AbstractString, dir::AbstractString; enabled::Bool
     root = abspath(base)
     rules = IgnoreRules[]
     if enabled
-        excludes = load_ignore_patterns(joinpath(root, GIT_EXCLUDE_PATH...), "")
-        excludes === nothing || push!(rules, excludes)
-        root_rules = load_ignore_rules(root, "")
-        root_rules === nothing || push!(rules, root_rules)
+        append!(rules, load_dir_rules(root, ""))
         prefix = ""
         for segment in eachsplit(root_relative(root, dir), '/'; keepempty = false)
             # `..` cannot appear for a contained path, but a rule set built from
             # one would be nonsense, so stop rather than guess.
             segment == ".." && break
             prefix = isempty(prefix) ? String(segment) : "$(prefix)/$(segment)"
-            nested = load_ignore_rules(joinpath(root, split(prefix, '/')...), prefix)
-            nested === nothing || push!(rules, nested)
+            append!(rules, load_dir_rules(joinpath(root, split(prefix, '/')...), prefix))
         end
     end
     return IgnoreContext(root, enabled, rules)
@@ -344,15 +427,60 @@ is_ignored(ctx::IgnoreContext, rel::AbstractString, is_dir::Bool) =
     is_ignored(ctx, ctx.rules, rel, is_dir)
 
 # Matches `walkdir`'s default of not following symlinked directories, which also
-# happens to be git's view: a symlink is a file, whatever it points at.
-is_directory_entry(path::AbstractString) = isdir(path) && !islink(path)
+# happens to be git's view: a symlink is a file, whatever it points at. An entry
+# that cannot be stat'ed at all counts as a file, so the walk reports it and
+# moves on instead of throwing.
+function is_directory_entry(path::AbstractString)
+    return try
+        isdir(path) && !islink(path)
+    catch
+        false
+    end
+end
+
+# `Base.walkdir` gets its speed from `_readdirx`, whose entries carry the type the
+# OS already reported for each dirent, so `isdir`/`islink` on one costs no stat
+# call. Reading names with `readdir` and stat'ing each of them instead made this
+# walk four times slower than `walkdir` on a tree with no rules in it at all,
+# which is pure overhead on every `find` and `grep`.
+#
+# It is a Base internal, so it is used only where it exists, with the same
+# behaviour either way. `walkdir` itself is built on it, which is why it is a
+# reasonable thing to depend on.
+const HAS_READDIRX = isdefined(Base.Filesystem, :_readdirx)
+
+# dir_entries(dir) -> Vector{Tuple{String,Bool}}
+#
+# Each entry of `dir` as `(name, is_dir)`, in the alphabetical order both
+# `readdir` and `_readdirx` return. Throws if the directory cannot be read; the
+# walk decides what to do about that.
+@static if HAS_READDIRX
+    dir_entries(dir::AbstractString) =
+        Tuple{String,Bool}[(entry.name, _entry_is_dir(entry))
+                           for entry in Base.Filesystem._readdirx(dir)]
+    # Mirrors walkdir: an entry whose type cannot be determined is a file.
+    _entry_is_dir(entry) = !_probe(islink, entry, true) && _probe(isdir, entry, false)
+    _probe(f, entry, fallback::Bool) = try
+        f(entry)
+    catch
+        fallback
+    end
+else
+    dir_entries(dir::AbstractString) =
+        Tuple{String,Bool}[(name, is_directory_entry(joinpath(dir, name)))
+                           for name in readdir(dir)]
+end
 
 """
-    walk_filtered(f, ctx, start) -> Bool
+    walk_filtered(f, ctx, start) -> (; completed::Bool, skipped::Int)
 
 Walk `start` depth-first, pruning entries [`is_ignored`](@ref) rejects, and call
 `f(dir, dirs, files)` once per surviving directory with the surviving entry
-names. `f` returns `false` to stop the walk, in which case this returns `false`.
+names. `f` returns `false` to stop the walk, which makes `completed` false.
+
+`skipped` counts the entries the ignore rules removed, so a caller can tell an
+empty result caused by the rules from one caused by its own pattern. It counts
+entries, not files: a pruned directory holding a thousand files counts once.
 
 Pruning happens at the directory level, so an ignored directory is never
 descended into. That matches git, where a rule inside an excluded directory
@@ -368,10 +496,11 @@ function walk_filtered(f, ctx::IgnoreContext, start::AbstractString)
     # Rules for `start` already include its own `.gitignore`; each descent adds
     # the child's, if it has one.
     pending = [(start_dir, start_rel, ctx.rules)]
+    skipped = 0
     while !isempty(pending)
         dir, dir_rel, rules = pop!(pending)
         entries = try
-            sort!(readdir(dir))
+            dir_entries(dir)
         catch
             # A directory that cannot be read is skipped, matching the way the
             # tools already swallow unreadable files.
@@ -379,22 +508,30 @@ function walk_filtered(f, ctx::IgnoreContext, start::AbstractString)
         end
         dirs = String[]
         files = String[]
-        for name in entries
-            full = joinpath(dir, name)
-            rel = isempty(dir_rel) ? name : "$(dir_rel)/$(name)"
-            is_dir = is_directory_entry(full)
-            is_ignored(ctx, rules, rel, is_dir) && continue
+        has_rules = !isempty(rules)
+        for (name, is_dir) in entries
+            # Checked on the name, before any path is built: this runs for every
+            # entry in the tree, and on a tree with no rules at all it is the only
+            # work the filter does.
+            always_ignored(name) && continue
+            if has_rules
+                rel = isempty(dir_rel) ? name : "$(dir_rel)/$(name)"
+                if path_ignored(rules, rel, is_dir)
+                    skipped += 1
+                    continue
+                end
+            end
             push!(is_dir ? dirs : files, name)
         end
-        f(dir, dirs, files) === false && return false
+        f(dir, dirs, files) === false && return (; completed = false, skipped)
         # Reversed, because the stack pops last-in first: this keeps the walk in
         # alphabetical order.
         for name in Iterators.reverse(dirs)
             child_rel = isempty(dir_rel) ? name : "$(dir_rel)/$(name)"
             child = joinpath(dir, name)
-            nested = ctx.enabled ? load_ignore_rules(child, child_rel) : nothing
-            push!(pending, (child, child_rel, nested === nothing ? rules : vcat(rules, nested)))
+            nested = ctx.enabled ? load_dir_rules(child, child_rel) : IgnoreRules[]
+            push!(pending, (child, child_rel, isempty(nested) ? rules : vcat(rules, nested)))
         end
     end
-    return true
+    return (; completed = true, skipped)
 end

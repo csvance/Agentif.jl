@@ -113,8 +113,166 @@ end
     @test !path_ignored([rules_from(["*.log", "!keep.log"])], "keep.log", false)
     @test path_ignored([rules_from(["!keep.log", "*.log"])], "keep.log", false)
 
-    # An unterminated `[` is a literal bracket.
-    @test path_ignored([rules_from(["a[b.txt"])], "a[b.txt", false)
+    # An unterminated `[` is inert in git (`wildmatch` returns WM_ABORT_ALL), so
+    # the pattern must match nothing rather than becoming a literal bracket.
+    @test parse_ignore_line("a[b.txt") === nothing
+    @test parse_ignore_line("[abc") === nothing
+end
+
+@testset "a malformed .gitignore costs that line only" begin
+    # A `.gitignore` is untrusted input from whatever repository the caller is
+    # standing in. An invalid bracket range is a PCRE compilation error, and it
+    # used to throw out of all three tools for the whole tree.
+    for bad in ("[c-a].txt", "[a-\\d].txt", "[9-0].txt", "[\\w-z].txt")
+        @test parse_ignore_line(bad) === nothing
+    end
+    # A trailing lone backslash is inert in git too.
+    @test parse_ignore_line("foo\\") === nothing
+
+    mktempdir() do dir
+        write(joinpath(dir, ".gitignore"), "[c-a].txt\n*.log\n")
+        write(joinpath(dir, "a.txt"), "x")
+        write(joinpath(dir, "b.log"), "x")
+        funcs = search_funcs(dir)
+        # The tools still work, the bad line matches nothing, and the good line
+        # after it is still applied.
+        listing = funcs["ls"](".", nothing, nothing)
+        @test occursin("a.txt", listing)
+        @test !occursin("b.log", listing)
+        @test funcs["find"]("**/*", nothing, nothing, nothing) isa String
+        @test funcs["grep"]("x", nothing, nothing, nothing, nothing, nothing, nothing, nothing) isa String
+    end
+end
+
+# Every expectation in the pattern-semantics testsets here was checked against
+# the real `git check-ignore` (git 2.43) on the same fixture, rather than read off
+# the gitignore man page. The one known divergence left is `[=equiv=]` and
+# `[.collating.]`, which PCRE cannot express, so those patterns are inert.
+@testset "bracket expression corner cases" begin
+    # A `]` in the first position is a member, not the terminator.
+    @test path_ignored([rules_from(["[]abc].txt"])], "].txt", false)
+    @test path_ignored([rules_from(["[!]abc].txt"])], "d.txt", false)
+    @test !path_ignored([rules_from(["[!]abc].txt"])], "].txt", false)
+    # A trailing `-` is a literal, not a broken range.
+    @test path_ignored([rules_from(["[a-].txt"])], "-.txt", false)
+    @test path_ignored([rules_from(["[a-].txt"])], "a.txt", false)
+    # An escaped `]` inside the class.
+    @test path_ignored([rules_from(["[\\]].txt"])], "].txt", false)
+    # A real range still works.
+    @test path_ignored([rules_from(["[a-c].txt"])], "b.txt", false)
+    @test !path_ignored([rules_from(["[a-c].txt"])], "d.txt", false)
+end
+
+@testset "POSIX character classes" begin
+    # `[[:digit:]]` is legal in a gitignore pattern and is also PCRE syntax, so it
+    # passes through. Escaping the `[` turned it into a class of ":digit"'s
+    # characters followed by a literal `]`, which hid the wrong files.
+    digits = rules_from(["[[:digit:]].txt"])
+    @test path_ignored([digits], "1.txt", false)
+    @test !path_ignored([digits], "a.txt", false)
+    @test !path_ignored([digits], "[.txt", false)
+
+    alpha = rules_from(["[[:alpha:]][[:digit:]].jl"])
+    @test path_ignored([alpha], "a1.jl", false)
+    @test !path_ignored([alpha], "11.jl", false)
+
+    # Collating elements and equivalence classes are git syntax that PCRE does
+    # not implement, so the pattern is inert rather than mistranslated.
+    @test parse_ignore_line("[[=a=]].txt") === nothing
+    @test parse_ignore_line("[[.a.]].txt") === nothing
+end
+
+@testset "git's whitespace, CR and BOM rules" begin
+    # Trailing spaces go unless escaped; trailing TABS stay, because git's
+    # trim_trailing_spaces switches on ' ' alone.
+    @test occursin(parse_ignore_line("trailing.txt   ").regex, "trailing.txt")
+    @test occursin(parse_ignore_line("space\\ ").regex, "space ")
+    tabbed = parse_ignore_line("tabbed.txt\t")
+    @test occursin(tabbed.regex, "tabbed.txt\t")
+    @test !occursin(tabbed.regex, "tabbed.txt")
+
+    # Exactly one trailing CR is the CRLF the line split left behind; a second
+    # one is part of the pattern, so it matches nothing on a normal filename.
+    @test occursin(parse_ignore_line("a.txt\r").regex, "a.txt")
+    @test !occursin(parse_ignore_line("a.txt\r\r").regex, "a.txt")
+
+    mktempdir() do dir
+        # A BOM would otherwise become part of the first pattern, killing it.
+        write(joinpath(dir, ".gitignore"), "\ufeff*.log\n")
+        write(joinpath(dir, "a.log"), "x")
+        write(joinpath(dir, "b.txt"), "x")
+        listing = search_funcs(dir)["ls"](".", nothing, nothing)
+        @test occursin("b.txt", listing)
+        @test !occursin("a.log", listing)
+    end
+end
+
+@testset "an unreadable directory does not fail the walk" begin
+    mktempdir() do dir
+        locked = joinpath(dir, "locked")
+        mkpath(locked)
+        write(joinpath(dir, "ok.txt"), "needle")
+        chmod(locked, 0o000)
+        try
+            funcs = search_funcs(dir)
+            # Probing the unreadable directory for a `.gitignore` used to throw
+            # EACCES before the walk's own guard could run.
+            # `*` rather than `**/*`: the latter requires an interior separator,
+            # so it would not match a top-level file regardless.
+            @test occursin("ok.txt", funcs["find"]("*", nothing, nothing, nothing))
+            @test occursin("ok.txt", funcs["grep"]("needle", nothing, nothing, nothing, nothing, nothing, nothing, nothing))
+            @test occursin("locked", funcs["ls"](".", nothing, nothing))
+        finally
+            chmod(locked, 0o755)
+        end
+    end
+end
+
+@testset "a nested repository's excludes are honoured too" begin
+    mktempdir() do home
+        repo = joinpath(home, "Git", "repo")
+        mkpath(joinpath(repo, ".git", "info"))
+        write(joinpath(repo, ".git", "info", "exclude"), "local-only.txt\n")
+        write(joinpath(repo, "tracked.txt"), "x")
+        write(joinpath(repo, "local-only.txt"), "x")
+        # Picking up a nested repository's .gitignore but not its excludes would
+        # honour half its rules.
+        found = search_funcs(home)["find"]("**/*.txt", nothing, nothing, nothing)
+        @test occursin("Git/repo/tracked.txt", found)
+        @test !occursin("local-only.txt", found)
+    end
+end
+
+@testset "notices survive the entry limit and do not misattribute" begin
+    mktempdir() do dir
+        write(joinpath(dir, ".gitignore"), "*.log\n")
+        for i in 1:5
+            write(joinpath(dir, "a$(i).txt"), "x")
+            write(joinpath(dir, "z$(i).log"), "x")
+        end
+        funcs = search_funcs(dir)
+        # The hidden count used to stop at the entry limit, so a truncated
+        # listing told the model nothing had been hidden.
+        limited = funcs["ls"](".", 3, nothing)
+        @test occursin("entries limit reached", limited)
+        @test occursin("5 entries hidden by .gitignore", limited)
+
+        # When the rules did remove something, the hint is earned.
+        @test occursin("includeIgnored", funcs["grep"]("nomatchanywhere", nothing, nothing, nothing, nothing, nothing, nothing, nothing))
+    end
+
+    # A tree where the rules exist but exclude nothing: the empty-result hint
+    # must not blame them when the glob or the pattern is the real reason.
+    mktempdir() do dir
+        write(joinpath(dir, ".gitignore"), "*.log\n")
+        write(joinpath(dir, "a.txt"), "x")
+        funcs = search_funcs(dir)
+        @test funcs["grep"]("x", nothing, "*.nope", nothing, nothing, nothing, nothing, nothing) ==
+              "No matches found"
+        @test funcs["grep"]("nomatchanywhere", nothing, nothing, nothing, nothing, nothing, nothing, nothing) ==
+              "No matches found"
+        @test funcs["find"]("*.nope", nothing, nothing, nothing) == "No files found matching pattern"
+    end
 end
 
 @testset "nested .gitignore precedence" begin
@@ -306,12 +464,15 @@ end
 
         ctx = ignore_context(dir, dir)
         visited = String[]
-        walk_filtered(ctx, dir) do root, _dirs, _files
+        walk = walk_filtered(ctx, dir) do root, _dirs, _files
             push!(visited, root)
             return true
         end
         @test length(visited) == 1
         @test !any(v -> occursin("node_modules", v), visited)
+        # The pruned directory is counted once, not once per file inside it.
+        @test walk.completed
+        @test walk.skipped == 1
 
         # And with the flag on, the walk goes in.
         ctx_all = ignore_context(dir, dir; enabled = false)
@@ -332,11 +493,11 @@ end
         end
         ctx = ignore_context(dir, dir)
         seen = String[]
-        completed = walk_filtered(ctx, dir) do root, _dirs, _files
+        walk = walk_filtered(ctx, dir) do root, _dirs, _files
             push!(seen, basename(root))
             return length(seen) < 2
         end
-        @test !completed
+        @test !walk.completed
         @test length(seen) == 2
     end
 end

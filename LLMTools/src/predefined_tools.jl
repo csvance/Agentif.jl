@@ -332,7 +332,7 @@ Use `ls` to see what's in a directory. For recursive file search by name pattern
 Arguments:
 - path (String or nothing, required): Directory path relative to the working directory, or nothing to list the working directory itself.
 - limit (Int, optional): Maximum number of entries to return. Defaults to 500.
-- includeIgnored (Bool or nothing, optional): By default, entries excluded by `.gitignore` are hidden, like `rg`. Set true to show them. Entries named `.git` are always hidden.
+- includeIgnored (Bool or nothing, optional): By default, entries excluded by `.gitignore` are hidden, like `rg`. Set true to show them. Entries named `.git` are hidden here, but `ls(".git")` still lists it, since the directory you name is always listed.
 
 Entries are sorted alphabetically (case-insensitive). Directories have a trailing `/` suffix. Dotfiles are included. Output is truncated to 500 entries or 50KB, whichever is hit first.
 
@@ -361,9 +361,13 @@ Examples:
                     ignored_count += 1
                     continue
                 end
+                # Keep counting past the limit rather than breaking: stopping here
+                # made the hidden-entry notice report only what the truncated
+                # prefix happened to contain, so a limited listing of a directory
+                # full of ignored files claimed nothing was hidden.
                 if length(results) >= effective_limit
                     entry_limit_reached = true
-                    break
+                    continue
                 end
                 suffix = isdir(full_path) ? "/" : ""
                 push!(results, entry * suffix)
@@ -465,7 +469,7 @@ Arguments:
 - pattern (String, required): Glob pattern to match against relative paths. Supports `*` (any chars except `/`), `**` (any path segments), and `?` (single char). Examples: `"*.jl"`, `"src/**/*.jl"`, `"test_*.jl"`.
 - path (String or nothing, optional): Directory to search within, relative to the working directory. Defaults to the working directory.
 - limit (Int, optional): Maximum number of results. Defaults to 1000.
-- includeIgnored (Bool or nothing, optional): By default, paths excluded by `.gitignore` are skipped, like `rg`. Set true to include them. Directories named `.git` are always skipped.
+- includeIgnored (Bool or nothing, optional): By default, paths excluded by `.gitignore` are skipped, like `rg`. Set true to include them. A `.git` directory found while walking is never entered, though searching inside one by passing it as `path` works.
 
 Matched directories have a trailing `/` suffix. Output is also capped at 50KB.
 
@@ -482,7 +486,7 @@ Examples:
             effective_limit = limit === nothing ? DEFAULT_FIND_LIMIT : max(1, limit)
             results = String[]
             limit_reached = false
-            walk_filtered(ignore, search_dir) do root, dirs, files
+            walk = walk_filtered(ignore, search_dir) do root, dirs, files
                 rel_root = relpath(root, search_dir)
                 rel_root = rel_root == "." ? "" : normalize_relpath(rel_root)
                 for dir in dirs
@@ -510,7 +514,9 @@ Examples:
                 return !limit_reached
             end
             if isempty(results)
-                return ignore.enabled ?
+                # Only mention the rules when they actually removed something: the
+                # hint used to appear even when the pattern was the whole reason.
+                return walk.skipped > 0 ?
                     "No files found matching pattern (gitignored paths were skipped; use includeIgnored=true to include them)" :
                     "No files found matching pattern"
             end
@@ -544,7 +550,7 @@ Arguments:
 - literal (Bool or nothing, optional): Treat pattern as a literal string, not regex.
 - context (Int or nothing, optional): Number of lines to show before and after each match (like `grep -C`).
 - limit (Int, optional): Maximum number of matches. Defaults to 100.
-- includeIgnored (Bool or nothing, optional): By default, files excluded by `.gitignore` are not searched, like `rg`. Set true to search them. Directories named `.git` are always skipped. A file named directly in `path` is always searched, ignored or not.
+- includeIgnored (Bool or nothing, optional): By default, files excluded by `.gitignore` are not searched, like `rg`. Set true to search them. A `.git` directory found while walking is never entered. The path given as `path` is itself always searched, ignored or not, though entries beneath it are still filtered.
 
 Lines longer than 500 characters are truncated. Output is capped at 50KB.
 
@@ -637,23 +643,26 @@ Examples:
                 end
                 return !match_limit_reached
             end
+            skipped = 0
             if isdir(search_path)
-                walk_filtered(ignore, search_path) do root, _dirs, files
+                walk = walk_filtered(ignore, search_path) do root, _dirs, files
                     for file in files
                         file_path = joinpath(root, file)
                         search_file(file_path, normalize_relpath(relpath(file_path, search_root))) || return false
                     end
                     return true
                 end
+                skipped = walk.skipped
             else
                 # A path the caller named is searched whether the ignore rules
                 # exclude it or not, the same way `rg some/ignored/file` searches it.
                 search_file(search_path, normalize_relpath(relpath(search_path, search_root)))
             end
             if isempty(output_lines)
-                # Only worth mentioning when the walk could have skipped something:
-                # a single named file is searched regardless of the ignore rules.
-                return (ignore.enabled && isdir(search_path)) ?
+                # Only worth mentioning when the walk actually skipped something.
+                # It used to fire whenever the rules were merely enabled, so a
+                # `glob` that excluded every file was blamed on `.gitignore`.
+                return skipped > 0 ?
                     "No matches found (gitignored files were not searched; use includeIgnored=true to search them)" :
                     "No matches found"
             end
