@@ -54,10 +54,11 @@ end
     events = parse_sse("data: one\ndata: two\n\n")
     @test events[1].data == "one\ntwo"
 
-    # CRLF terminators and a missing trailing blank line are both tolerated.
+    # CRLF terminators and a missing trailing blank line are both tolerated, and
+    # a field this client does not model is ignored rather than read as data.
     events = parse_sse("id: 7\r\ndata: x\r\n\r\ndata: y\n")
     @test length(events) == 2
-    @test events[1].id == "7"
+    @test events[1].data == "x"
     @test events[2].data == "y"
 
     # An event with no data is bookkeeping, not a message.
@@ -793,29 +794,20 @@ end
     end
 end
 
-@testset "server-initiated requests are bounded" begin
-    # A server that answers every POST with a request used to get an unbounded
-    # reply loop: each reply is a POST whose own body is routed back in.
-    answered = Threads.Atomic{Int}(0)
-    with_server((fs, msg, req) -> begin
-        msg === nothing && return nothing
-        method = get(msg, "method", "")
-        if method == "initialize" || startswith(method, "notifications/")
-            return default_dispatch(fs, msg, req)
-        end
-        # Every message the client sends, reply or not, provokes another request.
-        Threads.atomic_add!(answered, 1)
-        return json_response(Dict("jsonrpc" => "2.0", "id" => "srv-$(answered[])", "method" => "ping"))
-    end) do fs
-        client = Client(fs.url; timeout = 5)
-        try
-            # Enough to prove it terminates rather than growing without bound;
-            # the budget itself is 10_000, which is too slow to drive here.
-            sleep(2.0)
-            @test client.answered <= MCPClient.MAX_ANSWERED_REQUESTS
-        finally
-            close(client)
-        end
+@testset "a notification arriving after close does not restart the pump" begin
+    # `close` used to clear the channel field, so a late notification looked like
+    # the first one and started a second pump task nothing was left to close.
+    with_server() do fs
+        client = Client(fs.url; timeout = 5, on_notification = _ -> nothing)
+        MCPClient._incoming(client, Dict{String,Any}(
+            "jsonrpc" => "2.0", "method" => "notifications/message"))
+        @test wait_until(() -> client.notifications !== nothing)
+        pump = client.notifications
+        close(client)
+        MCPClient._incoming(client, Dict{String,Any}(
+            "jsonrpc" => "2.0", "method" => "notifications/message"))
+        @test client.notifications === pump
+        @test !isopen(pump)
     end
 end
 

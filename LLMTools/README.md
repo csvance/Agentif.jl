@@ -63,15 +63,10 @@ funcs["grep"]("TODO", "build/generated.jl")                 # named file, ignore
 funcs["ls"]("build")                                        # named dir, ignored or not
 ```
 
-Two limits are worth knowing. The exemption covers the named path only: entries
-*under* it are still filtered, so with `build/**` in a `.gitignore`,
-`ls("build")` reports its contents as hidden. And `.git` is exempt on the same
-terms as anything else, so a walk never enters it but `grep("token", ".git")`
-does read it, which is also what `rg` does.
-
-A `.gitignore` line that cannot be translated faithfully is inert, matching
-nothing, the way git treats a malformed pattern. One unusable line costs that
-line and not the whole tool.
+The exemption covers the named path only, so entries *under* it are still
+filtered: with `build/**` in a `.gitignore`, `ls("build")` reports its contents
+as hidden. A `.gitignore` line that cannot be translated faithfully is inert,
+matching nothing, the way git treats a malformed pattern.
 
 ## Terminal Tools
 

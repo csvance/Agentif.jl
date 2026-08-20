@@ -7,7 +7,7 @@ model applications use to discover and call tools hosted by a separate server.
 Both standard transports are implemented: [`StreamableHTTPTransport`](@ref) for a
 server reached over HTTP, and [`StdioTransport`](@ref) for one run as a child
 process. Each is an [`AbstractTransport`](@ref); the protocol layer above them is
-shared. See `STDIO.md` for the stdio design.
+shared.
 
 Typical use:
 
@@ -58,6 +58,7 @@ export Client,
     MCPTransportError,
     MCPProtocolError,
     initialize!,
+    request,
     list_tools,
     list_tools_page,
     call_tool,
@@ -69,7 +70,9 @@ export Client,
     server_instructions,
     protocol_version,
     session_id,
-    has_capability
+    has_capability,
+    is_open,
+    stderr_tail
 
 include("errors.jl")
 include("jsonrpc.jl")

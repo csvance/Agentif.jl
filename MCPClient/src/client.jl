@@ -80,7 +80,6 @@ mutable struct Client
     lock::ReentrantLock
     # Server-initiated traffic is handled off the reader task; see `_incoming`.
     notifications::Union{Nothing,Channel{Any}}
-    answered::Int
 end
 
 function Client(transport::AbstractTransport;
@@ -97,7 +96,7 @@ function Client(transport::AbstractTransport;
                     String(protocol_version), String(protocol_version),
                     Dict{String,Any}(), Dict{String,Any}(), nothing, false,
                     Float64(timeout), strict_version, on_notification, on_request,
-                    0, ReentrantLock(), nothing, 0)
+                    0, ReentrantLock(), nothing)
     set_handler!(transport, msg -> _incoming(client, msg))
     if initialize
         try
@@ -389,30 +388,17 @@ End the session and release the transport. Safe to call more than once.
 """
 function Base.close(c::Client)
     close(c.transport)
-    channel = @lock c.lock begin
-        ch = c.notifications
-        c.notifications = nothing
-        ch
-    end
     # Closing the channel ends the pump once it has drained, so a notification
-    # already queued still reaches its handler.
+    # already queued still reaches its handler. The field keeps pointing at the
+    # closed channel rather than being cleared: a notification arriving after
+    # this would otherwise look like the first one and start a second pump task
+    # that nothing is left to close.
+    channel = @lock c.lock c.notifications
     channel === nothing || close(channel)
     return nothing
 end
 
 # --- server-initiated traffic ---------------------------------------------
-
-"""
-Server-initiated requests answered per session before the client stops replying.
-
-A reply is itself a message, and over HTTP it is a fresh POST whose own response
-body is routed straight back here, so a server that answers every POST with a
-request gets an unbounded loop out of a client that always replies: measured at
-roughly 700 replies per second, each with a task and a socket behind it. The
-budget makes that terminate. It is far above any legitimate use, since the only
-server-initiated request this client answers unprompted is `ping`.
-"""
-const MAX_ANSWERED_REQUESTS = 10_000
 
 function _incoming(c::Client, msg::AbstractDict)
     if is_request(msg)
@@ -420,27 +406,10 @@ function _incoming(c::Client, msg::AbstractDict)
         # is reading the stream this request arrived on: over HTTP that would be a
         # POST from inside the response body being read, and over stdio the reader
         # task would be blocked while the reply it enables goes unread.
-        _budget_exhausted(c) ? _refuse_request(c, msg) : @async _answer(c, msg)
+        @async _answer(c, msg)
     elseif is_notification(msg)
         _enqueue_notification(c, msg)
     end
-    return nothing
-end
-
-function _budget_exhausted(c::Client)
-    @lock c.lock begin
-        c.answered >= MAX_ANSWERED_REQUESTS && return true
-        c.answered += 1
-        return false
-    end
-end
-
-function _refuse_request(c::Client, msg::AbstractDict)
-    # Logged once at the boundary rather than per request: a server in this state
-    # is producing thousands, and the useful signal is that it happened at all.
-    c.answered == MAX_ANSWERED_REQUESTS &&
-        @warn "MCP server has sent $(MAX_ANSWERED_REQUESTS) requests on one session; ignoring further ones"
-    @lock c.lock (c.answered += 1)
     return nothing
 end
 

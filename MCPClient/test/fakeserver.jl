@@ -99,3 +99,14 @@ end
 
 text_tool_result(text; is_error=false) =
     Dict("content" => [Dict("type" => "text", "text" => text)], "isError" => is_error)
+
+# Poll instead of sleeping a fixed amount: everything here crosses a process
+# boundary, so the only safe wait is one that ends when the condition holds.
+function wait_until(predicate; seconds::Real=10.0)
+    deadline = time() + seconds
+    while time() < deadline
+        predicate() && return true
+        sleep(0.02)
+    end
+    return predicate()
+end

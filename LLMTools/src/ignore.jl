@@ -1,32 +1,27 @@
 # Shared ignore handling for the search tools (`ls`, `find`, `grep`).
 #
 # An agent pointed at a repository should see the repository, not its build
-# output: a `find("**/*.jl")` that returns a thousand paths out of `.git` and a
-# `grep` that matches inside a vendored dependency both burn context and bury
-# the answer. `rg` solved this by honouring `.gitignore` and skipping `.git`, and
-# these tools do the same, so `find` and `grep` agree with what a developer sees
-# and with each other.
+# output. `rg` solved that by honouring `.gitignore` and skipping `.git`, and
+# these tools do the same, so `find` and `grep` agree with each other and with
+# what a developer sees.
 #
-# Rules are looked for only at paths within the tool's base directory: a
-# `.gitignore` above it belongs to a tree the tools may not touch, and reaching
-# for it would leak the sandbox boundary. Everything below the base directory is
-# honoured, each `.gitignore` applying to its own subtree the way git applies it.
-# Note the boundary is on the path, not on the bytes: a `.gitignore` that is
-# itself a symlink out of the tree is followed, like any other file the tools
-# read. Pattern text is never echoed to output, so the only thing that crosses is
-# which entries were hidden.
+# Rules are read only from paths inside the tool's base directory: a `.gitignore`
+# above it governs a tree the tools may not touch. Everything below is honoured,
+# each file applying to its own subtree the way git applies it.
 
 const IGNORE_FILE_NAME = ".gitignore"
-
-# Directories git itself never tracks. Skipped even when ignore handling is
-# turned off: `.git` holds packed objects, so walking it is never what a caller
-# meant, and a `.git` *file* is a worktree pointer rather than content.
-const ALWAYS_IGNORED_NAMES = (".git",)
 
 # Repository-local excludes, which are part of "respect the ignore rules" even
 # though they live outside any `.gitignore`. Per-user and system-wide excludes
 # are not read: those depend on git configuration this package does not parse.
 const GIT_EXCLUDE_PATH = (".git", "info", "exclude")
+
+# `.git` is skipped even when ignore handling is off: it holds packed objects, so
+# walking it is never what a caller meant, and a `.git` *file* is a worktree
+# pointer rather than content.
+always_ignored(name::AbstractString) = name == ".git"
+
+normalize_relpath(path::AbstractString) = replace(path, '\\' => '/')
 
 """
 One line of a `.gitignore`, compiled.
@@ -55,8 +50,8 @@ end
 
 """
 Ignore rules in force for one directory, innermost last. `enabled` is false when
-the caller asked to see ignored files, which leaves only
-[`ALWAYS_IGNORED_NAMES`](@ref) filtered.
+the caller asked to see ignored files, which leaves `rules` empty and stops
+[`walk_filtered`](@ref) loading any more of them on the way down.
 """
 struct IgnoreContext
     root::String
@@ -98,7 +93,7 @@ function translate_char_class(out::IO, pattern::AbstractString, idx::Int)
         if char == '['
             # A POSIX class such as `[:digit:]` is legal in a gitignore pattern
             # and is also PCRE syntax, so it passes through verbatim. Escaping
-            # the `[` instead turned `[[:digit:]]` into a class of the six
+            # the `[` instead would turn `[[:digit:]]` into a class of the six
             # characters in ":digit" followed by a literal `]`.
             after_posix = _copy_posix_class(body, pattern, cursor)
             if after_posix !== nothing
@@ -157,7 +152,7 @@ function _is_collating_element(pattern::AbstractString, cursor::Int)
 end
 
 """
-    ignore_glob_to_regex(pattern, anchored) -> Regex
+    ignore_glob_to_regex(pattern, anchored) -> Union{Nothing, Regex}
 
 Compile a gitignore pattern body, with any `!` prefix and trailing `/` already
 stripped. `anchored` patterns match from the declaring directory; the rest match
@@ -227,14 +222,11 @@ function ignore_glob_to_regex(pattern::AbstractString, anchored::Bool)
         idx = next_idx
     end
     print(out, "\$")
-    source = String(take!(out))
     return try
-        Regex(source)
+        Regex(String(take!(out)))
     catch
-        # An invalid range such as `[c-a]` is a PCRE compilation error. git leaves
-        # such a pattern inert rather than failing, and so must this: the
-        # alternative is that one bad line in one `.gitignore` throws out of every
-        # ls, find and grep over the whole tree.
+        # An invalid range such as `[c-a]` is a PCRE compilation error, which git
+        # leaves inert rather than fatal.
         nothing
     end
 end
@@ -248,8 +240,7 @@ function strip_unescaped_trailing_space(line::AbstractString)
     stop = lastindex(line)
     while stop >= firstindex(line) && line[stop] == ' '
         previous = prevind(line, stop)
-        # Count the backslashes immediately before this run; an odd number means
-        # the whitespace is quoted and the stripping stops here.
+        # An odd number of backslashes immediately before the space quotes it.
         backslashes = 0
         probe = previous
         while probe >= firstindex(line) && line[probe] == '\\'
@@ -308,7 +299,6 @@ function load_ignore_patterns(path::AbstractString, prefix::AbstractString)
     end
     content === nothing && return nothing
     # A BOM would otherwise become part of the first pattern, making it dead.
-    # Windows editors write them.
     startswith(content, '\ufeff') && (content = content[nextind(content, firstindex(content)):end])
     patterns = IgnorePattern[]
     for line in eachsplit(content, '\n')
@@ -324,8 +314,8 @@ end
 
 Everything `dir` contributes: its repository-local excludes first, then its
 `.gitignore`, which is the precedence git gives them. A directory contributes
-both because a repository nested below the base directory is still a repository:
-picking up its `.gitignore` but not its excludes would honour half its rules.
+both because a repository nested below the base directory is still a repository,
+and picking up its `.gitignore` but not its excludes would honour half its rules.
 """
 function load_dir_rules(dir::AbstractString, prefix::AbstractString)
     rules = IgnoreRules[]
@@ -355,18 +345,18 @@ function ignore_context(base::AbstractString, dir::AbstractString; enabled::Bool
     if enabled
         append!(rules, load_dir_rules(root, ""))
         prefix = ""
+        path = root
         for segment in eachsplit(root_relative(root, dir), '/'; keepempty = false)
             # `..` cannot appear for a contained path, but a rule set built from
             # one would be nonsense, so stop rather than guess.
             segment == ".." && break
             prefix = isempty(prefix) ? String(segment) : "$(prefix)/$(segment)"
-            append!(rules, load_dir_rules(joinpath(root, split(prefix, '/')...), prefix))
+            path = joinpath(path, segment)
+            append!(rules, load_dir_rules(path, prefix))
         end
     end
     return IgnoreContext(root, enabled, rules)
 end
-
-always_ignored(name::AbstractString) = name in ALWAYS_IGNORED_NAMES
 
 # The portion of `rel` that `rules` was written to match, or nothing when `rel`
 # lies outside the declaring directory.
@@ -407,76 +397,45 @@ end
 
 """
     is_ignored(ctx, rel, is_dir) -> Bool
-    is_ignored(ctx, rules, rel, is_dir) -> Bool
 
-Whether the entry at root-relative path `rel` should be hidden. Names in
-[`ALWAYS_IGNORED_NAMES`](@ref) are hidden regardless of `ctx.enabled`.
-
-The four-argument form takes the rule stack explicitly, which is what a walk
-needs: its stack grows as it descends, so `ctx.rules` alone would only ever apply
-the rules that were in force at the starting directory.
+Whether the entry at root-relative path `rel` should be hidden. `.git` is hidden
+regardless of `ctx.enabled`; everything else is hidden only when `ctx.rules` say
+so, and those are empty when the caller asked to see ignored files.
 """
-function is_ignored(ctx::IgnoreContext, rules::Vector{IgnoreRules}, rel::AbstractString, is_dir::Bool)
+function is_ignored(ctx::IgnoreContext, rel::AbstractString, is_dir::Bool)
     isempty(rel) && return false
     always_ignored(basename(rel)) && return true
-    ctx.enabled || return false
-    return path_ignored(rules, rel, is_dir)
+    return path_ignored(ctx.rules, rel, is_dir)
 end
 
-is_ignored(ctx::IgnoreContext, rel::AbstractString, is_dir::Bool) =
-    is_ignored(ctx, ctx.rules, rel, is_dir)
-
-# Matches `walkdir`'s default of not following symlinked directories, which also
-# happens to be git's view: a symlink is a file, whatever it points at. An entry
-# that cannot be stat'ed at all counts as a file, so the walk reports it and
-# moves on instead of throwing.
-function is_directory_entry(path::AbstractString)
-    return try
-        isdir(path) && !islink(path)
-    catch
-        false
-    end
-end
-
-# `Base.walkdir` gets its speed from `_readdirx`, whose entries carry the type the
-# OS already reported for each dirent, so `isdir`/`islink` on one costs no stat
-# call. Reading names with `readdir` and stat'ing each of them instead made this
-# walk four times slower than `walkdir` on a tree with no rules in it at all,
-# which is pure overhead on every `find` and `grep`.
+# Each entry of `dir` as `(name, is_dir)`, in the alphabetical order `_readdirx`
+# returns. Throws if the directory cannot be read; the walk decides what to do.
 #
-# It is a Base internal, so it is used only where it exists, with the same
-# behaviour either way. `walkdir` itself is built on it, which is why it is a
-# reasonable thing to depend on.
-const HAS_READDIRX = isdefined(Base.Filesystem, :_readdirx)
+# `_readdirx` is what `Base.walkdir` gets its speed from: its entries carry the
+# type the OS already reported for each dirent, so `isdir`/`islink` on one costs
+# no stat call, where reading names with `readdir` and stat'ing each of them is
+# several times slower on a tree with no rules in it at all.
+dir_entries(dir::AbstractString) =
+    Tuple{String,Bool}[(entry.name, _entry_is_dir(entry))
+                       for entry in Base.Filesystem._readdirx(dir)]
 
-# dir_entries(dir) -> Vector{Tuple{String,Bool}}
-#
-# Each entry of `dir` as `(name, is_dir)`, in the alphabetical order both
-# `readdir` and `_readdirx` return. Throws if the directory cannot be read; the
-# walk decides what to do about that.
-@static if HAS_READDIRX
-    dir_entries(dir::AbstractString) =
-        Tuple{String,Bool}[(entry.name, _entry_is_dir(entry))
-                           for entry in Base.Filesystem._readdirx(dir)]
-    # Mirrors walkdir: an entry whose type cannot be determined is a file.
-    _entry_is_dir(entry) = !_probe(islink, entry, true) && _probe(isdir, entry, false)
-    _probe(f, entry, fallback::Bool) = try
-        f(entry)
-    catch
-        fallback
-    end
-else
-    dir_entries(dir::AbstractString) =
-        Tuple{String,Bool}[(name, is_directory_entry(joinpath(dir, name)))
-                           for name in readdir(dir)]
+# A symlink is a file whatever it points at, which is both `walkdir`'s default
+# and git's view. An entry whose type cannot be determined counts as a file, so
+# the walk reports it and moves on instead of throwing.
+_entry_is_dir(entry) = !_probe(islink, entry, true) && _probe(isdir, entry, false)
+
+_probe(f, entry, fallback::Bool) = try
+    f(entry)
+catch
+    fallback
 end
 
 """
     walk_filtered(f, ctx, start) -> (; completed::Bool, skipped::Int)
 
-Walk `start` depth-first, pruning entries [`is_ignored`](@ref) rejects, and call
-`f(dir, dirs, files)` once per surviving directory with the surviving entry
-names. `f` returns `false` to stop the walk, which makes `completed` false.
+Walk `start` depth-first, pruning ignored entries, and call `f(dir, dirs, files)`
+once per surviving directory with the surviving entry names. `f` returns `false`
+to stop the walk, which makes `completed` false.
 
 `skipped` counts the entries the ignore rules removed, so a caller can tell an
 empty result caused by the rules from one caused by its own pattern. It counts
@@ -484,18 +443,17 @@ entries, not files: a pruned directory holding a thousand files counts once.
 
 Pruning happens at the directory level, so an ignored directory is never
 descended into. That matches git, where a rule inside an excluded directory
-cannot re-include anything, and it is the reason the walk is cheap on a tree with
-a large build directory.
+cannot re-include anything, and it is why the walk stays cheap on a tree with a
+large build directory.
 
 `start` itself is never pruned: a caller that names a path has asked for it, the
 same way `rg dist/` searches `dist/`.
 """
 function walk_filtered(f, ctx::IgnoreContext, start::AbstractString)
     start_dir = abspath(start)
-    start_rel = root_relative(ctx.root, start_dir)
     # Rules for `start` already include its own `.gitignore`; each descent adds
     # the child's, if it has one.
-    pending = [(start_dir, start_rel, ctx.rules)]
+    pending = [(start_dir, root_relative(ctx.root, start_dir), ctx.rules)]
     skipped = 0
     while !isempty(pending)
         dir, dir_rel, rules = pop!(pending)

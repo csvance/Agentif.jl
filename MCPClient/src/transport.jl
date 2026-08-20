@@ -2,8 +2,8 @@
     AbstractTransport
 
 The whole surface a transport must provide. [`Client`](@ref) builds and
-interprets JSON-RPC messages; a transport only moves them, so adding stdio means
-adding a type here rather than touching the protocol layer. See `STDIO.md`.
+interprets JSON-RPC messages; a transport only moves them, so a new transport is
+a new type here rather than a change to the protocol layer.
 
 Required methods:
 
@@ -40,9 +40,7 @@ not the response it was waiting for: server-initiated requests and
 notifications. `f` takes the message `Dict{String,Any}`.
 """
 function set_handler!(t::AbstractTransport, f)
-    hasfield(typeof(t), :handler) ||
-        throw(ArgumentError("$(typeof(t)) does not support incoming messages"))
-    setfield!(t, :handler, f)
+    t.handler = f
     return nothing
 end
 
@@ -52,7 +50,7 @@ end
 Whether the transport can still be used. A transport is expected to become
 closed exactly once.
 """
-is_open(t::AbstractTransport) = !getfield(t, :closed)
+is_open(t::AbstractTransport) = !t.closed
 
 """
     dispatch!(t, message)
@@ -62,7 +60,7 @@ handler are logged rather than propagated: a misbehaving handler must not turn
 someone else's in-flight `tools/call` into a failure.
 """
 function dispatch!(t::AbstractTransport, message::AbstractDict)
-    handler = getfield(t, :handler)
+    handler = t.handler
     handler === nothing && return nothing
     try
         handler(message)

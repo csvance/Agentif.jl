@@ -4,6 +4,12 @@
 
 const JSONRPC_VERSION = "2.0"
 
+# Per-request deadline every transport and the client default to, in seconds.
+const DEFAULT_TIMEOUT = 30.0
+
+# Bound peer-supplied text before it goes into an error message or a `show`.
+_snippet(s::AbstractString, n::Int=400) = length(s) <= n ? String(s) : String(first(s, n)) * "..."
+
 """
     plain(x)
 

@@ -85,9 +85,6 @@ struct UnknownContent <: ContentBlock
     raw::Dict{String,Any}
 end
 
-# Kept as a thin alias so call sites read as intent rather than as plumbing.
-_maybe_string(x, what::AbstractString) = want_string_or_nothing(x, what)
-
 function _decode_b64(x, what::AbstractString)
     x isa AbstractString ||
         throw(MCPProtocolError("$what content block has no base64 \"data\" string"))
@@ -125,17 +122,17 @@ function parse_content(block::AbstractDict)
         blob === nothing || get(res, "text", nothing) === nothing ||
             throw(MCPProtocolError("resource content block carries both \"text\" and \"blob\""))
         return EmbeddedResource(want_string(get(res, "uri", ""), "\"resource.uri\""),
-                                _maybe_string(get(res, "mimeType", nothing), "\"resource.mimeType\""),
-                                _maybe_string(get(res, "text", nothing), "\"resource.text\""),
+                                want_string_or_nothing(get(res, "mimeType", nothing), "\"resource.mimeType\""),
+                                want_string_or_nothing(get(res, "text", nothing), "\"resource.text\""),
                                 blob === nothing ? nothing : _decode_b64(blob, "resource"),
                                 raw)
     elseif kind == "resource_link"
         return ResourceLink(want_string(get(raw, "uri", ""), "\"uri\" of a resource_link block"),
                             want_string(get(raw, "name", ""), "\"name\" of a resource_link block"),
-                            _maybe_string(get(raw, "description", nothing),
-                                          "\"description\" of a resource_link block"),
-                            _maybe_string(get(raw, "mimeType", nothing),
-                                          "\"mimeType\" of a resource_link block"), raw)
+                            want_string_or_nothing(get(raw, "description", nothing),
+                                                   "\"description\" of a resource_link block"),
+                            want_string_or_nothing(get(raw, "mimeType", nothing),
+                                                   "\"mimeType\" of a resource_link block"), raw)
     end
     return UnknownContent(String(kind), raw)
 end
@@ -249,7 +246,7 @@ function MCPTool(tool::AbstractDict)
                        want_object(schema, "\"inputSchema\" of tool \"$name\""),
                    want_object_or_nothing(get(raw, "outputSchema", nothing),
                                           "\"outputSchema\" of tool \"$name\""),
-                   _maybe_string(get(raw, "title", nothing), "\"title\" of tool \"$name\""),
+                   want_string_or_nothing(get(raw, "title", nothing), "\"title\" of tool \"$name\""),
                    annotations === nothing ? Dict{String,Any}() :
                        want_object(annotations, "\"annotations\" of tool \"$name\""),
                    raw)

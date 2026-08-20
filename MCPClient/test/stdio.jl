@@ -25,17 +25,6 @@ with_stdio_transport(f, mode::AbstractString="plain"; kwargs...) = begin
     end
 end
 
-# Poll instead of sleeping a fixed amount: everything here crosses a process
-# boundary, so the only safe wait is one that ends when the condition holds.
-function wait_until(predicate; seconds::Real=10.0)
-    deadline = time() + seconds
-    while time() < deadline
-        predicate() && return true
-        sleep(0.02)
-    end
-    return predicate()
-end
-
 @testset "stdio transport basics" begin
     with_stdio_transport() do t
         @test is_open(t)

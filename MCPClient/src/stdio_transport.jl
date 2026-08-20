@@ -1,16 +1,13 @@
-# Stdio transport (the other transport MCP defines; see STDIO.md for the design).
-#
-# The client spawns the server as a child process and speaks newline-delimited
-# JSON-RPC over its stdin and stdout: exactly one message per line, no framing
-# header, no session id, no URL. The child's stderr is its log stream and is
-# never parsed as protocol.
+# Stdio transport: the client spawns the server as a child process and speaks
+# newline-delimited JSON-RPC over its stdin and stdout, exactly one message per
+# line. There is no framing header, no session id and no URL, and the child's
+# stderr is its log stream rather than protocol.
 #
 # The structural difference from streamable HTTP is that a reply does not arrive
 # on the call that sent the request. HTTP hands back a body per POST, so
 # correlating a response with its request is local to one function; stdio has one
 # shared byte stream, so a single reader task owns it and a table of pending
-# deadlines keyed by JSON-RPC id is what gets a response back to the caller that
-# is waiting for it.
+# deadlines keyed by JSON-RPC id is what gets a response back to its caller.
 
 """
     StdioTransport(command; env=nothing, dir=nothing, inherit_env=true,
@@ -65,11 +62,9 @@ function StdioTransport(command::Base.Cmd;
                         close_grace::Real=2.0,
                         stderr_lines::Integer=50)
     cmd = _child_command(command, env, dir, inherit_env)
-    # A fresh PipeEndpoint given to `pipeline` is opened as the parent end and the
-    # child end is closed here at spawn, which is what makes `eof` on stdout
-    # become true when the child exits. Handing over an already-linked `Pipe`
-    # would leave this process holding a write end of the child's stdout, and then
-    # a dead child would look exactly like an idle one.
+    # A fresh PipeEndpoint, not a `Pipe`: `pipeline` closes the child end at spawn,
+    # which is what makes `eof` on stdout true once the child exits. Holding a
+    # write end ourselves would make a dead child look like an idle one.
     child_stderr = Base.PipeEndpoint()
     process = try
         open(pipeline(cmd; stderr=child_stderr), "r+")
@@ -80,10 +75,9 @@ function StdioTransport(command::Base.Cmd;
                        Float64(timeout), Float64(close_grace), Dict{Any,Deadline}(),
                        nothing, nothing, nothing, Int(stderr_lines), String[],
                        nothing, false, ReentrantLock(), ReentrantLock())
-    # Both readers start before this returns. A server that logs during startup
-    # fills the stderr pipe buffer and blocks in `write` if nobody is draining it,
-    # and that deadlock is indistinguishable from a server that simply never
-    # answers the handshake.
+    # Both readers start before this returns: a server that logs during startup
+    # blocks in `write` once the stderr pipe buffer fills, and that deadlock looks
+    # exactly like a server that never answers the handshake.
     t.stderr_reader = @async _drain_stderr!(t)
     t.reader = @async _read_loop!(t)
     return t
@@ -105,9 +99,8 @@ function _child_command(command::Base.Cmd, env, dir, inherit_env::Bool)
     return cmd
 end
 
-_env_pairs(env::AbstractDict) = pairs(env)
 _env_pairs(env::NamedTuple) = pairs(env)
-_env_pairs(env) = env  # a vector of `"K" => "V"` pairs
+_env_pairs(env) = env  # a dict, or a vector of `"K" => "V"` pairs
 
 Base.show(io::IO, t::StdioTransport) = print(io, "StdioTransport(", t.command,
                                              _state_suffix(t), ")")
@@ -146,17 +139,14 @@ function _read_loop!(t::StdioTransport)
     try
         while !eof(t.stdout)
             line = readline(t.stdout)
-            # `readline` returns a whole line or whatever preceded EOF, so a
-            # message split across several pipe reads is reassembled for us. A
-            # fixed-size read would have to reassemble it by hand.
+            # `readline` reassembles a message split across several pipe reads.
             isempty(strip(line)) && continue
             msgs = try
                 parse_payload(line)
             catch e
-                # A server that prints a banner or a stray log line on stdout is
-                # the single most common cause of a broken stdio connection, and
-                # taking the session down for it would turn a cosmetic bug in
-                # someone else's server into an outage in ours.
+                # A banner or stray log line on stdout is the commonest cause of a
+                # broken stdio connection, and taking the session down for it
+                # turns a cosmetic bug in someone else's server into an outage.
                 @warn "ignoring a line on the MCP server's stdout that is not JSON-RPC" line = _snippet(line)
                 continue
             end
@@ -169,13 +159,11 @@ function _read_loop!(t::StdioTransport)
         # us, which is not a failure worth reporting to anyone.
         @debug "the MCP stdio reader stopped" exception = (e, catch_backtrace())
     finally
-        # stdout is at EOF, so no response will ever arrive again. Every caller
-        # still waiting has to be told now; leaving them to their deadlines makes
-        # a process that died instantly look like one that is merely slow.
-        #
-        # On the ordinary shutdown path the answer is already known, and asking
-        # for the exit code and the log tail would only make `close` wait for
-        # diagnostics nobody is going to read.
+        # stdout is at EOF, so no response can arrive again and every waiter has
+        # to be told now: leaving them to their deadlines makes a process that
+        # died instantly look like one that is merely slow. On the ordinary
+        # shutdown path the answer is already known, so skip the exit code and the
+        # log tail rather than make `close` wait for them.
         err = @lock(t.lock, t.closed) ?
               MCPTransportError("the stdio transport for `$(t.command)` was closed") :
               _death_error(t)
@@ -297,10 +285,9 @@ function send_request!(t::StdioTransport, message::AbstractDict, id;
         if t.closed || t.failure !== nothing
             _unusable(t, method)
         elseif haskey(t.pending, id)
-            # Overwriting the entry would orphan whoever registered it, and that
-            # caller would then hang until its deadline for a response that was
-            # handed to someone else. [`Client`](@ref) never reuses an id; a caller
-            # speaking raw JSON-RPC can.
+            # Overwriting the entry would orphan whoever registered it, leaving
+            # that caller to hang out its deadline for a response handed to
+            # someone else. `Client` never reuses an id; raw JSON-RPC can.
             MCPProtocolError("a request with id $(repr(id)) is already in flight; " *
                              "JSON-RPC ids must be unique while a request is outstanding")
         else
@@ -326,7 +313,8 @@ function send_notification!(t::StdioTransport, message::AbstractDict;
     # has to wait for the POST to be accepted. Here there is nothing to wait for:
     # a notification is one line written to a pipe and no reply will ever come.
     method = _method_of(message)
-    is_open(t) || throw(_unusable_locked(t, method))
+    err = @lock t.lock (t.closed || t.failure !== nothing ? _unusable(t, method) : nothing)
+    err === nothing || throw(err)
     _write_message!(t, message, method)
     return nothing
 end
@@ -335,11 +323,10 @@ end
 # is only ever used to name the failure in an error message.
 _method_of(message::AbstractDict) = String(get(message, "method", "a response"))
 
+# Call under `t.lock`: reports why the transport cannot carry `method`.
 _unusable(t::StdioTransport, method::AbstractString) =
     t.failure !== nothing && !t.closed ? t.failure :
     MCPTransportError("the stdio transport for `$(t.command)` is closed, so \"$method\" cannot be sent")
-
-_unusable_locked(t::StdioTransport, method::AbstractString) = @lock t.lock _unusable(t, method)
 
 function _write_message!(t::StdioTransport, message::AbstractDict, method::AbstractString)
     json = JSON.json(message)
@@ -350,15 +337,11 @@ function _write_message!(t::StdioTransport, message::AbstractDict, method::Abstr
         throw(MCPProtocolError("refusing to send \"$method\": its JSON contains a newline, " *
                                "which stdio framing cannot carry"))
     try
-        # The lock covers the payload and its terminator together. Two tasks each
-        # writing half of their message produces two lines that are both invalid,
-        # and the server has no way to recover the boundary.
-        #
-        # The write is done on the caller's task rather than under a deadline of
-        # its own: abandoning a half-written line would corrupt every message
-        # after it, which is worse than blocking on a child that has stopped
-        # reading its stdin. MCP messages are far below a pipe buffer, so this
-        # only blocks against a child that is already wedged.
+        # The lock covers the payload and its terminator together: two tasks each
+        # writing half a message produce two invalid lines the server cannot
+        # recover the boundary from. There is deliberately no deadline here, since
+        # abandoning a half-written line corrupts every message after it; MCP
+        # messages sit far below a pipe buffer, so only a wedged child can block.
         @lock t.write_lock begin
             write(t.stdin, json)
             write(t.stdin, '\n')
@@ -409,9 +392,8 @@ function Base.close(t::StdioTransport)
     _fail_pending!(t, MCPTransportError(
         "the stdio transport for `$(t.command)` was closed while the request was in flight"))
 
-    # Closing the read ends unblocks the reader tasks even when a grandchild
-    # inherited the pipes and is holding them open, which is the one case where
-    # the child exiting is not enough to end them.
+    # Closing the read ends unblocks the readers even when a grandchild inherited
+    # the pipes, the one case where the child exiting is not enough.
     for pipe in (t.stdout, t.stderr)
         try
             close(pipe)

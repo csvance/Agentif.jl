@@ -5,9 +5,13 @@
 # gained its own SSE helpers only recently, so parsing the handful of relevant
 # fields here keeps this package working across HTTP.jl versions and keeps the
 # parser directly testable without a socket.
+#
+# Only `event` and `data` are modelled. `id` and `retry` exist to drive
+# reconnection, which this client does not do, and a field nobody reads is
+# indistinguishable from one that is ignored.
 
 """
-    SSEEvent(event, data, id, retry)
+    SSEEvent(event, data)
 
 One dispatched SSE event. `data` holds the `data:` lines joined with newlines,
 matching the browser EventSource semantics that MCP servers are written against.
@@ -15,25 +19,19 @@ matching the browser EventSource semantics that MCP servers are written against.
 struct SSEEvent
     event::Union{Nothing,String}
     data::String
-    id::Union{Nothing,String}
-    retry::Union{Nothing,Int}
 end
 
 mutable struct SSEParser
     data::Vector{String}
     event::Union{Nothing,String}
-    id::Union{Nothing,String}
-    retry::Union{Nothing,Int}
     saw_data::Bool
 end
 
-SSEParser() = SSEParser(String[], nothing, nothing, nothing, false)
+SSEParser() = SSEParser(String[], nothing, false)
 
 function _reset!(p::SSEParser)
     empty!(p.data)
     p.event = nothing
-    p.id = nothing
-    p.retry = nothing
     p.saw_data = false
     return nothing
 end
@@ -54,7 +52,7 @@ function feed_line!(p::SSEParser, line::AbstractString)
             _reset!(p)
             return nothing
         end
-        ev = SSEEvent(p.event, join(p.data, "\n"), p.id, p.retry)
+        ev = SSEEvent(p.event, join(p.data, "\n"))
         _reset!(p)
         return ev
     end
@@ -72,12 +70,6 @@ function feed_line!(p::SSEParser, line::AbstractString)
         p.saw_data = true
     elseif field == "event"
         p.event = value
-    elseif field == "id"
-        # A NUL in the id is required to be ignored, not stored.
-        occursin('\0', value) || (p.id = value)
-    elseif field == "retry"
-        r = tryparse(Int, value)
-        r === nothing || r < 0 || (p.retry = r)
     end
     return nothing
 end
@@ -85,8 +77,9 @@ end
 """
     parse_sse(text) -> Vector{SSEEvent}
 
-Parse a complete SSE body. Used for buffered bodies and in tests; the streaming
-path feeds [`feed_line!`](@ref) line by line instead.
+Parse a complete SSE body in one call. The transport streams
+[`feed_line!`](@ref) line by line instead; this exists to exercise the parser
+directly.
 """
 function parse_sse(text::AbstractString)
     p = SSEParser()

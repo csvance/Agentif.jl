@@ -9,7 +9,7 @@ Both standard transports are implemented:
 - `StreamableHTTPTransport` for a server reached over HTTP, including the SSE
   response stream and `Mcp-Session-Id` session handling
 - `StdioTransport` for a server run as a child process, with newline-delimited
-  JSON framing over its stdin/stdout (see [`STDIO.md`](STDIO.md) for the design)
+  JSON framing over its stdin/stdout
 
 The protocol layer above them is shared, so nothing in `Client` is transport
 specific. The package depends only on `HTTP`, `JSON` and `Base64`, which keeps it
@@ -102,10 +102,7 @@ skips later notifications without ever stalling the transport.
 
 Pass `on_request = f(method, params)` to answer server-initiated requests;
 without one, everything except `ping` is answered "method not found". `ping` is
-always answered, since a client that ignores it looks dead. Replies are budgeted
-at `MCPClient.MAX_ANSWERED_REQUESTS` per session, because a reply is itself a
-message and a server that answers every one with a fresh request would otherwise
-get an unbounded loop.
+always answered, since a client that ignores it looks dead.
 
 ## Closing
 

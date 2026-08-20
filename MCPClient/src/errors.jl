@@ -28,14 +28,9 @@ struct JSONRPCError <: MCPException
     method::String
 end
 
-JSONRPCError(code::Integer, message::AbstractString) =
-    JSONRPCError(Int(code), String(message), nothing, "")
-
-# The codes JSON-RPC 2.0 reserves. Servers add their own outside this range.
-const ERR_PARSE = -32700
-const ERR_INVALID_REQUEST = -32600
+# The two reserved JSON-RPC 2.0 codes this client sends. Servers add their own
+# outside the reserved range.
 const ERR_METHOD_NOT_FOUND = -32601
-const ERR_INVALID_PARAMS = -32602
 const ERR_INTERNAL = -32603
 
 function Base.showerror(io::IO, e::JSONRPCError)

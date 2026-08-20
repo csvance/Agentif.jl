@@ -154,10 +154,6 @@ function resolve_search_path(base_dir::AbstractString, path::Union{Nothing, Stri
     return resolve_relative_path(base_dir, local_path)
 end
 
-function normalize_relpath(path::AbstractString)
-    return replace(path, '\\' => '/')
-end
-
 function glob_to_regex(pattern::String)
     normalized = replace(pattern, '\\' => '/')
     out = IOBuffer()
@@ -357,24 +353,23 @@ Examples:
                 always_ignored(entry) && continue
                 rel = isempty(dir_rel) ? entry : "$(dir_rel)/$(entry)"
                 full_path = joinpath(dir_path, entry)
-                if is_ignored(ignore, rel, is_directory_entry(full_path))
+                is_dir = isdir(full_path)
+                # git counts a symlinked directory as a file, so `dir_only`
+                # patterns must not match one; `islink` is only reached where that
+                # distinction can change the verdict.
+                if is_ignored(ignore, rel, is_dir && !islink(full_path))
                     ignored_count += 1
                     continue
                 end
-                # Keep counting past the limit rather than breaking: stopping here
-                # made the hidden-entry notice report only what the truncated
-                # prefix happened to contain, so a limited listing of a directory
-                # full of ignored files claimed nothing was hidden.
+                # Counting continues past the limit so the hidden-entry notice
+                # describes the whole directory rather than the listed prefix.
                 if length(results) >= effective_limit
                     entry_limit_reached = true
                     continue
                 end
-                suffix = isdir(full_path) ? "/" : ""
-                push!(results, entry * suffix)
+                push!(results, is_dir ? entry * "/" : entry)
             end
-            # An empty listing and a fully ignored one are different facts, and a
-            # model told "empty" about a directory full of ignored files will draw
-            # the wrong conclusion.
+            # An empty directory and a fully ignored one are different facts.
             if isempty(results)
                 ignored_count == 0 && return "(empty directory)"
                 return "(no listed entries; $(ignored_count) hidden by .gitignore. Use includeIgnored=true to show them)"
@@ -514,8 +509,8 @@ Examples:
                 return !limit_reached
             end
             if isempty(results)
-                # Only mention the rules when they actually removed something: the
-                # hint used to appear even when the pattern was the whole reason.
+                # Only mention the rules when they actually removed something,
+                # otherwise an unmatched pattern gets blamed on `.gitignore`.
                 return walk.skipped > 0 ?
                     "No files found matching pattern (gitignored paths were skipped; use includeIgnored=true to include them)" :
                     "No files found matching pattern"
@@ -557,8 +552,7 @@ Lines longer than 500 characters are truncated. Output is capped at 50KB.
 Examples:
 - `grep("function main")` — search all files for a regex pattern
 - `grep("TODO", nothing, "*.jl", true)` — case-insensitive search in Julia files only
-- `grep("error", "src/app.jl", nothing, nothing, true, 2)` — literal search in one file with 2 lines of context
-- `grep("version", nothing, nothing, nothing, nothing, nothing, nothing, true)` — search gitignored files too""",
+- `grep("error", "src/app.jl", nothing, nothing, true, 2)` — literal search in one file with 2 lines of context""",
         grep(
             pattern::String,
             path::Union{Nothing, String} = nothing,
@@ -580,7 +574,6 @@ Examples:
             lines_truncated = false
             output_lines = String[]
             search_root = isdir(search_path) ? search_path : dirname(search_path)
-            ignore = ignore_context(base, search_root; enabled = includeIgnored !== true)
             regex = nothing
             if literal !== true
                 try
@@ -645,6 +638,7 @@ Examples:
             end
             skipped = 0
             if isdir(search_path)
+                ignore = ignore_context(base, search_root; enabled = includeIgnored !== true)
                 walk = walk_filtered(ignore, search_path) do root, _dirs, files
                     for file in files
                         file_path = joinpath(root, file)
@@ -659,9 +653,8 @@ Examples:
                 search_file(search_path, normalize_relpath(relpath(search_path, search_root)))
             end
             if isempty(output_lines)
-                # Only worth mentioning when the walk actually skipped something.
-                # It used to fire whenever the rules were merely enabled, so a
-                # `glob` that excluded every file was blamed on `.gitignore`.
+                # Only worth mentioning when the walk actually skipped something,
+                # otherwise a `glob` that excluded every file gets blamed on it.
                 return skipped > 0 ?
                     "No matches found (gitignored files were not searched; use includeIgnored=true to search them)" :
                     "No matches found"

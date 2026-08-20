@@ -7,8 +7,6 @@
 # we are waiting for. Both are handled here so the layer above sees only a
 # response dictionary.
 
-const DEFAULT_TIMEOUT = 30.0
-
 """
     StreamableHTTPTransport(url; headers=[], timeout=30.0, terminate_on_close=true)
 
@@ -89,8 +87,6 @@ function _capture_session!(t::StreamableHTTPTransport, response)
     @lock t.lock (t.session_id = String(sid))
     return nothing
 end
-
-_snippet(s::AbstractString, n::Int=400) = length(s) <= n ? String(s) : String(first(s, n)) * "..."
 
 function send_request!(t::StreamableHTTPTransport, message::AbstractDict, id;
                        timeout::Real=t.timeout)
@@ -299,14 +295,13 @@ function Base.close(t::StreamableHTTPTransport)
 end
 
 function _terminate_session(t::StreamableHTTPTransport)
-    sid = t.session_id
+    sid, version = @lock t.lock (t.session_id, t.protocol_version)
     (t.terminate_on_close && sid !== nothing) || return nothing
     headers = Pair{String,String}["Mcp-Session-Id" => sid]
-    t.protocol_version === nothing ||
-        push!(headers, "MCP-Protocol-Version" => t.protocol_version)
+    version === nothing || push!(headers, "MCP-Protocol-Version" => version)
     append!(headers, t.headers)
     try
-        run_with_deadline(min(t.timeout <= 0 ? 5.0 : t.timeout, 5.0), "DELETE") do d
+        run_with_deadline(t.timeout <= 0 ? 5.0 : min(t.timeout, 5.0), "DELETE") do d
             HTTP.request("DELETE", t.url, headers; retry=false, status_exception=false,
                          client=t.http_client)
             deliver!(d, nothing)
