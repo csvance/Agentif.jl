@@ -1,0 +1,25 @@
+name = "MCPClient"
+uuid = "9c36364a-8bb0-469c-adfd-7d7f936899d2"
+version = "0.1.0"
+authors = ["Carroll Vance <cvance@medicalmetrics.com>"]
+
+[deps]
+Base64 = "2a0f44e3-6c83-55bd-87e4-b1978d98bd5f"
+HTTP = "cd3eb016-35fb-5094-929b-558a96fad6f3"
+JSON = "682c06a0-de6a-54ab-a142-c8b1cf79cde6"
+
+[sources]
+HTTP = {url = "https://github.com/JuliaWeb/HTTP.jl.git", rev = "master"}
+
+[compat]
+Base64 = "1"
+HTTP = "2"
+JSON = "1"
+julia = "1.10"
+
+[extras]
+Sockets = "6462fe0b-24de-5631-8697-dd941f90decc"
+Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+
+[targets]
+test = ["Test", "Sockets"]

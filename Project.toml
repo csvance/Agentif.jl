@@ -12,6 +12,7 @@ LLMOAuth = "f3f4c4b3-4b8a-4e8c-9b4f-7b8e4e6e5b2d"
 LLMProviders = "e1f4c4b3-4b8a-4e8c-9b4f-7b8e4e6e5b2a"
 LLMTools = "d2f4c4b3-4b8a-4e8c-9b4f-7b8e4e6e5b2c"
 LocalSearch = "3edf9609-13f2-4288-b0a3-8bd6d521158e"
+MCPClient = "9c36364a-8bb0-469c-adfd-7d7f936899d2"
 MSTeams = "730ab40b-c28c-4fcb-83ce-ff189233d76d"
 Mattermost = "c9a394b0-b131-4b99-aeb4-b011b7b7f934"
 OAuth = "22d8b318-f366-56fb-a292-a93f7d76c017"
@@ -35,6 +36,7 @@ LLMOAuth = {path = "LLMOAuth"}
 LLMProviders = {path = "LLMProviders"}
 LLMTools = {path = "LLMTools"}
 LocalSearch = {url = "https://github.com/quinnj/LocalSearch.jl.git"}
+MCPClient = {path = "MCPClient"}
 MSTeams = {url = "https://github.com/quinnj/MSTeams.jl.git"}
 Mattermost = {url = "https://github.com/quinnj/Mattermost.jl.git"}
 OAuth = {rev = "main", url = "https://github.com/JuliaServices/OAuth.jl.git"}

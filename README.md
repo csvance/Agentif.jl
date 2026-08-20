@@ -13,7 +13,7 @@ Pkg.instantiate()
 After that, you can load any of the top-level packages directly from the repo root:
 
 ```julia
-using Agentif, LLMTools, LLMProviders, Claw, LLMOAuth, Juco
+using Agentif, LLMTools, LLMProviders, Claw, LLMOAuth, Juco, MCPClient
 ```
 
 ## Packages
@@ -24,6 +24,7 @@ using Agentif, LLMTools, LLMProviders, Claw, LLMOAuth, Juco
 - `Claw`: SQLite-backed event-driven assistant app built on top of `Agentif` and `LLMTools`.
 - `LLMOAuth`: OAuth helpers for Codex/OpenAI and Anthropic flows.
 - `Juco`: uber-minimal coding agent (bash/read/edit + memory, single-SQLite persistence); see `Juco/README.md`.
+- `MCPClient`: Model Context Protocol client with HTTP and stdio transports, depending only on `HTTP`/`JSON`.
 
 Each package has its own README:
 
@@ -33,6 +34,7 @@ Each package has its own README:
 - [`Claw/README.md`](Claw/README.md)
 - [`LLMOAuth/README.md`](LLMOAuth/README.md)
 - [`Juco/README.md`](Juco/README.md)
+- [`MCPClient/README.md`](MCPClient/README.md)
 
 ## Quick Start
 

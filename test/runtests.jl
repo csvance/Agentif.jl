@@ -1,5 +1,5 @@
 const ROOT = normpath(joinpath(@__DIR__, ".."))
-const PACKAGE_ORDER = ["LLMProviders", "LLMOAuth", "Agentif", "LLMTools", "Claw"]
+const PACKAGE_ORDER = ["MCPClient", "LLMProviders", "LLMOAuth", "Agentif", "LLMTools", "Claw"]
 const PACKAGE_TESTS = Dict(
     name => joinpath(ROOT, name, "test", "runtests.jl") for name in PACKAGE_ORDER
 )

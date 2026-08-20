@@ -12,4 +12,6 @@
 /LLMProviders/Manifest.toml
 /LLMProviders/Manifest-v*.toml
 /LLMTools/Manifest.toml
+/MCPClient/Manifest.toml
+/MCPClient/Manifest-v*.toml
 /projects/**/Manifest.toml

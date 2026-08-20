@@ -2,7 +2,7 @@
 
 julia_version = "1.12.6"
 manifest_format = "2.0"
-project_hash = "0dc391b6268dae8628484182440593ccb116681a"
+project_hash = "642a10be64f9bf9b44e083aa7bde885be8a274b4"
 
 [[deps.AbstractStores]]
 deps = ["Base64", "Dates", "Serialization"]
@@ -305,6 +305,12 @@ deps = ["Dates", "Logging"]
 git-tree-sha1 = "f00544d95982ea270145636c181ceda21c4e2575"
 uuid = "e6f89c97-d47a-5376-807f-9c37f3926c36"
 version = "1.2.0"
+
+[[deps.MCPClient]]
+deps = ["Base64", "HTTP", "JSON"]
+path = "MCPClient"
+uuid = "9c36364a-8bb0-469c-adfd-7d7f936899d2"
+version = "0.1.0"
 
 [[deps.MSTeams]]
 deps = ["Dates", "HTTP", "JSON", "Logging", "ZipFile"]
