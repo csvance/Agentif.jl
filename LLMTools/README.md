@@ -36,6 +36,32 @@ coding = LLMTools.coding_tools(pwd())
 everything = LLMTools.all_tools(pwd(); workers = true)
 ```
 
+## Ignored Files
+
+`ls`, `find` and `grep` behave like `rg`: they skip whatever `.gitignore` excludes,
+and they never descend into a directory named `.git`. A repository's build output,
+dependency caches and packed git objects therefore stay out of the model's
+context, and the three tools agree with each other and with what a developer sees.
+
+Rules are collected from the base directory downwards, so a nested `.gitignore`
+applies to its own subtree, a deeper file overrides a shallower one, and `!`
+re-inclusions work. `.git/info/exclude` is read as well. Nothing above the base
+directory is consulted: that tree is outside what the tools are allowed to touch.
+
+Each of the three takes a trailing `includeIgnored` argument to turn the filtering
+off, and a path the caller names directly is always searched or listed even when
+the rules exclude it:
+
+```julia
+funcs = Dict(t.name => t.func for t in LLMTools.read_only_tools(pwd()))
+
+funcs["find"]("**/*.jl")                                    # tracked files only
+funcs["find"]("**/*.jl", nothing, nothing, true)            # ignored files too
+funcs["grep"]("TODO", "build/generated.jl")                 # named file, ignored or not
+```
+
+`.git` is skipped regardless of `includeIgnored`.
+
 ## Terminal Tools
 
 The PTY-backed terminal tools are created with:

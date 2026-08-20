@@ -332,35 +332,55 @@ Use `ls` to see what's in a directory. For recursive file search by name pattern
 Arguments:
 - path (String or nothing, required): Directory path relative to the working directory, or nothing to list the working directory itself.
 - limit (Int, optional): Maximum number of entries to return. Defaults to 500.
+- includeIgnored (Bool or nothing, optional): By default, entries excluded by `.gitignore` are hidden, like `rg`. Set true to show them. Entries named `.git` are always hidden.
 
 Entries are sorted alphabetically (case-insensitive). Directories have a trailing `/` suffix. Dotfiles are included. Output is truncated to 500 entries or 50KB, whichever is hit first.
 
 Examples:
 - `ls(nothing)` — list the working directory
-- `ls("src", 20)` — list first 20 entries in src/""",
-        ls(path::Union{Nothing, String}, limit::Union{Nothing, Int} = nothing) = begin
+- `ls("src", 20)` — list first 20 entries in src/
+- `ls("build", nothing, true)` — list build/ including gitignored entries""",
+        ls(path::Union{Nothing, String}, limit::Union{Nothing, Int} = nothing, includeIgnored::Union{Nothing, Bool} = nothing) = begin
             dir_path = resolve_search_path(base, path)
             isdir(dir_path) || throw(ArgumentError("not a directory: $(path === nothing ? "." : path)"))
+            ignore = ignore_context(base, dir_path; enabled = includeIgnored !== true)
+            dir_rel = root_relative(base, dir_path)
             entries = readdir(dir_path)
             sort!(entries, lt = (a, b) -> lowercase(a) < lowercase(b))
             effective_limit = limit === nothing ? DEFAULT_LS_LIMIT : max(1, limit)
             results = String[]
             entry_limit_reached = false
+            ignored_count = 0
             for entry in entries
+                # `.git` is skipped silently: it is never what a caller wants and
+                # saying so on every listing would be noise.
+                always_ignored(entry) && continue
+                rel = isempty(dir_rel) ? entry : "$(dir_rel)/$(entry)"
+                full_path = joinpath(dir_path, entry)
+                if is_ignored(ignore, rel, is_directory_entry(full_path))
+                    ignored_count += 1
+                    continue
+                end
                 if length(results) >= effective_limit
                     entry_limit_reached = true
                     break
                 end
-                full_path = joinpath(dir_path, entry)
                 suffix = isdir(full_path) ? "/" : ""
                 push!(results, entry * suffix)
             end
-            isempty(results) && return "(empty directory)"
+            # An empty listing and a fully ignored one are different facts, and a
+            # model told "empty" about a directory full of ignored files will draw
+            # the wrong conclusion.
+            if isempty(results)
+                ignored_count == 0 && return "(empty directory)"
+                return "(no listed entries; $(ignored_count) hidden by .gitignore. Use includeIgnored=true to show them)"
+            end
             raw_output = join(results, "\n")
             truncation = truncate_head(raw_output; max_lines = typemax(Int))
             output = truncation.content
             notices = String[]
             entry_limit_reached && push!(notices, "$(effective_limit) entries limit reached. Use limit=$(effective_limit * 2) for more")
+            ignored_count > 0 && push!(notices, "$(ignored_count) entries hidden by .gitignore. Use includeIgnored=true to show them")
             truncation.truncated && push!(notices, "$(format_size(DEFAULT_MAX_BYTES)) limit reached")
             if !isempty(notices)
                 output *= "\n\n[$(join(notices, ". "))]"
@@ -445,21 +465,24 @@ Arguments:
 - pattern (String, required): Glob pattern to match against relative paths. Supports `*` (any chars except `/`), `**` (any path segments), and `?` (single char). Examples: `"*.jl"`, `"src/**/*.jl"`, `"test_*.jl"`.
 - path (String or nothing, optional): Directory to search within, relative to the working directory. Defaults to the working directory.
 - limit (Int, optional): Maximum number of results. Defaults to 1000.
+- includeIgnored (Bool or nothing, optional): By default, paths excluded by `.gitignore` are skipped, like `rg`. Set true to include them. Directories named `.git` are always skipped.
 
 Matched directories have a trailing `/` suffix. Output is also capped at 50KB.
 
 Examples:
 - `find("*.jl")` — find all Julia files recursively
-- `find("**/*test*.jl", "test")` — find test files under test/""",
-        find(pattern::String, path::Union{Nothing, String} = nothing, limit::Union{Nothing, Int} = nothing) = begin
+- `find("**/*test*.jl", "test")` — find test files under test/
+- `find("*.o", nothing, nothing, true)` — find object files, including gitignored ones""",
+        find(pattern::String, path::Union{Nothing, String} = nothing, limit::Union{Nothing, Int} = nothing, includeIgnored::Union{Nothing, Bool} = nothing) = begin
             isempty(pattern) && throw(ArgumentError("pattern is required"))
             search_dir = resolve_search_path(base, path)
             isdir(search_dir) || throw(ArgumentError("not a directory: $(path === nothing ? "." : path)"))
             regex = glob_to_regex(pattern)
+            ignore = ignore_context(base, search_dir; enabled = includeIgnored !== true)
             effective_limit = limit === nothing ? DEFAULT_FIND_LIMIT : max(1, limit)
             results = String[]
             limit_reached = false
-            for (root, dirs, files) in walkdir(search_dir)
+            walk_filtered(ignore, search_dir) do root, dirs, files
                 rel_root = relpath(root, search_dir)
                 rel_root = rel_root == "." ? "" : normalize_relpath(rel_root)
                 for dir in dirs
@@ -472,20 +495,25 @@ Examples:
                         end
                     end
                 end
-                limit_reached && break
-                for file in files
-                    rel = rel_root == "" ? file : "$(rel_root)/$(file)"
-                    if occursin(regex, rel)
-                        push!(results, rel)
-                        if length(results) >= effective_limit
-                            limit_reached = true
-                            break
+                if !limit_reached
+                    for file in files
+                        rel = rel_root == "" ? file : "$(rel_root)/$(file)"
+                        if occursin(regex, rel)
+                            push!(results, rel)
+                            if length(results) >= effective_limit
+                                limit_reached = true
+                                break
+                            end
                         end
                     end
                 end
-                limit_reached && break
+                return !limit_reached
             end
-            isempty(results) && return "No files found matching pattern"
+            if isempty(results)
+                return ignore.enabled ?
+                    "No files found matching pattern (gitignored paths were skipped; use includeIgnored=true to include them)" :
+                    "No files found matching pattern"
+            end
             raw_output = join(results, "\n")
             truncation = truncate_head(raw_output; max_lines = typemax(Int))
             output = truncation.content
@@ -516,13 +544,15 @@ Arguments:
 - literal (Bool or nothing, optional): Treat pattern as a literal string, not regex.
 - context (Int or nothing, optional): Number of lines to show before and after each match (like `grep -C`).
 - limit (Int, optional): Maximum number of matches. Defaults to 100.
+- includeIgnored (Bool or nothing, optional): By default, files excluded by `.gitignore` are not searched, like `rg`. Set true to search them. Directories named `.git` are always skipped. A file named directly in `path` is always searched, ignored or not.
 
 Lines longer than 500 characters are truncated. Output is capped at 50KB.
 
 Examples:
 - `grep("function main")` — search all files for a regex pattern
 - `grep("TODO", nothing, "*.jl", true)` — case-insensitive search in Julia files only
-- `grep("error", "src/app.jl", nothing, nothing, true, 2)` — literal search in one file with 2 lines of context""",
+- `grep("error", "src/app.jl", nothing, nothing, true, 2)` — literal search in one file with 2 lines of context
+- `grep("version", nothing, nothing, nothing, nothing, nothing, nothing, true)` — search gitignored files too""",
         grep(
             pattern::String,
             path::Union{Nothing, String} = nothing,
@@ -531,6 +561,7 @@ Examples:
             literal::Union{Nothing, Bool} = nothing,
             context::Union{Nothing, Int} = nothing,
             limit::Union{Nothing, Int} = nothing,
+            includeIgnored::Union{Nothing, Bool} = nothing,
         ) = begin
             isempty(pattern) && throw(ArgumentError("pattern is required"))
             search_path = resolve_search_path(base, path)
@@ -543,7 +574,7 @@ Examples:
             lines_truncated = false
             output_lines = String[]
             search_root = isdir(search_path) ? search_path : dirname(search_path)
-            file_list = isdir(search_path) ? collect(walkdir(search_path)) : [(search_root, String[], [basename(search_path)])]
+            ignore = ignore_context(base, search_root; enabled = includeIgnored !== true)
             regex = nothing
             if literal !== true
                 try
@@ -553,62 +584,79 @@ Examples:
                     throw(ArgumentError("invalid regex pattern"))
                 end
             end
-            for (root, _dirs, files) in file_list
-                for file in files
-                    file_path = joinpath(root, file)
-                    rel_path = normalize_relpath(relpath(file_path, search_root))
-                    glob_regex !== nothing && !occursin(glob_regex, rel_path) && continue
-                    content = try
-                        read(file_path, String)
-                    catch
-                        continue
-                    end
-                    occursin('\0', content) && continue
-                    lines = split(content, "\n"; keepempty = true)
-                    match_lines = Int[]
-                    for (idx, line) in enumerate(lines)
-                        is_match = if literal === true
-                            if ignoreCase === true
-                                occursin(lowercase(pattern), lowercase(line))
-                            else
-                                occursin(pattern, line)
-                            end
-                        else
-                            regex !== nothing && occursin(regex, line)
-                        end
-                        if is_match
-                            push!(match_lines, idx)
-                            match_count += 1
-                            if match_count >= effective_limit
-                                match_limit_reached = true
-                                break
-                            end
-                        end
-                    end
-                    isempty(match_lines) && continue
-                    match_set = Set(match_lines)
-                    last_printed = 0
-                    for match_line in match_lines
-                        start_line = max(1, match_line - context_value)
-                        end_line = min(length(lines), match_line + context_value)
-                        start_line = max(start_line, last_printed + 1)
-                        for line_idx in start_line:end_line
-                            line_text = lines[line_idx]
-                            truncated = truncate_line(line_text)
-                            truncated.was_truncated && (lines_truncated = true)
-                            if line_idx in match_set
-                                push!(output_lines, "$(rel_path):$(line_idx): $(truncated.text)")
-                            else
-                                push!(output_lines, "$(rel_path)-$(line_idx)- $(truncated.text)")
-                            end
-                        end
-                        last_printed = max(last_printed, end_line)
-                    end
-                    match_limit_reached && break
+            # One `search_file` call per candidate, so the single-file case and the
+            # directory walk share the matching code. It returns false once the
+            # match limit is hit, which is also `walk_filtered`'s stop signal.
+            search_file = function (file_path::AbstractString, rel_path::AbstractString)
+                glob_regex !== nothing && !occursin(glob_regex, rel_path) && return true
+                content = try
+                    read(file_path, String)
+                catch
+                    return true
                 end
-                match_limit_reached && break
+                occursin('\0', content) && return true
+                lines = split(content, "\n"; keepempty = true)
+                match_lines = Int[]
+                for (idx, line) in enumerate(lines)
+                    is_match = if literal === true
+                        if ignoreCase === true
+                            occursin(lowercase(pattern), lowercase(line))
+                        else
+                            occursin(pattern, line)
+                        end
+                    else
+                        regex !== nothing && occursin(regex, line)
+                    end
+                    if is_match
+                        push!(match_lines, idx)
+                        match_count += 1
+                        if match_count >= effective_limit
+                            match_limit_reached = true
+                            break
+                        end
+                    end
+                end
+                isempty(match_lines) && return !match_limit_reached
+                match_set = Set(match_lines)
+                last_printed = 0
+                for match_line in match_lines
+                    start_line = max(1, match_line - context_value)
+                    end_line = min(length(lines), match_line + context_value)
+                    start_line = max(start_line, last_printed + 1)
+                    for line_idx in start_line:end_line
+                        line_text = lines[line_idx]
+                        truncated = truncate_line(line_text)
+                        truncated.was_truncated && (lines_truncated = true)
+                        if line_idx in match_set
+                            push!(output_lines, "$(rel_path):$(line_idx): $(truncated.text)")
+                        else
+                            push!(output_lines, "$(rel_path)-$(line_idx)- $(truncated.text)")
+                        end
+                    end
+                    last_printed = max(last_printed, end_line)
+                end
+                return !match_limit_reached
             end
-            isempty(output_lines) && return "No matches found"
+            if isdir(search_path)
+                walk_filtered(ignore, search_path) do root, _dirs, files
+                    for file in files
+                        file_path = joinpath(root, file)
+                        search_file(file_path, normalize_relpath(relpath(file_path, search_root))) || return false
+                    end
+                    return true
+                end
+            else
+                # A path the caller named is searched whether the ignore rules
+                # exclude it or not, the same way `rg some/ignored/file` searches it.
+                search_file(search_path, normalize_relpath(relpath(search_path, search_root)))
+            end
+            if isempty(output_lines)
+                # Only worth mentioning when the walk could have skipped something:
+                # a single named file is searched regardless of the ignore rules.
+                return (ignore.enabled && isdir(search_path)) ?
+                    "No matches found (gitignored files were not searched; use includeIgnored=true to search them)" :
+                    "No matches found"
+            end
             raw_output = join(output_lines, "\n")
             truncation = truncate_head(raw_output; max_lines = typemax(Int))
             output = truncation.content

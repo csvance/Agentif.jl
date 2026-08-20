@@ -15,6 +15,9 @@ include("subprocess_env.jl")
 # Outbound network policy for web_fetch (§2.3)
 include("egress.jl")
 
+# .gitignore handling shared by the ls/find/grep tools
+include("ignore.jl")
+
 # File/search/subagent/web tools and tool aggregation
 include("predefined_tools.jl")
 
