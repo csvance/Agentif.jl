@@ -3,6 +3,7 @@ module LLMTools
 using Agentif
 using Agentif: Agent, AgentTool, AssistantMessage, message_text, evaluate
 using HTTP, JSON, PtySessions, UUIDs
+using GitIgnore: IgnoreMatcher, isignored, walkfiltered
 using ConcurrentUtilities: Workers, Worker, remote_eval, remote_fetch
 using ScopedValues: ScopedValue, @with
 
@@ -14,9 +15,6 @@ include("subprocess_env.jl")
 
 # Outbound network policy for web_fetch (§2.3)
 include("egress.jl")
-
-# .gitignore handling shared by the ls/find/grep tools
-include("ignore.jl")
 
 # File/search/subagent/web tools and tool aggregation
 include("predefined_tools.jl")

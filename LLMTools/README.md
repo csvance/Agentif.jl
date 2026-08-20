@@ -43,11 +43,14 @@ and a walk never descends into a directory named `.git`. A repository's build
 output, dependency caches and packed git objects therefore stay out of the model's
 context, and the three tools agree with each other and with what a developer sees.
 
-Rules are collected from the base directory downwards, so a nested `.gitignore`
-applies to its own subtree, a deeper file overrides a shallower one, and `!`
-re-inclusions work. Each directory's `.git/info/exclude` is read as well, which
-matters when the base directory holds several repositories. Nothing above the base
-directory is consulted: that tree is outside what the tools are allowed to touch.
+Matching is [`GitIgnore.jl`](https://github.com/csvance/GitIgnore.jl), which is
+tested differentially against the real `git` binary. Rules are collected from the
+base directory downwards, so a nested `.gitignore` applies to its own subtree, a
+deeper file overrides a shallower one, and `!` re-inclusions work. Each directory's
+`.git/info/exclude` is read as well, which matters when the base directory holds
+several repositories. Nothing above the base directory is consulted: that tree is
+outside what the tools are allowed to touch, and per-user or system-wide excludes
+(`core.excludesFile`) are not read either.
 
 Each of the three takes a trailing `includeIgnored` argument to turn the filtering
 off. The path a caller names is itself exempt, so a directory or file that the
@@ -65,8 +68,9 @@ funcs["ls"]("build")                                        # named dir, ignored
 
 The exemption covers the named path only, so entries *under* it are still
 filtered: with `build/**` in a `.gitignore`, `ls("build")` reports its contents
-as hidden. A `.gitignore` line that cannot be translated faithfully is inert,
-matching nothing, the way git treats a malformed pattern.
+as hidden. Naming a directory that is itself excluded lists it in full, since git
+cannot re-include anything below an excluded directory and there is nothing left
+to filter.
 
 ## Terminal Tools
 

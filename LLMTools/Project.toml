@@ -3,6 +3,7 @@ uuid = "d2f4c4b3-4b8a-4e8c-9b4f-7b8e4e6e5b2c"
 version = "1.0.0"
 
 [deps]
+GitIgnore = "a0010394-fc0d-43eb-a3e0-33caa976912f"
 Agentif = "b1e21dde-9d8e-492f-89d0-ee48af23bfc5"
 ConcurrentUtilities = "f0e56b4a-5159-44fe-b623-3e5288b988bb"
 HTTP = "cd3eb016-35fb-5094-929b-558a96fad6f3"
@@ -13,12 +14,14 @@ Sockets = "6462fe0b-24de-5631-8697-dd941f90decc"
 UUIDs = "cf7118a7-6976-5b1a-9a39-7adc72f591a4"
 
 [sources]
+GitIgnore = {rev = "e2d78809cf0aaf5961b20ccdff70b0ad5190c8f3", url = "https://github.com/csvance/GitIgnore.jl.git"}
 Agentif = {path = "../Agentif"}
 LLMProviders = {path = "../LLMProviders"}
 ConcurrentUtilities = {url = "https://github.com/JuliaServices/ConcurrentUtilities.jl.git", rev = "main"}
 PtySessions = {url = "https://github.com/quinnj/PtySessions.jl.git"}
 
 [compat]
+GitIgnore = "0.1"
 Agentif = "1"
 ConcurrentUtilities = "2"
 HTTP = "2"

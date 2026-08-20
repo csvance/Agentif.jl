@@ -3,7 +3,7 @@ using Test, LLMTools
 @testset "LLMTools.jl" begin
     include("test_utils.jl")
     include("file_tools_test.jl")
-    include("ignore_test.jl")
+    include("ignore_tools_test.jl")
     include("session_utils_test.jl")
     include("subprocess_env_test.jl")
     include("terminal_tools_test.jl")

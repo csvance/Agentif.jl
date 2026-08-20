@@ -4,6 +4,7 @@ Claw = "46916a23-5c37-4b23-b62b-45b422578c04"
 ConcurrentUtilities = "f0e56b4a-5159-44fe-b623-3e5288b988bb"
 Encid = "22e113d6-bca1-46f4-8715-c46169ad70b7"
 GitHub = "bc5e4493-9b4d-5f90-b8aa-2b2bcaad7a26"
+GitIgnore = "a0010394-fc0d-43eb-a3e0-33caa976912f"
 HTTP = "cd3eb016-35fb-5094-929b-558a96fad6f3"
 JSON = "682c06a0-de6a-54ab-a142-c8b1cf79cde6"
 JSONSchema = "7d188eb4-7ad8-530c-ae41-71a32a6d4692"
@@ -29,6 +30,7 @@ Agentif = {path = "Agentif"}
 Claw = {path = "Claw"}
 ConcurrentUtilities = {rev = "main", url = "https://github.com/JuliaServices/ConcurrentUtilities.jl.git"}
 Encid = {url = "https://github.com/JuliaServices/Encid.jl.git"}
+GitIgnore = {rev = "e2d78809cf0aaf5961b20ccdff70b0ad5190c8f3", url = "https://github.com/csvance/GitIgnore.jl.git"}
 HTTP = {rev = "master", url = "https://github.com/JuliaWeb/HTTP.jl.git"}
 JSONSchema = {rev = "4076c12e69f8191b611580744c42579f95e92974", url = "https://github.com/JuliaIO/JSONSchema.jl.git"}
 Juco = {path = "Juco"}

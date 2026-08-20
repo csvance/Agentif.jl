@@ -2,7 +2,7 @@
 
 julia_version = "1.12.6"
 manifest_format = "2.0"
-project_hash = "642a10be64f9bf9b44e083aa7bde885be8a274b4"
+project_hash = "e7080bcdf9b8b6bcc0c0813023db56961cc498a9"
 
 [[deps.AbstractStores]]
 deps = ["Base64", "Dates", "Serialization"]
@@ -157,6 +157,13 @@ git-tree-sha1 = "33de1bc5665494f0a9669fd6027e28180709d874"
 uuid = "bc5e4493-9b4d-5f90-b8aa-2b2bcaad7a26"
 version = "5.13.0"
 
+[[deps.GitIgnore]]
+git-tree-sha1 = "1f6d8b9baa9690de7610bf64adb715f4d49f37ed"
+repo-rev = "e2d78809cf0aaf5961b20ccdff70b0ad5190c8f3"
+repo-url = "https://github.com/csvance/GitIgnore.jl.git"
+uuid = "a0010394-fc0d-43eb-a3e0-33caa976912f"
+version = "0.1.0"
+
 [[deps.HTTP]]
 deps = ["Base64", "CodecZlib", "Dates", "EnumX", "PrecompileTools", "Random", "Reseau", "SHA", "URIs", "UUIDs", "Zlib_jll"]
 git-tree-sha1 = "0a58fbbdee93d132a2fb1159b7f5e1b5c2465e71"
@@ -253,7 +260,7 @@ uuid = "e1f4c4b3-4b8a-4e8c-9b4f-7b8e4e6e5b2a"
 version = "1.0.0"
 
 [[deps.LLMTools]]
-deps = ["Agentif", "ConcurrentUtilities", "HTTP", "JSON", "PtySessions", "ScopedValues", "Sockets", "UUIDs"]
+deps = ["Agentif", "ConcurrentUtilities", "GitIgnore", "HTTP", "JSON", "PtySessions", "ScopedValues", "Sockets", "UUIDs"]
 path = "LLMTools"
 uuid = "d2f4c4b3-4b8a-4e8c-9b4f-7b8e4e6e5b2c"
 version = "1.0.0"

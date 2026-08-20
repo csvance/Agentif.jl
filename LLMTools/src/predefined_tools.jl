@@ -154,6 +154,14 @@ function resolve_search_path(base_dir::AbstractString, path::Union{Nothing, Stri
     return resolve_relative_path(base_dir, local_path)
 end
 
+normalize_relpath(path::AbstractString) = replace(path, '\\' => '/')
+
+# One matcher covers any directory under `base`: GitIgnore loads each directory's
+# rules on first use. `includeIgnored` asks for an unfiltered view, which is a
+# matcher holding no rules at all rather than a flag threaded through the walk.
+ignore_matcher(base::AbstractString, includeIgnored::Union{Nothing, Bool}) =
+    includeIgnored === true ? IgnoreMatcher(base, ()) : IgnoreMatcher(base)
+
 function glob_to_regex(pattern::String)
     normalized = replace(pattern, '\\' => '/')
     out = IOBuffer()
@@ -339,8 +347,14 @@ Examples:
         ls(path::Union{Nothing, String}, limit::Union{Nothing, Int} = nothing, includeIgnored::Union{Nothing, Bool} = nothing) = begin
             dir_path = resolve_search_path(base, path)
             isdir(dir_path) || throw(ArgumentError("not a directory: $(path === nothing ? "." : path)"))
-            ignore = ignore_context(base, dir_path; enabled = includeIgnored !== true)
-            dir_rel = root_relative(base, dir_path)
+            matcher = ignore_matcher(base, includeIgnored)
+            # `isignored` applies git's rule that an excluded directory takes
+            # everything below it, so naming an ignored directory would otherwise
+            # report every entry as hidden. A caller who names a path has asked for
+            # it, and a rule inside an excluded directory cannot re-include
+            # anything, so there is nothing left to filter. `find` and `grep` agree
+            # by construction: their walk never tests an ancestor of its start.
+            filtered = !isignored(matcher, dir_path, true)
             entries = readdir(dir_path)
             sort!(entries, lt = (a, b) -> lowercase(a) < lowercase(b))
             effective_limit = limit === nothing ? DEFAULT_LS_LIMIT : max(1, limit)
@@ -349,15 +363,16 @@ Examples:
             ignored_count = 0
             for entry in entries
                 # `.git` is skipped silently: it is never what a caller wants and
-                # saying so on every listing would be noise.
-                always_ignored(entry) && continue
-                rel = isempty(dir_rel) ? entry : "$(dir_rel)/$(entry)"
+                # saying so on every listing would be noise. `isignored` reports
+                # only what the rules say, matching `git check-ignore`, so this is
+                # the tool's own policy rather than the matcher's.
+                entry == ".git" && continue
                 full_path = joinpath(dir_path, entry)
                 is_dir = isdir(full_path)
-                # git counts a symlinked directory as a file, so `dir_only`
-                # patterns must not match one; `islink` is only reached where that
+                # git counts a symlinked directory as a file, so a `dir_only`
+                # pattern must not match one; `islink` is only reached where that
                 # distinction can change the verdict.
-                if is_ignored(ignore, rel, is_dir && !islink(full_path))
+                if filtered && isignored(matcher, full_path, is_dir && !islink(full_path))
                     ignored_count += 1
                     continue
                 end
@@ -477,11 +492,11 @@ Examples:
             search_dir = resolve_search_path(base, path)
             isdir(search_dir) || throw(ArgumentError("not a directory: $(path === nothing ? "." : path)"))
             regex = glob_to_regex(pattern)
-            ignore = ignore_context(base, search_dir; enabled = includeIgnored !== true)
+            matcher = ignore_matcher(base, includeIgnored)
             effective_limit = limit === nothing ? DEFAULT_FIND_LIMIT : max(1, limit)
             results = String[]
             limit_reached = false
-            walk = walk_filtered(ignore, search_dir) do root, dirs, files
+            walk = walkfiltered(matcher, search_dir) do root, dirs, files
                 rel_root = relpath(root, search_dir)
                 rel_root = rel_root == "." ? "" : normalize_relpath(rel_root)
                 for dir in dirs
@@ -585,7 +600,7 @@ Examples:
             end
             # One `search_file` call per candidate, so the single-file case and the
             # directory walk share the matching code. It returns false once the
-            # match limit is hit, which is also `walk_filtered`'s stop signal.
+            # match limit is hit, which is also `walkfiltered`'s stop signal.
             search_file = function (file_path::AbstractString, rel_path::AbstractString)
                 glob_regex !== nothing && !occursin(glob_regex, rel_path) && return true
                 content = try
@@ -638,8 +653,8 @@ Examples:
             end
             skipped = 0
             if isdir(search_path)
-                ignore = ignore_context(base, search_root; enabled = includeIgnored !== true)
-                walk = walk_filtered(ignore, search_path) do root, _dirs, files
+                matcher = ignore_matcher(base, includeIgnored)
+                walk = walkfiltered(matcher, search_path) do root, _dirs, files
                     for file in files
                         file_path = joinpath(root, file)
                         search_file(file_path, normalize_relpath(relpath(file_path, search_root))) || return false
