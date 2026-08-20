@@ -33,6 +33,12 @@ mutable struct StreamableHTTPTransport <: AbstractTransport
     closed::Bool
     terminate_on_close::Bool
     http_client::HTTP.Client
+    # Every exchange currently waiting for a reply, so `close` can wake it. A
+    # closed socket does not by itself unblock the caller: its `Deadline` lives
+    # on the worker task, so without this registry the caller waits out its full
+    # timeout after `close` returns, and with `timeout <= 0` waits forever.
+    inflight::Dict{Int,Deadline}
+    next_inflight::Int
     lock::ReentrantLock
 end
 
@@ -46,7 +52,7 @@ function StreamableHTTPTransport(url::AbstractString;
     # of a small tools/call.
     return StreamableHTTPTransport(String(url), hs, Float64(timeout), nothing, nothing,
                                    nothing, false, terminate_on_close, HTTP.Client(),
-                                   ReentrantLock())
+                                   Dict{Int,Deadline}(), 0, ReentrantLock())
 end
 
 session_id(t::StreamableHTTPTransport) = @lock t.lock t.session_id
@@ -126,8 +132,41 @@ function _exchange(t::StreamableHTTPTransport, message::AbstractDict, want_id,
         return nothing
     end
     return run_with_deadline(timeout, method; cleanup=cleanup) do d
-        _post(t, payload, want_id, method, stream_ref, ctx, d)
+        token = _register_inflight!(t, d, method)
+        try
+            _post(t, payload, want_id, method, stream_ref, ctx, d)
+        finally
+            _unregister_inflight!(t, token)
+        end
     end
+end
+
+function _register_inflight!(t::StreamableHTTPTransport, d::Deadline, method::AbstractString)
+    # Registering the waiter and re-checking `closed` happen under one lock, and
+    # `close` empties the registry under the same one, so a request registered
+    # just after a close cannot be stranded.
+    @lock t.lock begin
+        t.closed && throw(MCPTransportError("transport for $(t.url) was closed before \"$method\" was sent"))
+        t.next_inflight += 1
+        token = t.next_inflight
+        t.inflight[token] = d
+        return token
+    end
+end
+
+_unregister_inflight!(t::StreamableHTTPTransport, token::Int) =
+    @lock t.lock delete!(t.inflight, token)
+
+function _fail_inflight!(t::StreamableHTTPTransport, err::Exception)
+    waiters = @lock t.lock begin
+        ws = collect(values(t.inflight))
+        empty!(t.inflight)
+        ws
+    end
+    for d in waiters
+        deliver!(d, err)
+    end
+    return nothing
 end
 
 function _post(t::StreamableHTTPTransport, payload::String, want_id, method::AbstractString,
@@ -231,6 +270,9 @@ Mark the transport unusable and, when the server issued a session id, ask it to
 end the session with an HTTP `DELETE`. Failure to delete is logged at debug level
 only: the session will expire on its own and there is nothing useful a caller can
 do about it.
+
+Any request still in flight fails with [`MCPTransportError`](@ref) rather than
+waiting out its deadline, which matters most when that deadline is "never".
 """
 function Base.close(t::StreamableHTTPTransport)
     already = @lock t.lock begin
@@ -239,6 +281,10 @@ function Base.close(t::StreamableHTTPTransport)
         was
     end
     already && return nothing
+    # Wake anyone mid-exchange before the session teardown, which itself performs
+    # a request and can block.
+    _fail_inflight!(t, MCPTransportError(
+        "the transport for $(t.url) was closed while the request was in flight"))
     try
         _terminate_session(t)
     finally

@@ -30,8 +30,8 @@ URL:
 client = Client(`npx -y @modelcontextprotocol/server-everything`)
 ```
 
-This package depends only on HTTP, JSON and three standard libraries, so it can
-be wrapped for any agent framework without dragging one in.
+This package depends only on HTTP, JSON and Base64, so it can be wrapped for any
+agent framework without dragging one in.
 """
 module MCPClient
 

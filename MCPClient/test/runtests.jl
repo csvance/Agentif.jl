@@ -614,6 +614,330 @@ end
     end
 end
 
+# --- regressions from code review -----------------------------------------
+
+# Everything below covers a defect found in review: a server that sends the wrong
+# type where the spec says string used to raise MethodError, which is not an
+# MCPException, so a caller guarding with `catch e isa MCPException` saw an
+# escaping crash and read a server's sloppiness as a bug in its own code.
+@testset "a wrong-typed field is a protocol error, not a MethodError" begin
+    # Each case is (description, the tools/call result the server returns).
+    malformed_results = [
+        "mimeType of an image" => Dict("content" => [Dict("type" => "image", "data" => "AAAA", "mimeType" => 42)]),
+        "mimeType as an object" => Dict("content" => [Dict("type" => "image", "data" => "AAAA", "mimeType" => Dict())]),
+        "text of a text block" => Dict("content" => [Dict("type" => "text", "text" => 7)]),
+        "resource.uri" => Dict("content" => [Dict("type" => "resource", "resource" => Dict("uri" => 1, "text" => "x"))]),
+        "resource.text" => Dict("content" => [Dict("type" => "resource", "resource" => Dict("uri" => "u", "text" => 2))]),
+        "resource_link.uri" => Dict("content" => [Dict("type" => "resource_link", "uri" => 3, "name" => "n")]),
+        "resource_link.name" => Dict("content" => [Dict("type" => "resource_link", "uri" => "u", "name" => 4)]),
+        "structuredContent as an array" => Dict("content" => [], "structuredContent" => [1, 2]),
+        "both text and blob on a resource" =>
+            Dict("content" => [Dict("type" => "resource", "resource" => Dict("uri" => "u", "text" => "t", "blob" => "AAAA"))]),
+    ]
+    for (label, result) in malformed_results
+        @testset "$label" begin
+            with_server((fs, msg, req) -> begin
+                msg === nothing && return nothing
+                get(msg, "method", "") == "tools/call" ?
+                    json_response(result_for(msg, result)) : default_dispatch(fs, msg, req)
+            end) do fs
+                Client(fs.url; timeout = 5) do client
+                    err = try
+                        call_tool(client, "echo", Dict{String,Any}())
+                        nothing
+                    catch e
+                        e
+                    end
+                    @test err isa MCPException
+                    @test err isa MCPProtocolError
+                end
+            end
+        end
+    end
+end
+
+@testset "a malformed tools/list entry is a protocol error" begin
+    for entries in ([("not an object")], [Dict("name" => "ok", "description" => 5)],
+                    [Dict("name" => "ok", "inputSchema" => [1])],
+                    [Dict("name" => "ok", "title" => 9)])
+        with_server((fs, msg, req) -> begin
+            msg === nothing && return nothing
+            get(msg, "method", "") == "tools/list" ?
+                json_response(result_for(msg, Dict("tools" => entries))) : default_dispatch(fs, msg, req)
+        end) do fs
+            Client(fs.url; timeout = 5) do client
+                err = try
+                    list_tools(client)
+                    nothing
+                catch e
+                    e
+                end
+                @test err isa MCPProtocolError
+            end
+        end
+    end
+end
+
+@testset "a malformed error object is a protocol error" begin
+    # A non-integer code used to be silently rewritten to ERR_INTERNAL, which
+    # reports a different error than the one the server sent.
+    for err_obj in (Dict("code" => -32602, "message" => 5),
+                    Dict("code" => "not a number", "message" => "m"),
+                    Dict("code" => -3.5, "message" => "m"))
+        with_server((fs, msg, req) -> begin
+            msg === nothing && return nothing
+            get(msg, "method", "") == "tools/call" ?
+                json_response(Dict("jsonrpc" => "2.0", "id" => msg["id"], "error" => err_obj)) :
+                default_dispatch(fs, msg, req)
+        end) do fs
+            Client(fs.url; timeout = 5) do client
+                err = try
+                    call_tool(client, "echo", Dict{String,Any}())
+                    nothing
+                catch e
+                    e
+                end
+                @test err isa MCPProtocolError
+            end
+        end
+    end
+    # An integer-valued float is a JSON round-trip artefact and still works.
+    with_server((fs, msg, req) -> begin
+        msg === nothing && return nothing
+        get(msg, "method", "") == "tools/call" ?
+            json_response(Dict("jsonrpc" => "2.0", "id" => msg["id"],
+                               "error" => Dict("code" => -32602.0, "message" => "bad args"))) :
+            default_dispatch(fs, msg, req)
+    end) do fs
+        Client(fs.url; timeout = 5) do client
+            err = try
+                call_tool(client, "echo", Dict{String,Any}())
+                nothing
+            catch e
+                e
+            end
+            @test err isa JSONRPCError
+            @test err.code == -32602
+        end
+    end
+end
+
+@testset "a wrong-typed capabilities object is not silently emptied" begin
+    with_server((fs, msg, req) -> begin
+        msg === nothing && return nothing
+        get(msg, "method", "") == "initialize" || return default_dispatch(fs, msg, req)
+        json_response(result_for(msg, Dict("protocolVersion" => LATEST_PROTOCOL_VERSION,
+                                          "capabilities" => [1, 2],
+                                          "serverInfo" => Dict("name" => "s", "version" => "1"))))
+    end) do fs
+        @test_throws MCPProtocolError Client(fs.url; timeout = 5)
+    end
+end
+
+@testset "close wakes a request that is still in flight" begin
+    # The HTTP transport used to close its socket without touching the waiter, so
+    # the caller sat out its whole deadline after close() had returned. The stdio
+    # transport already did this correctly; the two must agree.
+    with_server((fs, msg, req) -> begin
+        msg === nothing && return nothing
+        get(msg, "method", "") == "tools/call" ? (sleep(30); json_response(result_for(msg, Dict()))) :
+            default_dispatch(fs, msg, req)
+    end) do fs
+        client = Client(fs.url; timeout = 60)
+        outcome = Ref{Any}(nothing)
+        caller = @async begin
+            outcome[] = try
+                call_tool(client, "slow", Dict{String,Any}())
+            catch e
+                e
+            end
+        end
+        # Let the POST get out before closing, otherwise this tests the
+        # already-closed path instead.
+        sleep(1.0)
+        started = time()
+        close(client)
+        wait(caller)
+        elapsed = time() - started
+        @test outcome[] isa MCPTransportError
+        # Comfortably under both the 60s deadline and the server's 30s sleep.
+        @test elapsed < 15
+    end
+end
+
+@testset "a request sent after close fails immediately" begin
+    with_server() do fs
+        client = Client(fs.url; timeout = 5)
+        close(client)
+        @test_throws MCPTransportError ping(client)
+    end
+end
+
+@testset "a handshake failure closes a transport it was handed" begin
+    # The URL and Cmd constructors guarded this; the transport-taking one, which
+    # the docstring recommends for further configuration, did not.
+    with_server((fs, msg, req) -> begin
+        msg === nothing && return nothing
+        get(msg, "method", "") == "initialize" ?
+            json_response(error_for(msg, -32603, "no handshake for you")) :
+            default_dispatch(fs, msg, req)
+    end) do fs
+        transport = StreamableHTTPTransport(fs.url; timeout = 5)
+        @test_throws JSONRPCError Client(transport)
+        @test !MCPClient.is_open(transport)
+
+        # And the do-block form, whose construction sits outside its own try.
+        other = StreamableHTTPTransport(fs.url; timeout = 5)
+        @test_throws JSONRPCError Client(c -> c, other)
+        @test !MCPClient.is_open(other)
+    end
+end
+
+@testset "server-initiated requests are bounded" begin
+    # A server that answers every POST with a request used to get an unbounded
+    # reply loop: each reply is a POST whose own body is routed back in.
+    answered = Threads.Atomic{Int}(0)
+    with_server((fs, msg, req) -> begin
+        msg === nothing && return nothing
+        method = get(msg, "method", "")
+        if method == "initialize" || startswith(method, "notifications/")
+            return default_dispatch(fs, msg, req)
+        end
+        # Every message the client sends, reply or not, provokes another request.
+        Threads.atomic_add!(answered, 1)
+        return json_response(Dict("jsonrpc" => "2.0", "id" => "srv-$(answered[])", "method" => "ping"))
+    end) do fs
+        client = Client(fs.url; timeout = 5)
+        try
+            # Enough to prove it terminates rather than growing without bound;
+            # the budget itself is 10_000, which is too slow to drive here.
+            sleep(2.0)
+            @test client.answered <= MCPClient.MAX_ANSWERED_REQUESTS
+        finally
+            close(client)
+        end
+    end
+end
+
+@testset "a notification handler may call back into the client" begin
+    # Handlers used to run on the reader task, so a handler that called the
+    # client deadlocked the transport it was waiting on.
+    with_server((fs, msg, req) -> begin
+        msg === nothing && return nothing
+        if get(msg, "method", "") == "tools/call"
+            return sse_response(
+                Dict("jsonrpc" => "2.0", "method" => "notifications/progress",
+                     "params" => Dict("progressToken" => "t", "progress" => 1)),
+                result_for(msg, text_tool_result("done")))
+        end
+        return default_dispatch(fs, msg, req)
+    end) do fs
+        pinged = Threads.Atomic{Int}(0)
+        client = Client(fs.url; timeout = 10, on_notification = function (_)
+            # A nested call on the same client: this is the deadlock case.
+            try
+                ping(client)
+                Threads.atomic_add!(pinged, 1)
+            catch
+            end
+        end)
+        try
+            started = time()
+            result = call_tool(client, "echo", Dict{String,Any}("text" => "hi"))
+            elapsed = time() - started
+            @test content_text(result) == "done"
+            # The handler no longer blocks the call it arrived on.
+            @test elapsed < 5
+            # And the nested ping did get through, on the pump's task.
+            timeout = time() + 5
+            while pinged[] == 0 && time() < timeout
+                sleep(0.05)
+            end
+            @test pinged[] == 1
+        finally
+            close(client)
+        end
+    end
+end
+
+@testset "notification handlers run in order and survive a throw" begin
+    seen = Int[]
+    with_server((fs, msg, req) -> begin
+        msg === nothing && return nothing
+        if get(msg, "method", "") == "tools/call"
+            notes = [Dict("jsonrpc" => "2.0", "method" => "notifications/progress",
+                          "params" => Dict("progress" => i)) for i in 1:5]
+            return sse_response(notes..., result_for(msg, text_tool_result("ok")))
+        end
+        return default_dispatch(fs, msg, req)
+    end) do fs
+        client = Client(fs.url; timeout = 10, on_notification = function (m)
+            n = m["params"]["progress"]
+            # A throwing handler must not kill the pump for the ones after it.
+            n == 2 && error("handler blew up")
+            push!(seen, n)
+        end)
+        try
+            call_tool(client, "echo", Dict{String,Any}())
+            timeout = time() + 5
+            while length(seen) < 4 && time() < timeout
+                sleep(0.05)
+            end
+            @test seen == [1, 3, 4, 5]
+        finally
+            close(client)
+        end
+    end
+end
+
+@testset "on_request handler answers a server request" begin
+    # Previously untested, which is why the answering path went unexercised.
+    with_server((fs, msg, req) -> begin
+        msg === nothing && return nothing
+        method = get(msg, "method", "")
+        if method == "tools/call"
+            return sse_response(
+                Dict("jsonrpc" => "2.0", "id" => "srv-1", "method" => "roots/list"),
+                result_for(msg, text_tool_result("ok")))
+        end
+        # A message with no method is the client's reply to us; 202 is the
+        # correct answer, and answering it with an error would provoke another.
+        isempty(method) && return nothing
+        return default_dispatch(fs, msg, req)
+    end) do fs
+        asked = Threads.Atomic{Int}(0)
+        Client(fs.url; timeout = 10,
+               on_request = (method, params) -> begin
+                   method == "roots/list" && Threads.atomic_add!(asked, 1)
+                   return Dict{String,Any}("roots" => [])
+               end) do client
+            call_tool(client, "echo", Dict{String,Any}())
+            # Wait for the reply to reach the server, not merely for the handler
+            # to run: the reply is POSTed after the handler returns.
+            replies() = filter(m -> get(m, "id", nothing) == "srv-1", received_messages(fs))
+            deadline = time() + 10
+            while isempty(replies()) && time() < deadline
+                sleep(0.05)
+            end
+            @test asked[] == 1
+            # The reply went back as a result, not as a "method not found" error.
+            @test length(replies()) == 1
+            @test haskey(replies()[1], "result")
+        end
+    end
+end
+
+@testset "call_tool sends a progress token when asked" begin
+    with_server() do fs
+        Client(fs.url; timeout = 5) do client
+            call_tool(client, "echo", Dict{String,Any}("text" => "x"); progress_token = "tok-1")
+            calls = filter(m -> get(m, "method", "") == "tools/call", received_messages(fs))
+            @test length(calls) == 1
+            @test calls[1]["params"]["_meta"]["progressToken"] == "tok-1"
+        end
+    end
+end
+
 # The stdio transport spawns a real child process, so its fake server is a script
 # rather than an in-process handler; see test/stdio.jl.
 include("stdio.jl")

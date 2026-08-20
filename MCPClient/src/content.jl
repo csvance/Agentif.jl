@@ -85,7 +85,8 @@ struct UnknownContent <: ContentBlock
     raw::Dict{String,Any}
 end
 
-_maybe_string(x) = x === nothing ? nothing : String(x)
+# Kept as a thin alias so call sites read as intent rather than as plumbing.
+_maybe_string(x, what::AbstractString) = want_string_or_nothing(x, what)
 
 function _decode_b64(x, what::AbstractString)
     x isa AbstractString ||
@@ -107,29 +108,34 @@ function parse_content(block::AbstractDict)
     kind = get(raw, "type", nothing)
     kind isa AbstractString || throw(MCPProtocolError("content block is missing its \"type\""))
     if kind == "text"
-        text = get(raw, "text", "")
-        text isa AbstractString || throw(MCPProtocolError("text content block has no \"text\" string"))
-        return TextContent(String(text), raw)
+        return TextContent(want_string(get(raw, "text", ""), "\"text\" of a text content block"), raw)
     elseif kind == "image"
         return ImageContent(_decode_b64(get(raw, "data", nothing), "image"),
-                            String(get(raw, "mimeType", "application/octet-stream")), raw)
+                            want_string(get(raw, "mimeType", "application/octet-stream"),
+                                        "\"mimeType\" of an image content block"), raw)
     elseif kind == "audio"
         return AudioContent(_decode_b64(get(raw, "data", nothing), "audio"),
-                            String(get(raw, "mimeType", "application/octet-stream")), raw)
+                            want_string(get(raw, "mimeType", "application/octet-stream"),
+                                        "\"mimeType\" of an audio content block"), raw)
     elseif kind == "resource"
         res = get(raw, "resource", nothing)
         res isa AbstractDict ||
             throw(MCPProtocolError("resource content block has no \"resource\" object"))
         blob = get(res, "blob", nothing)
-        return EmbeddedResource(String(get(res, "uri", "")),
-                                _maybe_string(get(res, "mimeType", nothing)),
-                                _maybe_string(get(res, "text", nothing)),
+        blob === nothing || get(res, "text", nothing) === nothing ||
+            throw(MCPProtocolError("resource content block carries both \"text\" and \"blob\""))
+        return EmbeddedResource(want_string(get(res, "uri", ""), "\"resource.uri\""),
+                                _maybe_string(get(res, "mimeType", nothing), "\"resource.mimeType\""),
+                                _maybe_string(get(res, "text", nothing), "\"resource.text\""),
                                 blob === nothing ? nothing : _decode_b64(blob, "resource"),
                                 raw)
     elseif kind == "resource_link"
-        return ResourceLink(String(get(raw, "uri", "")), String(get(raw, "name", "")),
-                            _maybe_string(get(raw, "description", nothing)),
-                            _maybe_string(get(raw, "mimeType", nothing)), raw)
+        return ResourceLink(want_string(get(raw, "uri", ""), "\"uri\" of a resource_link block"),
+                            want_string(get(raw, "name", ""), "\"name\" of a resource_link block"),
+                            _maybe_string(get(raw, "description", nothing),
+                                          "\"description\" of a resource_link block"),
+                            _maybe_string(get(raw, "mimeType", nothing),
+                                          "\"mimeType\" of a resource_link block"), raw)
     end
     return UnknownContent(String(kind), raw)
 end
@@ -189,9 +195,9 @@ function ToolResult(result::AbstractDict)
     elseif content !== nothing
         throw(MCPProtocolError("tool result \"content\" is not an array"))
     end
-    structured = get(raw, "structuredContent", nothing)
     return ToolResult(blocks, get(raw, "isError", false) === true,
-                      structured isa AbstractDict ? plain(structured) : nothing, raw)
+                      want_object_or_nothing(get(raw, "structuredContent", nothing),
+                                             "\"structuredContent\" of a tool result"), raw)
 end
 
 function Base.show(io::IO, r::ToolResult)
@@ -233,15 +239,19 @@ function MCPTool(tool::AbstractDict)
     raw = plain(tool)
     name = get(raw, "name", nothing)
     name isa AbstractString || throw(MCPProtocolError("tool entry is missing its \"name\""))
+    # An omitted inputSchema is a server that takes no arguments; a wrong-typed
+    # one is a server whose arguments we would then get wrong, so it is an error.
     schema = get(raw, "inputSchema", nothing)
     annotations = get(raw, "annotations", nothing)
-    output = get(raw, "outputSchema", nothing)
     return MCPTool(String(name),
-                   String(get(raw, "description", "")),
-                   schema isa AbstractDict ? plain(schema) : Dict{String,Any}("type" => "object"),
-                   output isa AbstractDict ? plain(output) : nothing,
-                   _maybe_string(get(raw, "title", nothing)),
-                   annotations isa AbstractDict ? plain(annotations) : Dict{String,Any}(),
+                   want_string(get(raw, "description", ""), "\"description\" of tool \"$name\""),
+                   schema === nothing ? Dict{String,Any}("type" => "object") :
+                       want_object(schema, "\"inputSchema\" of tool \"$name\""),
+                   want_object_or_nothing(get(raw, "outputSchema", nothing),
+                                          "\"outputSchema\" of tool \"$name\""),
+                   _maybe_string(get(raw, "title", nothing), "\"title\" of tool \"$name\""),
+                   annotations === nothing ? Dict{String,Any}() :
+                       want_object(annotations, "\"annotations\" of tool \"$name\""),
                    raw)
 end
 

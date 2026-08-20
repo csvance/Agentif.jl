@@ -101,7 +101,11 @@ end
         slow = @async begin
             reply = send_request!(t, request_message(1, "tools/call",
                 Dict{String,Any}("name" => "delay",
-                                 "arguments" => Dict{String,Any}("seconds" => 1.0))), 1)
+                                 # Generous on purpose: the assertion below is
+                                 # that the fast reply overtakes this one, and a
+                                 # loaded CI runner should not be able to close a
+                                 # margin this wide.
+                                 "arguments" => Dict{String,Any}("seconds" => 3.0))), 1)
             @lock lk push!(finished, "slow")
             reply
         end

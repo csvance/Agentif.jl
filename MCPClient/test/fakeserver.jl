@@ -49,6 +49,10 @@ end
 
 Base.close(fs::FakeServer) = close(fs.server)
 
+"Every decoded message the server received, in order, objects only."
+received_messages(fs::FakeServer) =
+    @lock fs.lock Any[m for m in fs.received if m isa AbstractDict]
+
 received_methods(fs::FakeServer) =
     @lock fs.lock String[m["method"] for m in fs.received if m isa AbstractDict && haskey(m, "method")]
 

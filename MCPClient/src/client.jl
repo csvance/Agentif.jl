@@ -43,7 +43,9 @@ Keyword arguments:
     list, which is what the spec asks a client to do. Set `false` to continue
     with a warning
   * `on_notification`: `f(message)` for server notifications such as
-    `notifications/tools/list_changed`
+    `notifications/tools/list_changed`. Handlers run in order on one dedicated
+    task, so a handler may call back into the client, and a slow one delays later
+    notifications but never the transport
   * `on_request`: `f(method, params) -> result` for server-initiated requests.
     Without one, everything except `ping` is answered "method not found"
   * `initialize`: set `false` to construct without handshaking, then call
@@ -76,6 +78,9 @@ mutable struct Client
     on_request::Union{Nothing,Any}
     next_id::Int
     lock::ReentrantLock
+    # Server-initiated traffic is handled off the reader task; see `_incoming`.
+    notifications::Union{Nothing,Channel{Any}}
+    answered::Int
 end
 
 function Client(transport::AbstractTransport;
@@ -92,9 +97,20 @@ function Client(transport::AbstractTransport;
                     String(protocol_version), String(protocol_version),
                     Dict{String,Any}(), Dict{String,Any}(), nothing, false,
                     Float64(timeout), strict_version, on_notification, on_request,
-                    0, ReentrantLock())
+                    0, ReentrantLock(), nothing, 0)
     set_handler!(transport, msg -> _incoming(client, msg))
-    initialize && initialize!(client)
+    if initialize
+        try
+            initialize!(client)
+        catch
+            # A handshake that fails still leaves a socket, and possibly a session
+            # or a child process, behind. The URL and `Cmd` constructors below
+            # each guard this too; the guard belongs here as well, because a
+            # caller who built the transport itself gets no other cleanup.
+            close(client)
+            rethrow()
+        end
+    end
     return client
 end
 
@@ -134,6 +150,8 @@ function Client(command::Base.Cmd;
 end
 
 function Client(f::Function, url_or_transport; kwargs...)
+    # Construction is outside the `try` on purpose: if it throws, it has already
+    # cleaned up after itself and there is no client to close.
     client = Client(url_or_transport; kwargs...)
     try
         return f(client)
@@ -260,12 +278,17 @@ function initialize!(c::Client; timeout::Real=c.timeout)
         @warn message
     end
     c.protocol_version = String(version)
+    # A wrong-typed capabilities or serverInfo object used to become an empty one,
+    # which makes a malformed server indistinguishable from a limited one and
+    # sends `has_capability` answering `false` about a capability the server has.
     caps = get(result, "capabilities", nothing)
-    c.server_capabilities = caps isa AbstractDict ? plain(caps) : Dict{String,Any}()
+    c.server_capabilities = something(want_object_or_nothing(caps, "\"capabilities\" in the initialize result"),
+                                      Dict{String,Any}())
     info = get(result, "serverInfo", nothing)
-    c.server_info = info isa AbstractDict ? plain(info) : Dict{String,Any}()
-    instructions = get(result, "instructions", nothing)
-    c.instructions = instructions isa AbstractString ? String(instructions) : nothing
+    c.server_info = something(want_object_or_nothing(info, "\"serverInfo\" in the initialize result"),
+                              Dict{String,Any}())
+    c.instructions = want_string_or_nothing(get(result, "instructions", nothing),
+                                            "\"instructions\" in the initialize result")
     # Only after this point may the session id and protocol version headers ride
     # along, and only after the notification may the server expect other calls.
     protocol_version!(c.transport, c.protocol_version)
@@ -299,7 +322,7 @@ function list_tools_page(c::Client; cursor=nothing, timeout::Real=c.timeout)
     entries = get(result, "tools", nothing)
     entries isa AbstractVector ||
         throw(MCPProtocolError("tools/list result has no \"tools\" array"))
-    tools = MCPTool[MCPTool(e) for e in entries]
+    tools = MCPTool[MCPTool(want_object(e, "an entry in the tools/list result")) for e in entries]
     next = get(result, "nextCursor", nothing)
     if next !== nothing && !(next isa AbstractString)
         throw(MCPProtocolError("tools/list returned a \"nextCursor\" that is not a string"))
@@ -366,10 +389,30 @@ End the session and release the transport. Safe to call more than once.
 """
 function Base.close(c::Client)
     close(c.transport)
+    channel = @lock c.lock begin
+        ch = c.notifications
+        c.notifications = nothing
+        ch
+    end
+    # Closing the channel ends the pump once it has drained, so a notification
+    # already queued still reaches its handler.
+    channel === nothing || close(channel)
     return nothing
 end
 
 # --- server-initiated traffic ---------------------------------------------
+
+"""
+Server-initiated requests answered per session before the client stops replying.
+
+A reply is itself a message, and over HTTP it is a fresh POST whose own response
+body is routed straight back here, so a server that answers every POST with a
+request gets an unbounded loop out of a client that always replies: measured at
+roughly 700 replies per second, each with a task and a socket behind it. The
+budget makes that terminate. It is far above any legitimate use, since the only
+server-initiated request this client answers unprompted is `ping`.
+"""
+const MAX_ANSWERED_REQUESTS = 10_000
 
 function _incoming(c::Client, msg::AbstractDict)
     if is_request(msg)
@@ -377,15 +420,73 @@ function _incoming(c::Client, msg::AbstractDict)
         # is reading the stream this request arrived on: over HTTP that would be a
         # POST from inside the response body being read, and over stdio the reader
         # task would be blocked while the reply it enables goes unread.
-        @async _answer(c, msg)
+        _budget_exhausted(c) ? _refuse_request(c, msg) : @async _answer(c, msg)
     elseif is_notification(msg)
+        _enqueue_notification(c, msg)
+    end
+    return nothing
+end
+
+function _budget_exhausted(c::Client)
+    @lock c.lock begin
+        c.answered >= MAX_ANSWERED_REQUESTS && return true
+        c.answered += 1
+        return false
+    end
+end
+
+function _refuse_request(c::Client, msg::AbstractDict)
+    # Logged once at the boundary rather than per request: a server in this state
+    # is producing thousands, and the useful signal is that it happened at all.
+    c.answered == MAX_ANSWERED_REQUESTS &&
+        @warn "MCP server has sent $(MAX_ANSWERED_REQUESTS) requests on one session; ignoring further ones"
+    @lock c.lock (c.answered += 1)
+    return nothing
+end
+
+# Notifications run on one dedicated task, not on the reader task and not on a
+# fresh task each. On the reader task, a handler that calls back into the client
+# deadlocks the transport, since the task that would read its reply is the one
+# inside the handler; a task each would let handlers overtake one another, which
+# is wrong for an ordered progress stream. One consumer task keeps both
+# properties.
+function _enqueue_notification(c::Client, msg::AbstractDict)
+    c.on_notification === nothing && return nothing
+    channel = @lock c.lock begin
+        if c.notifications === nothing
+            ch = Channel{Any}(Inf)
+            c.notifications = ch
+            @async _drain_notifications(c, ch)
+        end
+        c.notifications
+    end
+    try
+        put!(channel, msg)
+    catch e
+        # The only way this fails is a closed channel, which means the client is
+        # shutting down and the notification no longer has anywhere to go.
+        @debug "dropped a notification on a closing client" exception = e
+    end
+    return nothing
+end
+
+function _drain_notifications(c::Client, channel::Channel{Any})
+    for msg in channel
         handler = c.on_notification
-        handler === nothing || handler(msg)
+        handler === nothing && continue
+        try
+            handler(msg)
+        catch e
+            # A throwing handler must not kill the pump, or every later
+            # notification is silently lost.
+            @debug "on_notification handler failed" exception = (e, catch_backtrace())
+        end
     end
     return nothing
 end
 
 function _answer(c::Client, msg::AbstractDict)
+    is_open(c) || return nothing
     id = get(msg, "id", nothing)
     method = String(get(msg, "method", ""))
     reply = try

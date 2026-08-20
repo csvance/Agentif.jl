@@ -7,6 +7,9 @@ jobs:
   test:
     name: ${{ matrix.package }} - Julia ${{ matrix.version }}
     runs-on: ubuntu-latest
+    # A hung test would otherwise burn the runner's whole default budget. The
+    # slowest suite here takes about three minutes with a warm cache.
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:

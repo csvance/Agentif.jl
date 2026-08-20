@@ -17,6 +17,39 @@ plain(x) = x
 plain(x::AbstractDict) = Dict{String,Any}(String(k) => plain(v) for (k, v) in x)
 plain(x::AbstractVector) = Any[plain(v) for v in x]
 
+"""
+    want_string(x, what) -> String
+    want_string_or_nothing(x, what) -> Union{Nothing,String}
+
+Coerce a value the peer sent into a `String`, throwing
+[`MCPProtocolError`](@ref) when it is not one.
+
+Bare `String(x)` is the wrong tool at the wire boundary: a server that puts a
+number where the spec says string raises `MethodError`, which is not an
+[`MCPException`](@ref), so a caller guarding with `catch e isa MCPException`
+sees an escaping crash and reads a server's sloppiness as a bug in its own code.
+Every field this package narrows to a `String` goes through here.
+"""
+want_string(x::AbstractString, what::AbstractString) = String(x)
+want_string(x, what::AbstractString) =
+    throw(MCPProtocolError("$what should be a string, got $(typeof(x))"))
+
+want_string_or_nothing(::Nothing, what::AbstractString) = nothing
+want_string_or_nothing(x, what::AbstractString) = want_string(x, what)
+
+"""
+    want_object(x, what) -> Dict{String,Any}
+
+The same for a JSON object, used where a wrong type must be an error rather than
+silently reinterpreted.
+"""
+want_object(x::AbstractDict, what::AbstractString) = plain(x)
+want_object(x, what::AbstractString) =
+    throw(MCPProtocolError("$what should be an object, got $(typeof(x))"))
+
+want_object_or_nothing(::Nothing, what::AbstractString) = nothing
+want_object_or_nothing(x, what::AbstractString) = want_object(x, what)
+
 function request_message(id, method::AbstractString, params)
     msg = Dict{String,Any}("jsonrpc" => JSONRPC_VERSION, "id" => id, "method" => String(method))
     params === nothing || (msg["params"] = params)
@@ -69,10 +102,9 @@ function unwrap_result(msg::AbstractDict, method::AbstractString)
     if haskey(msg, "error")
         err = msg["error"]
         err isa AbstractDict || throw(MCPProtocolError("\"error\" member of a response to \"$method\" is not an object"))
-        code = get(err, "code", ERR_INTERNAL)
         throw(JSONRPCError(
-            code isa Integer ? Int(code) : ERR_INTERNAL,
-            String(get(err, "message", "unknown error")),
+            _error_code(get(err, "code", ERR_INTERNAL), method),
+            want_string(get(err, "message", "unknown error"), "\"error.message\" in a response to \"$method\""),
             plain(get(err, "data", nothing)),
             String(method),
         ))
@@ -81,6 +113,13 @@ function unwrap_result(msg::AbstractDict, method::AbstractString)
         throw(MCPProtocolError("response to \"$method\" has neither \"result\" nor \"error\""))
     return plain(msg["result"])
 end
+
+_error_code(code::Integer, method::AbstractString) = Int(code)
+_error_code(code::AbstractFloat, method::AbstractString) =
+    isinteger(code) ? Int(code) :
+    throw(MCPProtocolError("\"error.code\" in a response to \"$method\" is not an integer: $code"))
+_error_code(code, method::AbstractString) =
+    throw(MCPProtocolError("\"error.code\" in a response to \"$method\" is not a number, got $(typeof(code))"))
 
 """
     parse_payload(body) -> Vector{Dict{String,Any}}

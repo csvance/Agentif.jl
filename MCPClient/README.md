@@ -86,16 +86,35 @@ something else. Exceptions are reserved for the call not happening:
 - `MCPTransportError`: the message could not be exchanged at all
 - `MCPProtocolError`: the peer answered, but not with valid MCP
 
-All four are subtypes of `MCPException`.
+All four are subtypes of `MCPException`, and that is exhaustive: every field this
+package narrows to a `String` or a `Dict` is type-checked at the wire boundary, so
+a server that puts a number where the spec says string produces an
+`MCPProtocolError` rather than a `MethodError` escaping past a
+`catch e isa MCPException`.
 
 ## Server-initiated traffic
 
 Pass `on_notification = f(message)` to observe notifications such as
 `notifications/tools/list_changed` or the `notifications/progress` stream a call
-emits when given a `progress_token`. Pass `on_request = f(method, params)` to
-answer server-initiated requests; without one, everything except `ping` is
-answered "method not found". `ping` is always answered, since a client that
-ignores it looks dead.
+emits when given a `progress_token`. Handlers run in order on one dedicated task,
+so a handler may call back into the client, and a slow or throwing one delays or
+skips later notifications without ever stalling the transport.
+
+Pass `on_request = f(method, params)` to answer server-initiated requests;
+without one, everything except `ping` is answered "method not found". `ping` is
+always answered, since a client that ignores it looks dead. Replies are budgeted
+at `MCPClient.MAX_ANSWERED_REQUESTS` per session, because a reply is itself a
+message and a server that answers every one with a fresh request would otherwise
+get an unbounded loop.
+
+## Closing
+
+`close` releases the transport and is safe to call more than once. A request
+still in flight fails with `MCPTransportError` rather than waiting out its
+deadline, on both transports, which matters most when that deadline is "never"
+(`timeout <= 0`). A handshake that fails closes the transport it was given, so a
+failed `Client(...)` never leaves a socket, a server-side session or a child
+process behind.
 
 ## Testing
 
