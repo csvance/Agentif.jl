@@ -1924,6 +1924,64 @@ end
     end
 end
 
+@testset "front matter is read by a YAML parser, not line by line" begin
+    # The reader this replaced matched one regex per line, so a folded description read as the
+    # literal string ">" and every line of the actual text was dropped. One character passes every
+    # length check a caller applies, so the skill was accepted and offered with no description.
+    doc = """
+    ---
+    name: demo
+    description: >
+      first line
+      second line
+
+      new paragraph
+    metadata:
+      author: someone
+      created: 2026-08-21
+    ---
+
+    body text
+    """
+    f = Agentif.parse_frontmatter(doc)
+    @test f["name"] == "demo"
+    @test f["description"] == "first line second line\nnew paragraph"
+    @test f["metadata"] == Dict("author" => "someone", "created" => "2026-08-21")
+
+    # every other scalar style, because the risk in this change is the shape that already worked
+    ds(doc) = Agentif.parse_frontmatter(doc)["description"]
+    @test ds("---\nname: a\ndescription: just text\n---\n") == "just text"
+    @test ds("---\nname: a\ndescription: \"quoted\"\n---\n") == "quoted"
+    @test ds("---\nname: a\ndescription: |\n  one\n  two\n---\n") == "one\ntwo"
+    @test ds("---\nname: a\ndescription: >-\n  one\n  two\n\n---\n") == "one two"
+    @test ds("---\nname: a\ndescription: >\n  weird: value here\n---\n") == "weird: value here"
+    @test ds("---\r\nname: a\r\ndescription: >\r\n  one\r\n  two\r\n---\r\n") == "one two"
+    @test ds("---\n# a note\nname: a\ndescription: text\n---\n") == "text"
+
+    # YAML types its scalars and every SkillMetadata field is a string
+    @test ds("---\nname: a\ndescription: 2026\n---\n") == "2026"
+    @test ds("---\nname: a\ndescription: [one, two]\n---\n") == "one, two"
+    @test Agentif.flatten_yaml(nothing) == ""
+
+    # malformed front matter is an error rather than a value that looks fine
+    @test_throws ArgumentError Agentif.parse_frontmatter("---\nname: a\ndescription: > bad\n---\n")
+    @test_throws ArgumentError Agentif.parse_frontmatter("name: a\n")
+    @test_throws ArgumentError Agentif.parse_frontmatter("---\nname: a\n")
+    @test_throws ArgumentError Agentif.parse_frontmatter("---\n- a list\n---\n")
+    @test Agentif.parse_frontmatter("---\n---\n") == Dict{String, Any}()
+
+    # end to end: a bundle written the conventional way is discovered with its description whole
+    dir = mktempdir()
+    mkpath(joinpath(dir, "demo-skill"))
+    write(joinpath(dir, "demo-skill", "SKILL.md"),
+          "---\nname: demo-skill\ndescription: >\n  Do the thing, and the other thing.\n" *
+          "  Invoke when the thing needs doing.\n---\n\nbody\n")
+    found = Agentif.discover_skills([dir])
+    @test length(found) == 1
+    @test only(found).description ==
+          "Do the thing, and the other thing. Invoke when the thing needs doing."
+end
+
 @testset "skill metadata unquoting is UTF-8 safe" begin
     @test Agentif.unquote("\"café\"") == "café"
     @test Agentif.unquote("'😀'") == "😀"

@@ -177,59 +177,66 @@ function parse_skill_metadata(skill_file::AbstractString)
     )
 end
 
+"""Split a skill file into its front matter and hand the block to YAML.
+
+The delimiters are ours to find: a `SKILL.md` is markdown with a YAML block fenced by `---` at the
+top, and the body below it is prose that no parser should see.
+"""
 function parse_frontmatter(content::AbstractString)
     lines = split(content, "\n"; keepempty = true)
     isempty(lines) && throw(ArgumentError("missing frontmatter"))
     strip(lines[1]) == "---" || throw(ArgumentError("missing frontmatter start delimiter"))
-    end_idx = nothing
-    for i in 2:length(lines)
-        if strip(lines[i]) == "---"
-            end_idx = i
-            break
-        end
-    end
+    end_idx = findnext(l -> strip(l) == "---", lines, 2)
     end_idx === nothing && throw(ArgumentError("missing frontmatter end delimiter"))
-    front_lines = lines[2:(end_idx - 1)]
-    return parse_frontmatter_lines(front_lines)
+    return parse_frontmatter_lines(lines[2:(end_idx - 1)])
 end
 
+"""
+    parse_frontmatter_lines(lines) -> Dict{String, Any}
+
+Read the front matter block with a YAML parser, and flatten every value to a string.
+
+This was hand-rolled, one regex per line, and the shapes it could not read it dropped in silence.
+A folded description, which is how skills are conventionally written:
+
+    description: >
+      Author or read a ReactantNitro experiment: the four required hooks, ...
+
+read as the literal string `>`, with every line of the actual text discarded. One character passes
+every length check a caller applies, so the skill was accepted and offered to a model with no
+description at all. Block scalars, plain multi-line scalars, comments and anchors are what a YAML
+parser is for; none of them are worth reimplementing here.
+
+Every value is stringified, because YAML types its scalars and every field a `SkillMetadata` carries
+is a string: `created: 2026-08-21` arrives as a `Date`, `version: 2` as an `Int`, and a
+`allowed-tools` list as a `Vector`. Strings are right-stripped, so a folded block does not carry
+YAML's trailing newline into a prompt.
+"""
 function parse_frontmatter_lines(lines::AbstractVector{<:AbstractString})
-    fields = Dict{String, Any}()
-    metadata = Dict{String, String}()
-    i = 1
-    while i <= length(lines)
-        line = lines[i]
-        stripped = strip(line)
-        if isempty(stripped) || startswith(stripped, "#")
-            i += 1
-            continue
-        end
-        if stripped == "metadata:"
-            i += 1
-            while i <= length(lines)
-                meta_line = lines[i]
-                isempty(strip(meta_line)) && (i += 1; continue)
-                indent = length(meta_line) - length(lstrip(meta_line))
-                indent < 2 && break
-                meta_str = strip(meta_line)
-                m = match(r"^([A-Za-z0-9_.-]+)\s*:\s*(.*)$", meta_str)
-                if m !== nothing
-                    metadata[m.captures[1]] = unquote(m.captures[2])
-                end
-                i += 1
-            end
-            continue
-        end
-        m = match(r"^([A-Za-z0-9_-]+)\s*:\s*(.*)$", stripped)
-        if m !== nothing
-            fields[m.captures[1]] = unquote(m.captures[2])
-        end
-        i += 1
+    doc = try
+        YAML.load(join(lines, "\n"))
+    catch e
+        throw(ArgumentError("invalid YAML frontmatter: " * first(sprint(showerror, e), 200)))
     end
-    if !isempty(metadata)
-        fields["metadata"] = metadata
+    doc === nothing && return Dict{String, Any}()          # an empty block is not a malformed one
+    doc isa AbstractDict || throw(ArgumentError("frontmatter must be a mapping"))
+    fields = Dict{String, Any}()
+    for (k, v) in doc
+        key = string(k)
+        fields[key] = (key == "metadata" && v isa AbstractDict) ?
+                      Dict{String, String}(string(mk) => flatten_yaml(mv) for (mk, mv) in v) :
+                      flatten_yaml(v)
     end
     return fields
+end
+
+"""One YAML value as the string a `SkillMetadata` field wants. A list becomes a comma-separated
+line, which is the form `allowed-tools` is read in whether it was written as a list or as text."""
+function flatten_yaml(v)
+    v === nothing && return ""
+    v isa AbstractString && return String(rstrip(v))
+    v isa AbstractVector && return join((flatten_yaml(x) for x in v), ", ")
+    return string(v)
 end
 
 function unquote(value::AbstractString)
