@@ -16,7 +16,7 @@ Required methods:
     to call twice.
 
 Optional methods with defaults: [`session_id`](@ref), [`set_handler!`](@ref),
-[`is_open`](@ref).
+[`is_open`](@ref), [`protocol_version!`](@ref), [`start_listening!`](@ref).
 """
 abstract type AbstractTransport end
 
@@ -223,3 +223,35 @@ it on the wire (streamable HTTP sends an `MCP-Protocol-Version` header) do
 anything with it.
 """
 protocol_version!(::AbstractTransport, ::AbstractString) = nothing
+
+"""
+    start_listening!(t)
+
+Ask a transport to start receiving server-initiated traffic that does not arrive
+as part of a reply. [`initialize!`](@ref) calls this once the handshake is
+complete, and only when a handler was installed, since a transport that has to
+hold a connection open should not do so for traffic nobody consumes.
+
+A transport whose messages already all arrive on one stream needs nothing here,
+which is why the default does nothing: stdio has a single reader from the moment
+the child starts. Streamable HTTP is the case this exists for, because a
+notification the server sends between requests has no reply for it to ride along
+with, and reaching it means opening the specification's standalone `GET` stream.
+
+Must be safe to call more than once, and must not block.
+"""
+start_listening!(::AbstractTransport) = nothing
+
+# Neither `wait(::Process)` nor `wait(::Task)` takes a deadline, and neither does
+# "wait a while unless the transport closes first". Polling is coarse, but it is
+# only used on shutdown and reconnect paths, where 20ms of granularity costs
+# nothing.
+function _poll(done::Function, seconds::Real)
+    done() && return true
+    deadline = time() + max(Float64(seconds), 0.0)
+    while time() < deadline
+        sleep(0.02)
+        done() && return true
+    end
+    return done()
+end

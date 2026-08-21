@@ -271,12 +271,49 @@ end
 Send a JSON-RPC request and return its `result`. A JSON-RPC `error` response
 becomes a thrown [`JSONRPCError`](@ref). Use this for methods this package does
 not wrap.
+
+Giving up on the deadline also tells the server so, see
+[`MCPTimeoutError`](@ref).
 """
 function request(c::Client, method::AbstractString, params = nothing; timeout::Real = c.timeout)
     id = _next_id!(c)
     message = request_message(id, method, params)
-    response = send_request!(c.transport, message, id; timeout = timeout)
+    response = try
+        send_request!(c.transport, message, id; timeout = timeout)
+    catch e
+        e isa MCPTimeoutError && _cancel_request(c, id, method, e)
+        rethrow()
+    end
     return unwrap_result(response, method)
+end
+
+# How long the cancellation itself gets. It is a courtesy to the server, and the
+# caller is already past its own deadline, so it must not add much to the wait.
+const _CANCEL_TIMEOUT = 5.0
+
+# Abandoning a request only stops this side waiting; the server carries on
+# working, and over stdio it will eventually write a reply nobody reads. The
+# specification asks a client that stops waiting to say so, which is the only way
+# a server learns it can stop. `initialize` is excluded because the specification
+# says that one request must not be cancelled -- there is no session yet to
+# cancel it in.
+function _cancel_request(c::Client, id, method::AbstractString, err::MCPTimeoutError)
+    method == "initialize" && return nothing
+    params = Dict{String, Any}(
+        "requestId" => id,
+        "reason" => "the client stopped waiting for \"$method\" after $(err.timeout)s",
+    )
+    try
+        send_notification!(
+            c.transport, notification_message("notifications/cancelled", params);
+            timeout = _CANCEL_TIMEOUT
+        )
+    catch e
+        # Best effort by nature: the usual reason this fails is the same one that
+        # caused the timeout, and the caller is about to see that timeout anyway.
+        @debug "could not tell the server a request was cancelled" id method exception = e
+    end
+    return nothing
 end
 
 """
@@ -338,6 +375,13 @@ function initialize!(c::Client; timeout::Real = c.timeout)
     protocol_version!(c.transport, c.protocol_version)
     notify_server(c, "notifications/initialized")
     c.initialized = true
+    # A transport that has to hold a connection open to hear the server's own
+    # traffic should only do so when there is something to hear it: with no
+    # handler installed, every message the stream carries would be dispatched
+    # into nothing. See [`start_listening!`](@ref).
+    if c.on_notification !== nothing || c.on_request !== nothing
+        start_listening!(c.transport)
+    end
     return c
 end
 

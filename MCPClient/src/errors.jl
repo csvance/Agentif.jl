@@ -43,8 +43,12 @@ end
 """
     MCPTimeoutError(method, timeout)
 
-The peer did not produce a reply to `method` within `timeout` seconds. The
-request may still be executing on the server; MCPClient simply stopped waiting.
+The peer did not produce a reply to `method` within `timeout` seconds.
+
+MCPClient stopped waiting, and told the server so by sending the specification's
+`notifications/cancelled` for that request id, so a server that honours it stops
+working too. Whether it does is the server's business: the request may still be
+executing when this is thrown.
 """
 struct MCPTimeoutError <: MCPException
     method::String

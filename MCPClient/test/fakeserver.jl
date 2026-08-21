@@ -13,6 +13,7 @@ mutable struct FakeServer
     headers::Vector{Any}           # the headers that accompanied each message
     methods::Vector{String}        # HTTP methods seen, so DELETE is observable
     session::String
+    get_headers::Vector{Any}       # headers of each standalone-stream GET
     lock::ReentrantLock
 end
 
@@ -25,12 +26,23 @@ port_of(server) = HTTP.port(server)
 answered. Returning `nothing` means "202 Accepted with no body", the correct
 answer to a notification.
 """
-function fake_server(dispatch; session::AbstractString = "sess-1")
-    fs = FakeServer(nothing, "", Any[], Any[], String[], String(session), ReentrantLock())
+function fake_server(dispatch; session::AbstractString = "sess-1", on_get = nothing)
+    fs = FakeServer(
+        nothing, "", Any[], Any[], String[], String(session), Any[],
+        ReentrantLock()
+    )
     handler = function (req::HTTP.Request)
         @lock fs.lock push!(fs.methods, req.method)
         if req.method == "DELETE"
             return HTTP.Response(200, "")
+        end
+        if req.method == "GET"
+            # The standalone SSE stream. A server is allowed not to offer one,
+            # which is 405, so that is the default: a test that wants the stream
+            # says so with `on_get`.
+            @lock fs.lock push!(fs.get_headers, req.headers)
+            on_get === nothing && return HTTP.Response(405, "")
+            return on_get(fs, req)
         end
         body = String(req.body)
         msg = isempty(body) ? nothing : JSON.parse(body)
@@ -80,6 +92,35 @@ function sse_response(messages...; session = nothing)
     session === nothing || push!(headers, "Mcp-Session-Id" => session)
     return HTTP.Response(200, headers, String(take!(io)))
 end
+
+"""
+    sse_stream(messages...) -> on_get
+
+An `on_get` handler for [`fake_server`](@ref) that answers the standalone stream
+with these messages, each as one SSE event carrying an `id`, and then ends the
+stream. The client reconnects afterwards, which is what makes the `Last-Event-ID`
+header observable in `fs.get_headers`.
+"""
+function sse_stream(messages...)
+    io = IOBuffer()
+    for (i, m) in enumerate(messages)
+        print(io, "event: message\n")
+        print(io, "id: evt-", i, "\n")
+        print(io, "data: ", JSON.json(m), "\n\n")
+    end
+    body = String(take!(io))
+    return (fs, req) -> HTTP.Response(
+        200, ["Content-Type" => "text/event-stream", "Cache-Control" => "no-cache"], body
+    )
+end
+
+"Header value from the nth standalone-stream GET, or \"\" if there was none."
+get_header_for(fs::FakeServer, index::Int, name::AbstractString) =
+    @lock fs.lock (
+    index <= length(fs.get_headers) ? HTTP.header(fs.get_headers[index], name, "") : ""
+)
+
+get_count(fs::FakeServer) = @lock fs.lock length(fs.get_headers)
 
 result_for(msg, result) =
     Dict("jsonrpc" => "2.0", "id" => msg["id"], "result" => result)

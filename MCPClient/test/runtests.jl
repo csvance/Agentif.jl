@@ -1063,6 +1063,184 @@ end
 # fakeserver.jl above does.
 include("stdio.jl")
 
+@testset "the standalone SSE stream carries server notifications" begin
+    # C1: over HTTP a notification the server sends between requests has no reply
+    # to travel with, so it only arrives if the client holds open the spec's
+    # standalone `GET` stream.
+    note = Dict(
+        "jsonrpc" => "2.0", "method" => "notifications/message",
+        "params" => Dict("level" => "info", "data" => "out of band")
+    )
+    seen = Channel{Any}(Inf)
+    with_server(default_dispatch; on_get = sse_stream(note)) do fs
+        client = Client(fs.url; on_notification = msg -> put!(seen, msg))
+        try
+            @test wait_until(() -> Base.n_avail(seen) > 0)
+            msg = take!(seen)
+            @test msg["method"] == "notifications/message"
+            @test msg["params"]["data"] == "out of band"
+
+            # The stream is opened with the headers the spec asks for, and only
+            # after the handshake: a GET before `initialize` has no session to
+            # name.
+            @test get_count(fs) >= 1
+            @test occursin("text/event-stream", get_header_for(fs, 1, "Accept"))
+            @test get_header_for(fs, 1, "Mcp-Session-Id") == fs.session
+            @test get_header_for(fs, 1, "MCP-Protocol-Version") == LATEST_PROTOCOL_VERSION
+            # Nothing was sent before the stream existed, so the first GET cannot
+            # resume anything.
+            @test get_header_for(fs, 1, "Last-Event-ID") == ""
+
+            # This server ends the stream after its events, so the client comes
+            # back, and says where it got to.
+            @test wait_until(() -> get_count(fs) >= 2)
+            @test get_header_for(fs, 2, "Last-Event-ID") == "evt-1"
+        finally
+            close(client)
+            close(seen)
+        end
+    end
+end
+
+@testset "a server that refuses the standalone stream is left alone" begin
+    # 405 is the spec's way for a server to say it offers no such stream. Asking
+    # again forever would be a busy loop against a server that already answered.
+    with_server() do fs   # the default `on_get` is 405
+        client = Client(fs.url; on_notification = _ -> nothing)
+        try
+            @test wait_until(() -> get_count(fs) >= 1)
+            # Still perfectly usable: no stream is not an error.
+            @test ping(client) === nothing
+            @test is_open(client)
+            before = get_count(fs)
+            sleep(1.0)
+            # It took the hint and stopped asking.
+            @test get_count(fs) == before
+        finally
+            close(client)
+        end
+    end
+end
+
+@testset "no handler means no stream is opened" begin
+    # An idle listener holds a connection open for traffic nobody consumes.
+    with_server(default_dispatch; on_get = sse_stream()) do fs
+        client = Client(fs.url)
+        try
+            @test ping(client) === nothing
+            sleep(0.5)
+            @test get_count(fs) == 0
+        finally
+            close(client)
+        end
+    end
+end
+
+@testset "a timed-out request is cancelled at the protocol level" begin
+    # C2: giving up only stops this side waiting. The server is still working,
+    # and the spec asks the client to say it has stopped caring.
+    dispatch = function (fs, msg, req)
+        msg === nothing && return nothing
+        method = get(msg, "method", "")
+        if method == "tools/call"
+            sleep(5)   # far past the deadline below
+            return json_response(result_for(msg, text_tool_result("too late")))
+        end
+        return default_dispatch(fs, msg, req)
+    end
+    with_server(dispatch) do fs
+        client = Client(fs.url; timeout = 30.0)
+        try
+            @test_throws MCPTimeoutError call_tool(client, "echo", Dict("text" => "x"); timeout = 0.5)
+            # The cancellation names the request that was abandoned, which is the
+            # only way the server can match it to the work it is still doing.
+            @test wait_until() do
+                any(
+                    get(m, "method", "") == "notifications/cancelled"
+                        for m in received_messages(fs)
+                )
+            end
+            cancels = [
+                m for m in received_messages(fs)
+                    if get(m, "method", "") == "notifications/cancelled"
+            ]
+            @test length(cancels) == 1
+            # id 1 was initialize, 2 was the tools/call that timed out.
+            @test cancels[1]["params"]["requestId"] == 2
+            @test occursin("tools/call", cancels[1]["params"]["reason"])
+            @test is_open(client)
+        finally
+            close(client)
+        end
+    end
+end
+
+@testset "a failed initialize is not cancelled" begin
+    # The one request the spec says must not be cancelled: there is no session
+    # yet for a cancellation to belong to.
+    dispatch = function (fs, msg, req)
+        msg === nothing && return nothing
+        get(msg, "method", "") == "initialize" && sleep(5)
+        return default_dispatch(fs, msg, req)
+    end
+    with_server(dispatch) do fs
+        @test_throws MCPTimeoutError Client(fs.url; timeout = 0.5)
+        sleep(0.5)
+        @test !any(
+            get(m, "method", "") == "notifications/cancelled"
+                for m in received_messages(fs)
+        )
+    end
+end
+
+@testset "a dead session makes the HTTP transport unusable" begin
+    # C3: the far side can finish off an HTTP transport just as a dying child can
+    # finish off a stdio one, and `is_open` has to say so.
+    dispatch = function (fs, msg, req)
+        msg === nothing && return nothing
+        method = get(msg, "method", "")
+        method == "initialize" && return HTTP.Response(
+            200,
+            ["Content-Type" => "application/json", "Mcp-Session-Id" => fs.session],
+            JSON.json(result_for(msg, initialize_result()))
+        )
+        startswith(method, "notifications/") && return nothing
+        # Everything after the handshake: this session is gone.
+        return HTTP.Response(404, "session not found")
+    end
+    with_server(dispatch) do fs
+        client = Client(fs.url)
+        try
+            @test is_open(client)
+            err = try
+                ping(client)
+                nothing
+            catch e
+                e
+            end
+            @test err isa MCPTransportError
+            @test occursin("no longer valid", err.message)
+
+            # The transport now reports the truth rather than leaving every later
+            # call to fail one at a time.
+            @test !is_open(client)
+            @test occursin("failed", sprint(show, client.transport))
+            # And a later call says why, rather than blaming the caller for a
+            # close they never performed.
+            err2 = try
+                ping(client)
+                nothing
+            catch e
+                e
+            end
+            @test err2 isa MCPTransportError
+            @test occursin("no longer valid", err2.message)
+        finally
+            close(client)
+        end
+    end
+end
+
 # Integration tests against the reference MCP server, over both transports. They
 # are opt-in because they need `npx` and, on a cold npm cache, network access,
 # neither of which the rest of the suite requires; see test/integration.jl.

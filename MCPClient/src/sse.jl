@@ -6,28 +6,39 @@
 # fields here keeps this package working across HTTP.jl versions and keeps the
 # parser directly testable without a socket.
 #
-# Only `event` and `data` are modelled. `id` and `retry` exist to drive
-# reconnection, which this client does not do, and a field nobody reads is
-# indistinguishable from one that is ignored.
+# `event`, `data` and `id` are modelled. `id` is what a reconnecting client sends
+# back as `Last-Event-ID` so the server can replay what was missed, which the
+# standalone stream in `http_transport.jl` relies on; `retry` is only a hint
+# about reconnection delay, and a field nobody reads is indistinguishable from
+# one that is ignored.
 
 """
-    SSEEvent(event, data)
+    SSEEvent(event, data, id=nothing)
 
 One dispatched SSE event. `data` holds the `data:` lines joined with newlines,
 matching the browser EventSource semantics that MCP servers are written against.
+`id` is the last event id in effect when this event was dispatched, which is not
+necessarily set by this event: per the SSE specification an `id:` line changes a
+buffer that persists until the next one, so every later event carries it too.
 """
 struct SSEEvent
     event::Union{Nothing, String}
     data::String
+    id::Union{Nothing, String}
 end
+
+SSEEvent(event, data) = SSEEvent(event, data, nothing)
 
 mutable struct SSEParser
     data::Vector{String}
     event::Union{Nothing, String}
     saw_data::Bool
+    # Deliberately not cleared between events: the SSE specification keeps the
+    # last event id until a later `id:` line replaces it.
+    last_id::Union{Nothing, String}
 end
 
-SSEParser() = SSEParser(String[], nothing, false)
+SSEParser() = SSEParser(String[], nothing, false, nothing)
 
 function _reset!(p::SSEParser)
     empty!(p.data)
@@ -52,7 +63,7 @@ function feed_line!(p::SSEParser, line::AbstractString)
             _reset!(p)
             return nothing
         end
-        ev = SSEEvent(p.event, join(p.data, "\n"))
+        ev = SSEEvent(p.event, join(p.data, "\n"), p.last_id)
         _reset!(p)
         return ev
     end
@@ -70,6 +81,11 @@ function feed_line!(p::SSEParser, line::AbstractString)
         p.saw_data = true
     elseif field == "event"
         p.event = value
+    elseif field == "id"
+        # The specification says to ignore an id containing a NUL rather than
+        # store it, and a server that sends one would otherwise poison every
+        # later `Last-Event-ID` header.
+        occursin('\0', value) || (p.last_id = value)
     end
     return nothing
 end

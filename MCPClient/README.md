@@ -86,6 +86,16 @@ something else. Exceptions are reserved for the call not happening:
 - `MCPTransportError`: the message could not be exchanged at all
 - `MCPProtocolError`: the peer answered, but not with valid MCP
 
+Giving up on a deadline also tells the server so, with the specification's
+`notifications/cancelled` for that request id, because the server is still
+working on it: without that, an abandoned tool runs to completion and writes its
+result to nobody. `initialize` is the exception, which the specification says must
+not be cancelled.
+
+A transport can also be finished off from the far side, and `is_open` says so
+rather than leaving you to find out one failed call at a time: a stdio child that
+exits, or an HTTP server that declares its session gone with a 404.
+
 All four are subtypes of `MCPException`, and that is exhaustive: every field this
 package narrows to a `String` or a `Dict` is type-checked at the wire boundary, so
 a server that puts a number where the spec says string produces an
@@ -103,6 +113,16 @@ skips later notifications without ever stalling the transport.
 Pass `on_request = f(method, params)` to answer server-initiated requests;
 without one, everything except `ping` is answered "method not found". `ping` is
 always answered, since a client that ignores it looks dead.
+
+Both transports deliver the server's own traffic whether or not a request of
+yours is outstanding, but they get there differently. Stdio has one stream and
+always did. Streamable HTTP has no reply for a between-requests notification to
+travel with, so the client opens the specification's standalone `GET` stream once
+the handshake completes, reconnecting and resuming with `Last-Event-ID` if it
+drops. That stream is only opened when you passed a handler, since holding a
+connection open to dispatch into nothing is pure cost, and a server may decline
+it with HTTP 405, in which case only notifications interleaved into a reply are
+seen and the client stops asking.
 
 ## Closing
 
@@ -122,3 +142,14 @@ julia --project=. MCPClient/test/runtests.jl
 The suite needs no network access and no MCP server on the host: the HTTP tests
 run against an in-process fake server, and the stdio tests spawn a Julia child
 process that speaks the protocol.
+
+There is a second suite that runs the reference server,
+`@modelcontextprotocol/server-everything`, over both transports, so the same
+assertions cover a real child process and a real HTTP endpoint. It needs `npx`,
+and network access the first time, so it is opt-in:
+
+```bash
+MCPCLIENT_INTEGRATION=1 julia --project=. MCPClient/test/runtests.jl
+```
+
+The server version is pinned; `MCPCLIENT_EVERYTHING` overrides it.

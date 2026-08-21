@@ -345,6 +345,27 @@ function check_progress_notifications(connect)
     end
 end
 
+# Notifications the server emits when no request of ours is outstanding. Over
+# stdio these arrive on the one shared stream; over HTTP they only arrive if the
+# client holds open the specification's standalone `GET` stream, which is what
+# made this a transport gap until it did. Asserting it in the shared body is the
+# point: the two transports now owe the caller the same thing.
+function check_out_of_band_notifications(connect)
+    seen = Channel{Any}(Inf)
+    return connect(on_notification = msg -> put!(seen, msg)) do client
+        logging = call_tool(client, "toggle-simulated-logging")
+        @test !logging.is_error
+        # The reference server logs on a several-second cadence, and nothing of
+        # ours is in flight to carry these, so this is the standalone stream or
+        # nothing.
+        @test poll_until(() -> Base.n_avail(seen) > 0, seconds = 20.0)
+        close(seen)
+        methods_seen = unique(get(m, "method", "") for m in collect(seen))
+        @test "notifications/message" in methods_seen
+        @test is_open(client)
+    end
+end
+
 # --- the two transports ---------------------------------------------------
 
 """
@@ -389,6 +410,9 @@ function run_shared_tests(connect, label)
     @testset "$label: progress notifications" begin
         check_progress_notifications(connect)
     end
+    @testset "$label: notifications outside a response" begin
+        check_out_of_band_notifications(connect)
+    end
     return @testset "$label: close" begin
         # Not wrapped in `connect`: closing is the subject, and a second close
         # from the wrapper is itself part of what is asserted.
@@ -410,23 +434,6 @@ end
             @test client.transport isa StdioTransport
             @test isempty(MCPClient.stderr_tail(client.transport)) ||
                 MCPClient.stderr_tail(client.transport) isa Vector{String}
-        end
-    end
-
-    @testset "server notifications outside a response do arrive over stdio" begin
-        # The contrast to the HTTP case above: one shared stream carries the
-        # server's own traffic whether or not a request is outstanding.
-        seen = Channel{Any}(Inf)
-        Client(
-            everything_stdio_cmd(); timeout = INTEGRATION_TIMEOUT,
-            on_notification = msg -> put!(seen, msg)
-        ) do client
-            logging = call_tool(client, "toggle-simulated-logging")
-            @test !logging.is_error
-            @test poll_until(() -> Base.n_avail(seen) > 0, seconds = 15.0)
-            close(seen)
-            methods_seen = unique(get(m, "method", "") for m in collect(seen))
-            @test "notifications/message" in methods_seen
         end
     end
 
@@ -466,28 +473,6 @@ end
                 # the negotiated protocol version ride along on later requests.
                 @test ping(client) === nothing
                 @test session_id(client) == sid
-            end
-        end
-
-        @testset "server notifications outside a response never arrive" begin
-            # A known limitation, pinned here so it cannot change unnoticed. The
-            # spec lets a server push notifications on a standalone `GET` SSE
-            # stream, and the reference server uses it for its log and
-            # list_changed traffic. This client never opens that stream, so over
-            # HTTP only notifications the server interleaves into a POST's own
-            # response body are seen -- progress for the call that asked for it.
-            # The same tool over stdio does deliver them, which is what makes
-            # this a transport gap rather than a server quirk.
-            seen = Channel{Any}(Inf)
-            connect(on_notification = msg -> put!(seen, msg)) do client
-                logging = call_tool(client, "toggle-simulated-logging")
-                @test !logging.is_error
-                # The server logs on a several-second cadence; wait past it.
-                poll_until(() -> Base.n_avail(seen) > 0, seconds = 8.0)
-                @test Base.n_avail(seen) == 0
-                # The session is unaffected: nothing is being dropped on the
-                # floor mid-stream, there is simply no stream to read.
-                @test ping(client) === nothing
             end
         end
 

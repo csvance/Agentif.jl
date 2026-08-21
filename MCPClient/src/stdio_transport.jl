@@ -417,21 +417,9 @@ function _signal(t::StdioTransport, signum::Integer)
     return nothing
 end
 
-# Neither `wait(::Process)` nor `wait(::Task)` takes a deadline, and `close` must
-# not be able to hang. Polling is coarse but it is only ever used on the shutdown
-# path, where a 20ms granularity costs nothing.
-function _wait_exit(process::Base.Process, seconds::Real)
-    return _poll(() -> process_exited(process), seconds)
-end
+# `close` must not be able to hang, and neither `wait(::Process)` nor
+# `wait(::Task)` takes a deadline, so both go through the shared `_poll` in
+# transport.jl.
+_wait_exit(process::Base.Process, seconds::Real) = _poll(() -> process_exited(process), seconds)
 
 _wait_task(task::Task, seconds::Real) = _poll(() -> istaskdone(task), seconds)
-
-function _poll(done::Function, seconds::Real)
-    done() && return true
-    deadline = time() + max(Float64(seconds), 0.0)
-    while time() < deadline
-        sleep(0.02)
-        done() && return true
-    end
-    return done()
-end
