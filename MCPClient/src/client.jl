@@ -74,8 +74,8 @@ mutable struct Client
     initialized::Bool
     timeout::Float64
     strict_version::Bool
-    on_notification::Union{Nothing,Any}
-    on_request::Union{Nothing,Any}
+    on_notification::Any
+    on_request::Any
     next_id::Int
     lock::ReentrantLock
     # Server-initiated traffic is handled off the reader task; see `_incoming`.

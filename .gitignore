@@ -15,3 +15,6 @@
 /MCPClient/Manifest.toml
 /MCPClient/Manifest-v*.toml
 /projects/**/Manifest.toml
+
+# nitrosquad runtime state, not repo content
+.nitrosquad/state/

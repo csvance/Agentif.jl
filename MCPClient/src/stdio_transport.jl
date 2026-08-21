@@ -43,7 +43,7 @@ mutable struct StdioTransport <: AbstractTransport
     timeout::Float64
     close_grace::Float64
     pending::Dict{Any,Deadline}          # JSON-RPC id -> the caller waiting for it
-    handler::Union{Nothing,Any}
+    handler::Any
     reader::Union{Nothing,Task}
     stderr_reader::Union{Nothing,Task}
     stderr_lines::Int

@@ -27,7 +27,7 @@ mutable struct StreamableHTTPTransport <: AbstractTransport
     timeout::Float64
     session_id::Union{Nothing,String}
     protocol_version::Union{Nothing,String}
-    handler::Union{Nothing,Any}
+    handler::Any
     closed::Bool
     terminate_on_close::Bool
     http_client::HTTP.Client
