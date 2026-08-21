@@ -14,7 +14,7 @@ Sockets = "6462fe0b-24de-5631-8697-dd941f90decc"
 UUIDs = "cf7118a7-6976-5b1a-9a39-7adc72f591a4"
 
 [sources]
-GitIgnore = {rev = "37b303842590a0063a7a35bae995cceea8ca7f70", url = "https://github.com/csvance/GitIgnore.jl.git"}
+GitIgnore = {rev = "b409dc1eced184f284122d44bdd8e79b3f2feb1d", url = "https://github.com/csvance/GitIgnore.jl.git"}
 Agentif = {path = "../Agentif"}
 LLMProviders = {path = "../LLMProviders"}
 ConcurrentUtilities = {url = "https://github.com/JuliaServices/ConcurrentUtilities.jl.git", rev = "main"}

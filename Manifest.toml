@@ -158,8 +158,8 @@ uuid = "bc5e4493-9b4d-5f90-b8aa-2b2bcaad7a26"
 version = "5.13.0"
 
 [[deps.GitIgnore]]
-git-tree-sha1 = "01cd9d0dc894fb50f5203c18ded9307a147f123a"
-repo-rev = "37b303842590a0063a7a35bae995cceea8ca7f70"
+git-tree-sha1 = "35ddd9dfe497f8ca97ea35232960a641b009a7e8"
+repo-rev = "b409dc1eced184f284122d44bdd8e79b3f2feb1d"
 repo-url = "https://github.com/csvance/GitIgnore.jl.git"
 uuid = "a0010394-fc0d-43eb-a3e0-33caa976912f"
 version = "0.1.0"
