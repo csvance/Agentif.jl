@@ -8,7 +8,7 @@ const JSONRPC_VERSION = "2.0"
 const DEFAULT_TIMEOUT = 30.0
 
 # Bound peer-supplied text before it goes into an error message or a `show`.
-_snippet(s::AbstractString, n::Int=400) = length(s) <= n ? String(s) : String(first(s, n)) * "..."
+_snippet(s::AbstractString, n::Int = 400) = length(s) <= n ? String(s) : String(first(s, n)) * "..."
 
 """
     plain(x)
@@ -20,7 +20,7 @@ the boundary means every value this package exposes is a `Dict{String,Any}`,
 care which JSON package produced it.
 """
 plain(x) = x
-plain(x::AbstractDict) = Dict{String,Any}(String(k) => plain(v) for (k, v) in x)
+plain(x::AbstractDict) = Dict{String, Any}(String(k) => plain(v) for (k, v) in x)
 plain(x::AbstractVector) = Any[plain(v) for v in x]
 
 """
@@ -57,24 +57,24 @@ want_object_or_nothing(::Nothing, what::AbstractString) = nothing
 want_object_or_nothing(x, what::AbstractString) = want_object(x, what)
 
 function request_message(id, method::AbstractString, params)
-    msg = Dict{String,Any}("jsonrpc" => JSONRPC_VERSION, "id" => id, "method" => String(method))
+    msg = Dict{String, Any}("jsonrpc" => JSONRPC_VERSION, "id" => id, "method" => String(method))
     params === nothing || (msg["params"] = params)
     return msg
 end
 
 function notification_message(method::AbstractString, params)
-    msg = Dict{String,Any}("jsonrpc" => JSONRPC_VERSION, "method" => String(method))
+    msg = Dict{String, Any}("jsonrpc" => JSONRPC_VERSION, "method" => String(method))
     params === nothing || (msg["params"] = params)
     return msg
 end
 
 result_message(id, result) =
-    Dict{String,Any}("jsonrpc" => JSONRPC_VERSION, "id" => id, "result" => result)
+    Dict{String, Any}("jsonrpc" => JSONRPC_VERSION, "id" => id, "result" => result)
 
-function error_message(id, code::Integer, message::AbstractString, data=nothing)
-    err = Dict{String,Any}("code" => Int(code), "message" => String(message))
+function error_message(id, code::Integer, message::AbstractString, data = nothing)
+    err = Dict{String, Any}("code" => Int(code), "message" => String(message))
     data === nothing || (err["data"] = data)
-    return Dict{String,Any}("jsonrpc" => JSONRPC_VERSION, "id" => id, "error" => err)
+    return Dict{String, Any}("jsonrpc" => JSONRPC_VERSION, "id" => id, "error" => err)
 end
 
 is_response(msg::AbstractDict) = haskey(msg, "id") && (haskey(msg, "result") || haskey(msg, "error"))
@@ -108,12 +108,14 @@ function unwrap_result(msg::AbstractDict, method::AbstractString)
     if haskey(msg, "error")
         err = msg["error"]
         err isa AbstractDict || throw(MCPProtocolError("\"error\" member of a response to \"$method\" is not an object"))
-        throw(JSONRPCError(
-            _error_code(get(err, "code", ERR_INTERNAL), method),
-            want_string(get(err, "message", "unknown error"), "\"error.message\" in a response to \"$method\""),
-            plain(get(err, "data", nothing)),
-            String(method),
-        ))
+        throw(
+            JSONRPCError(
+                _error_code(get(err, "code", ERR_INTERNAL), method),
+                want_string(get(err, "message", "unknown error"), "\"error.message\" in a response to \"$method\""),
+                plain(get(err, "data", nothing)),
+                String(method),
+            )
+        )
     end
     haskey(msg, "result") ||
         throw(MCPProtocolError("response to \"$method\" has neither \"result\" nor \"error\""))
@@ -140,9 +142,9 @@ function parse_payload(body::AbstractString)
         throw(MCPProtocolError("peer sent a body that is not valid JSON: " * sprint(showerror, e)))
     end
     if parsed isa AbstractDict
-        return Dict{String,Any}[plain(parsed)]
+        return Dict{String, Any}[plain(parsed)]
     elseif parsed isa AbstractVector
-        msgs = Dict{String,Any}[]
+        msgs = Dict{String, Any}[]
         for m in parsed
             m isa AbstractDict || throw(MCPProtocolError("JSON-RPC batch contains a non-object element"))
             push!(msgs, plain(m))

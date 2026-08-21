@@ -25,7 +25,7 @@ port_of(server) = HTTP.port(server)
 answered. Returning `nothing` means "202 Accepted with no body", the correct
 answer to a notification.
 """
-function fake_server(dispatch; session::AbstractString="sess-1")
+function fake_server(dispatch; session::AbstractString = "sess-1")
     fs = FakeServer(nothing, "", Any[], Any[], String[], String(session), ReentrantLock())
     handler = function (req::HTTP.Request)
         @lock fs.lock push!(fs.methods, req.method)
@@ -41,7 +41,7 @@ function fake_server(dispatch; session::AbstractString="sess-1")
         response = dispatch(fs, msg, req)
         return response === nothing ? HTTP.Response(202, "") : response
     end
-    server = HTTP.serve!(handler, "127.0.0.1", 0; listenany=true)
+    server = HTTP.serve!(handler, "127.0.0.1", 0; listenany = true)
     fs.server = server
     fs.url = "http://127.0.0.1:$(port_of(server))/mcp"
     return fs
@@ -67,7 +67,7 @@ json_response(payload) = HTTP.Response(200, ["Content-Type" => "application/json
 Frame each message as one SSE event, the way a streamable-HTTP server does when
 it wants to interleave notifications with the response.
 """
-function sse_response(messages...; session=nothing)
+function sse_response(messages...; session = nothing)
     io = IOBuffer()
     # A comment line is a keep-alive; the client must not treat it as an event.
     print(io, ": keep-alive\n\n")
@@ -84,25 +84,31 @@ end
 result_for(msg, result) =
     Dict("jsonrpc" => "2.0", "id" => msg["id"], "result" => result)
 
-error_for(msg, code, message; data=nothing) = Dict(
+error_for(msg, code, message; data = nothing) = Dict(
     "jsonrpc" => "2.0", "id" => msg["id"],
     "error" => data === nothing ? Dict("code" => code, "message" => message) :
-               Dict("code" => code, "message" => message, "data" => data))
+        Dict("code" => code, "message" => message, "data" => data)
+)
 
-initialize_result(; version="2025-06-18", capabilities=Dict("tools" => Dict("listChanged" => true)),
-                  instructions=nothing) = begin
-    r = Dict{String,Any}("protocolVersion" => version, "capabilities" => capabilities,
-                         "serverInfo" => Dict("name" => "fake-mcp", "version" => "9.9.9"))
+initialize_result(;
+    version = LATEST_PROTOCOL_VERSION,
+    capabilities = Dict("tools" => Dict("listChanged" => true)),
+    instructions = nothing
+) = begin
+    r = Dict{String, Any}(
+        "protocolVersion" => version, "capabilities" => capabilities,
+        "serverInfo" => Dict("name" => "fake-mcp", "version" => "9.9.9")
+    )
     instructions === nothing || (r["instructions"] = instructions)
     r
 end
 
-text_tool_result(text; is_error=false) =
+text_tool_result(text; is_error = false) =
     Dict("content" => [Dict("type" => "text", "text" => text)], "isError" => is_error)
 
 # Poll instead of sleeping a fixed amount: everything here crosses a process
 # boundary, so the only safe wait is one that ends when the condition holds.
-function wait_until(predicate; seconds::Real=10.0)
+function wait_until(predicate; seconds::Real = 10.0)
     deadline = time() + seconds
     while time() < deadline
         predicate() && return true

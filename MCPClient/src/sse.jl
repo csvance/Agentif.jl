@@ -17,13 +17,13 @@ One dispatched SSE event. `data` holds the `data:` lines joined with newlines,
 matching the browser EventSource semantics that MCP servers are written against.
 """
 struct SSEEvent
-    event::Union{Nothing,String}
+    event::Union{Nothing, String}
     data::String
 end
 
 mutable struct SSEParser
     data::Vector{String}
-    event::Union{Nothing,String}
+    event::Union{Nothing, String}
     saw_data::Bool
 end
 

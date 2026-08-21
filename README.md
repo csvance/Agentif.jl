@@ -24,7 +24,7 @@ using Agentif, LLMTools, LLMProviders, Claw, LLMOAuth, Juco, MCPClient
 - `Claw`: SQLite-backed event-driven assistant app built on top of `Agentif` and `LLMTools`.
 - `LLMOAuth`: OAuth helpers for Codex/OpenAI and Anthropic flows.
 - `Juco`: uber-minimal coding agent (bash/read/edit + memory, single-SQLite persistence); see `Juco/README.md`.
-- `MCPClient`: Model Context Protocol client with HTTP and stdio transports, depending only on `HTTP`/`JSON`.
+- `MCPClient`: Model Context Protocol client with HTTP and stdio transports, depending only on `HTTP`/`JSON`/`Base64`.
 
 Each package has its own README:
 

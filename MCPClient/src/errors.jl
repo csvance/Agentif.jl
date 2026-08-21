@@ -37,7 +37,7 @@ function Base.showerror(io::IO, e::JSONRPCError)
     print(io, "JSONRPCError: ")
     isempty(e.method) || print(io, e.method, " failed: ")
     print(io, e.message, " (code ", e.code, ")")
-    e.data === nothing || print(io, "; data=", e.data)
+    return e.data === nothing || print(io, "; data=", e.data)
 end
 
 """
@@ -70,7 +70,7 @@ MCPTransportError(message::AbstractString) = MCPTransportError(String(message), 
 
 function Base.showerror(io::IO, e::MCPTransportError)
     print(io, "MCPTransportError: ", e.message)
-    e.cause === nothing || print(io, " (caused by ", sprint(showerror, e.cause), ")")
+    return e.cause === nothing || print(io, " (caused by ", sprint(showerror, e.cause), ")")
 end
 
 """

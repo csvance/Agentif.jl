@@ -52,6 +52,9 @@ export Client,
     StreamableHTTPTransport,
     StdioTransport,
     AbstractTransport,
+    send_request!,
+    send_notification!,
+    set_handler!,
     MCPException,
     JSONRPCError,
     MCPTimeoutError,
@@ -71,8 +74,7 @@ export Client,
     protocol_version,
     session_id,
     has_capability,
-    is_open,
-    stderr_tail
+    is_open
 
 include("errors.jl")
 include("jsonrpc.jl")

@@ -7,11 +7,24 @@ support, which is the negotiation MCP performs during `initialize`.
 const LATEST_PROTOCOL_VERSION = "2025-06-18"
 
 """
-Revisions this client can speak. The differences that matter to a tool caller are
-small; the list exists so an unrecognised version can be rejected rather than
-silently mishandled.
+Revisions this client can speak, newest first, so the head is always
+[`LATEST_PROTOCOL_VERSION`](@ref) — the one we ask for. The differences that
+matter to a tool caller are small; the list exists so an unrecognised version
+can be rejected rather than silently mishandled.
 """
-const SUPPORTED_PROTOCOL_VERSIONS = ["2025-06-18", "2025-03-26", "2024-11-05"]
+const SUPPORTED_PROTOCOL_VERSIONS = [LATEST_PROTOCOL_VERSION, "2025-03-26", "2024-11-05"]
+
+# The `clientInfo.version` the server sees: read from this package's own
+# `Project.toml` at load time, so it cannot drift from the release. The version
+# line is Pkg's own `version = "x.y.z"`, which is matched rather than parsed,
+# keeping the package free of a TOML dependency. A bundled load where the source
+# path is unknown falls back to `"unknown"`.
+const _PACKAGE_VERSION = try
+    path = joinpath(dirname(dirname(Base.pathof(@__MODULE__))), "Project.toml")
+    match(r"""^version\s*=\s*"([^"]+)"""m, read(path, String)).captures[1]
+catch
+    "unknown"
+end
 
 """
     Client(url; kwargs...)
@@ -65,12 +78,12 @@ mutable struct Client
     transport::AbstractTransport
     name::String
     version::String
-    capabilities::Dict{String,Any}
+    capabilities::Dict{String, Any}
     requested_version::String
     protocol_version::String
-    server_info::Dict{String,Any}
-    server_capabilities::Dict{String,Any}
-    instructions::Union{Nothing,String}
+    server_info::Dict{String, Any}
+    server_capabilities::Dict{String, Any}
+    instructions::Union{Nothing, String}
     initialized::Bool
     timeout::Float64
     strict_version::Bool
@@ -79,33 +92,20 @@ mutable struct Client
     next_id::Int
     lock::ReentrantLock
     # Server-initiated traffic is handled off the reader task; see `_incoming`.
-    notifications::Union{Nothing,Channel{Any}}
+    notifications::Union{Nothing, Channel{Any}}
 end
 
-function Client(transport::AbstractTransport;
-                name::AbstractString="MCPClient.jl",
-                version::AbstractString="0.1.0",
-                capabilities::AbstractDict=Dict{String,Any}(),
-                protocol_version::AbstractString=LATEST_PROTOCOL_VERSION,
-                strict_version::Bool=true,
-                timeout::Real=DEFAULT_TIMEOUT,
-                on_notification=nothing,
-                on_request=nothing,
-                initialize::Bool=true)
-    client = Client(transport, String(name), String(version), plain(capabilities),
-                    String(protocol_version), String(protocol_version),
-                    Dict{String,Any}(), Dict{String,Any}(), nothing, false,
-                    Float64(timeout), strict_version, on_notification, on_request,
-                    0, ReentrantLock(), nothing)
-    set_handler!(transport, msg -> _incoming(client, msg))
+function Client(transport::AbstractTransport; initialize::Bool = true, kwargs...)
+    client = Client(; transport = transport, kwargs...)
     if initialize
         try
             initialize!(client)
         catch
             # A handshake that fails still leaves a socket, and possibly a session
-            # or a child process, behind. The URL and `Cmd` constructors below
-            # each guard this too; the guard belongs here as well, because a
-            # caller who built the transport itself gets no other cleanup.
+            # or a child process, behind, so close before reporting the failure.
+            # This is the only such guard: the URL and `Cmd` constructors both
+            # funnel through here, and so does a caller who built the transport
+            # itself.
             close(client)
             rethrow()
         end
@@ -113,39 +113,33 @@ function Client(transport::AbstractTransport;
     return client
 end
 
-function Client(url::AbstractString;
-                headers=Pair{String,String}[],
-                timeout::Real=DEFAULT_TIMEOUT,
-                terminate_on_close::Bool=true,
-                kwargs...)
-    transport = StreamableHTTPTransport(url; headers=headers, timeout=timeout,
-                                        terminate_on_close=terminate_on_close)
-    try
-        return Client(transport; timeout=timeout, kwargs...)
-    catch
-        # A handshake that fails still leaves a socket and possibly a session
-        # behind on the server.
-        close(transport)
-        rethrow()
-    end
+function Client(
+        url::AbstractString;
+        headers = Pair{String, String}[],
+        timeout::Real = DEFAULT_TIMEOUT,
+        terminate_on_close::Bool = true,
+        kwargs...
+    )
+    transport = StreamableHTTPTransport(
+        url; headers = headers, timeout = timeout,
+        terminate_on_close = terminate_on_close
+    )
+    return Client(transport; timeout = timeout, kwargs...)
 end
 
-function Client(command::Base.Cmd;
-                env=nothing,
-                dir=nothing,
-                inherit_env::Bool=true,
-                timeout::Real=DEFAULT_TIMEOUT,
-                kwargs...)
-    transport = StdioTransport(command; env=env, dir=dir, inherit_env=inherit_env,
-                               timeout=timeout)
-    try
-        return Client(transport; timeout=timeout, kwargs...)
-    catch
-        # A handshake that fails still leaves a child process running, and an
-        # orphaned MCP server holds whatever the real one would have held.
-        close(transport)
-        rethrow()
-    end
+function Client(
+        command::Base.Cmd;
+        env = nothing,
+        dir = nothing,
+        inherit_env::Bool = true,
+        timeout::Real = DEFAULT_TIMEOUT,
+        kwargs...
+    )
+    transport = StdioTransport(
+        command; env = env, dir = dir, inherit_env = inherit_env,
+        timeout = timeout
+    )
+    return Client(transport; timeout = timeout, kwargs...)
 end
 
 function Client(f::Function, url_or_transport; kwargs...)
@@ -159,6 +153,45 @@ function Client(f::Function, url_or_transport; kwargs...)
     end
 end
 
+# The one place the struct is built. The `NamedTuple` keeps the field order
+# visible and every entry named, so adding or reordering a field cannot shift a
+# value silently the way a 17-argument positional call would.
+function Client(;
+        transport::AbstractTransport,
+        name::AbstractString = "MCPClient.jl",
+        version::AbstractString = _PACKAGE_VERSION,
+        capabilities::AbstractDict = Dict{String, Any}(),
+        protocol_version::AbstractString = LATEST_PROTOCOL_VERSION,
+        strict_version::Bool = true,
+        timeout::Real = DEFAULT_TIMEOUT,
+        on_notification = nothing,
+        on_request = nothing
+    )
+    client = Client(
+        (;
+            transport,
+            name = String(name),
+            version = String(version),
+            capabilities = plain(capabilities),
+            requested_version = String(protocol_version),
+            protocol_version = String(protocol_version),
+            server_info = Dict{String, Any}(),
+            server_capabilities = Dict{String, Any}(),
+            instructions = nothing,
+            initialized = false,
+            timeout = Float64(timeout),
+            strict_version,
+            on_notification,
+            on_request,
+            next_id = 0,
+            lock = ReentrantLock(),
+            notifications = nothing,
+        )...
+    )
+    set_handler!(transport, msg -> _incoming(client, msg))
+    return client
+end
+
 function Base.show(io::IO, c::Client)
     print(io, "Client(")
     if c.initialized
@@ -169,7 +202,7 @@ function Base.show(io::IO, c::Client)
     else
         print(io, "not initialized")
     end
-    print(io, ")")
+    return print(io, ")")
 end
 
 """
@@ -217,6 +250,12 @@ Whether the server declared the top-level capability `name`, such as `"tools"`,
 """
 has_capability(c::Client, name::AbstractString) = haskey(c.server_capabilities, String(name))
 
+"""
+    is_open(c) -> Bool
+
+Whether the client can still carry a message, i.e. whether its transport is
+still open, see [`is_open(t::AbstractTransport)`](@ref).
+"""
 is_open(c::Client) = is_open(c.transport)
 
 function _next_id!(c::Client)
@@ -233,10 +272,10 @@ Send a JSON-RPC request and return its `result`. A JSON-RPC `error` response
 becomes a thrown [`JSONRPCError`](@ref). Use this for methods this package does
 not wrap.
 """
-function request(c::Client, method::AbstractString, params=nothing; timeout::Real=c.timeout)
+function request(c::Client, method::AbstractString, params = nothing; timeout::Real = c.timeout)
     id = _next_id!(c)
     message = request_message(id, method, params)
-    response = send_request!(c.transport, message, id; timeout=timeout)
+    response = send_request!(c.transport, message, id; timeout = timeout)
     return unwrap_result(response, method)
 end
 
@@ -246,7 +285,7 @@ end
 Send a notification, which by definition gets no reply and cannot fail at the
 protocol level.
 """
-function notify_server(c::Client, method::AbstractString, params=nothing)
+function notify_server(c::Client, method::AbstractString, params = nothing)
     send_notification!(c.transport, notification_message(method, params))
     return nothing
 end
@@ -258,21 +297,21 @@ Run the handshake: send `initialize`, check the version the server chose, record
 its capabilities, then send the `notifications/initialized` acknowledgement that
 tells the server the session is live. [`Client`](@ref) calls this for you.
 """
-function initialize!(c::Client; timeout::Real=c.timeout)
+function initialize!(c::Client; timeout::Real = c.timeout)
     c.initialized && return c
-    params = Dict{String,Any}(
+    params = Dict{String, Any}(
         "protocolVersion" => c.requested_version,
         "capabilities" => c.capabilities,
-        "clientInfo" => Dict{String,Any}("name" => c.name, "version" => c.version),
+        "clientInfo" => Dict{String, Any}("name" => c.name, "version" => c.version),
     )
-    result = request(c, "initialize", params; timeout=timeout)
+    result = request(c, "initialize", params; timeout = timeout)
     result isa AbstractDict || throw(MCPProtocolError("initialize result is not an object"))
     version = get(result, "protocolVersion", nothing)
     version isa AbstractString ||
         throw(MCPProtocolError("initialize result has no \"protocolVersion\" string"))
     if !(version in SUPPORTED_PROTOCOL_VERSIONS)
         message = "server chose MCP protocol version \"$version\", which this client does not " *
-                  "list as supported ($(join(SUPPORTED_PROTOCOL_VERSIONS, ", ")))"
+            "list as supported ($(join(SUPPORTED_PROTOCOL_VERSIONS, ", ")))"
         c.strict_version && throw(MCPProtocolError(message))
         @warn message
     end
@@ -281,13 +320,19 @@ function initialize!(c::Client; timeout::Real=c.timeout)
     # which makes a malformed server indistinguishable from a limited one and
     # sends `has_capability` answering `false` about a capability the server has.
     caps = get(result, "capabilities", nothing)
-    c.server_capabilities = something(want_object_or_nothing(caps, "\"capabilities\" in the initialize result"),
-                                      Dict{String,Any}())
+    c.server_capabilities = something(
+        want_object_or_nothing(caps, "\"capabilities\" in the initialize result"),
+        Dict{String, Any}()
+    )
     info = get(result, "serverInfo", nothing)
-    c.server_info = something(want_object_or_nothing(info, "\"serverInfo\" in the initialize result"),
-                              Dict{String,Any}())
-    c.instructions = want_string_or_nothing(get(result, "instructions", nothing),
-                                            "\"instructions\" in the initialize result")
+    c.server_info = something(
+        want_object_or_nothing(info, "\"serverInfo\" in the initialize result"),
+        Dict{String, Any}()
+    )
+    c.instructions = want_string_or_nothing(
+        get(result, "instructions", nothing),
+        "\"instructions\" in the initialize result"
+    )
     # Only after this point may the session id and protocol version headers ride
     # along, and only after the notification may the server expect other calls.
     protocol_version!(c.transport, c.protocol_version)
@@ -302,8 +347,8 @@ end
 Check that the peer is alive. Throws on failure, including
 [`MCPTimeoutError`](@ref) when it does not answer in time.
 """
-function ping(c::Client; timeout::Real=c.timeout)
-    request(c, "ping", Dict{String,Any}(); timeout=timeout)
+function ping(c::Client; timeout::Real = c.timeout)
+    request(c, "ping", Dict{String, Any}(); timeout = timeout)
     return nothing
 end
 
@@ -313,10 +358,10 @@ end
 One page of `tools/list`, plus the cursor for the next page or `nothing` when the
 listing is complete. Use [`list_tools`](@ref) unless you need to page manually.
 """
-function list_tools_page(c::Client; cursor=nothing, timeout::Real=c.timeout)
-    params = Dict{String,Any}()
+function list_tools_page(c::Client; cursor = nothing, timeout::Real = c.timeout)
+    params = Dict{String, Any}()
     cursor === nothing || (params["cursor"] = String(cursor))
-    result = request(c, "tools/list", params; timeout=timeout)
+    result = request(c, "tools/list", params; timeout = timeout)
     result isa AbstractDict || throw(MCPProtocolError("tools/list result is not an object"))
     entries = get(result, "tools", nothing)
     entries isa AbstractVector ||
@@ -337,12 +382,12 @@ Every tool the server offers, following `nextCursor` until the listing ends.
 `max_pages` bounds a server that paginates forever; hitting it, or seeing a
 cursor repeat, raises [`MCPProtocolError`](@ref) rather than looping.
 """
-function list_tools(c::Client; timeout::Real=c.timeout, max_pages::Integer=100)
+function list_tools(c::Client; timeout::Real = c.timeout, max_pages::Integer = 100)
     tools = MCPTool[]
     seen = Set{String}()
     cursor = nothing
     for _ in 1:max_pages
-        page, cursor = list_tools_page(c; cursor=cursor, timeout=timeout)
+        page, cursor = list_tools_page(c; cursor = cursor, timeout = timeout)
         append!(tools, page)
         cursor === nothing && return tools
         cursor in seen &&
@@ -363,22 +408,24 @@ reserved for the call not happening, for instance an unknown tool name
 ([`JSONRPCError`](@ref)) or a server that never replies
 ([`MCPTimeoutError`](@ref)).
 """
-function call_tool(c::Client, name::AbstractString, arguments=Dict{String,Any}();
-                   timeout::Real=c.timeout, progress_token=nothing)
-    params = Dict{String,Any}("name" => String(name), "arguments" => _arguments(arguments))
+function call_tool(
+        c::Client, name::AbstractString, arguments = Dict{String, Any}();
+        timeout::Real = c.timeout, progress_token = nothing
+    )
+    params = Dict{String, Any}("name" => String(name), "arguments" => _arguments(arguments))
     # A server may only emit `notifications/progress` for a request that carried a token, so a
     # caller that wants progress has to ask for it here. Anything the server sends back under this
     # token reaches `on_notification`, which is the only way to learn anything about a call that has
     # not returned yet: without it a long call is indistinguishable from a dead one.
     progress_token === nothing ||
-        (params["_meta"] = Dict{String,Any}("progressToken" => progress_token))
-    result = request(c, "tools/call", params; timeout=timeout)
+        (params["_meta"] = Dict{String, Any}("progressToken" => progress_token))
+    result = request(c, "tools/call", params; timeout = timeout)
     result isa AbstractDict || throw(MCPProtocolError("tools/call result is not an object"))
     return ToolResult(result)
 end
 
-_arguments(x::AbstractDict) = Dict{String,Any}(String(k) => v for (k, v) in x)
-_arguments(x::NamedTuple) = Dict{String,Any}(String(k) => v for (k, v) in pairs(x))
+_arguments(x::AbstractDict) = Dict{String, Any}(String(k) => v for (k, v) in x)
+_arguments(x::NamedTuple) = Dict{String, Any}(String(k) => v for (k, v) in pairs(x))
 _arguments(x) = throw(ArgumentError("tool arguments must be a dictionary or NamedTuple, got $(typeof(x))"))
 
 """
@@ -462,10 +509,12 @@ function _answer(c::Client, msg::AbstractDict)
         if method == "ping"
             # Answering ping is the one server-initiated request every client owes,
             # and a client that ignores it looks dead.
-            result_message(id, Dict{String,Any}())
+            result_message(id, Dict{String, Any}())
         elseif c.on_request === nothing
-            error_message(id, ERR_METHOD_NOT_FOUND,
-                          "this client does not implement \"$method\"")
+            error_message(
+                id, ERR_METHOD_NOT_FOUND,
+                "this client does not implement \"$method\""
+            )
         else
             result_message(id, c.on_request(method, plain(get(msg, "params", nothing))))
         end
@@ -474,6 +523,9 @@ function _answer(c::Client, msg::AbstractDict)
         error_message(id, ERR_INTERNAL, "client handler for \"$method\" failed: " * sprint(showerror, e))
     end
     try
+        # The reply, like a notification, gets no answer of its own, so it goes out
+        # the fire-and-forget path: `send_request!` would wait for a reply that
+        # never comes.
         send_notification!(c.transport, reply)
     catch e
         @debug "could not deliver a response to a server-initiated request" exception = e

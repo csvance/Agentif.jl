@@ -19,7 +19,7 @@ A `text` content block.
 """
 struct TextContent <: ContentBlock
     text::String
-    raw::Dict{String,Any}
+    raw::Dict{String, Any}
 end
 
 """
@@ -31,7 +31,7 @@ still in `raw["data"]`.
 struct ImageContent <: ContentBlock
     data::Vector{UInt8}
     mime_type::String
-    raw::Dict{String,Any}
+    raw::Dict{String, Any}
 end
 
 """
@@ -42,7 +42,7 @@ An `audio` block, structured exactly like [`ImageContent`](@ref).
 struct AudioContent <: ContentBlock
     data::Vector{UInt8}
     mime_type::String
-    raw::Dict{String,Any}
+    raw::Dict{String, Any}
 end
 
 """
@@ -53,10 +53,10 @@ A `resource` block: resource contents inlined into the result. Exactly one of
 """
 struct EmbeddedResource <: ContentBlock
     uri::String
-    mime_type::Union{Nothing,String}
-    text::Union{Nothing,String}
-    blob::Union{Nothing,Vector{UInt8}}
-    raw::Dict{String,Any}
+    mime_type::Union{Nothing, String}
+    text::Union{Nothing, String}
+    blob::Union{Nothing, Vector{UInt8}}
+    raw::Dict{String, Any}
 end
 
 """
@@ -68,9 +68,9 @@ carrying no contents of its own.
 struct ResourceLink <: ContentBlock
     uri::String
     name::String
-    description::Union{Nothing,String}
-    mime_type::Union{Nothing,String}
-    raw::Dict{String,Any}
+    description::Union{Nothing, String}
+    mime_type::Union{Nothing, String}
+    raw::Dict{String, Any}
 end
 
 """
@@ -82,7 +82,7 @@ breaks on upgrade, so unknown blocks are preserved instead.
 """
 struct UnknownContent <: ContentBlock
     type::String
-    raw::Dict{String,Any}
+    raw::Dict{String, Any}
 end
 
 function _decode_b64(x, what::AbstractString)
@@ -107,13 +107,21 @@ function parse_content(block::AbstractDict)
     if kind == "text"
         return TextContent(want_string(get(raw, "text", ""), "\"text\" of a text content block"), raw)
     elseif kind == "image"
-        return ImageContent(_decode_b64(get(raw, "data", nothing), "image"),
-                            want_string(get(raw, "mimeType", "application/octet-stream"),
-                                        "\"mimeType\" of an image content block"), raw)
+        return ImageContent(
+            _decode_b64(get(raw, "data", nothing), "image"),
+            want_string(
+                get(raw, "mimeType", "application/octet-stream"),
+                "\"mimeType\" of an image content block"
+            ), raw
+        )
     elseif kind == "audio"
-        return AudioContent(_decode_b64(get(raw, "data", nothing), "audio"),
-                            want_string(get(raw, "mimeType", "application/octet-stream"),
-                                        "\"mimeType\" of an audio content block"), raw)
+        return AudioContent(
+            _decode_b64(get(raw, "data", nothing), "audio"),
+            want_string(
+                get(raw, "mimeType", "application/octet-stream"),
+                "\"mimeType\" of an audio content block"
+            ), raw
+        )
     elseif kind == "resource"
         res = get(raw, "resource", nothing)
         res isa AbstractDict ||
@@ -121,18 +129,26 @@ function parse_content(block::AbstractDict)
         blob = get(res, "blob", nothing)
         blob === nothing || get(res, "text", nothing) === nothing ||
             throw(MCPProtocolError("resource content block carries both \"text\" and \"blob\""))
-        return EmbeddedResource(want_string(get(res, "uri", ""), "\"resource.uri\""),
-                                want_string_or_nothing(get(res, "mimeType", nothing), "\"resource.mimeType\""),
-                                want_string_or_nothing(get(res, "text", nothing), "\"resource.text\""),
-                                blob === nothing ? nothing : _decode_b64(blob, "resource"),
-                                raw)
+        return EmbeddedResource(
+            want_string(get(res, "uri", ""), "\"resource.uri\""),
+            want_string_or_nothing(get(res, "mimeType", nothing), "\"resource.mimeType\""),
+            want_string_or_nothing(get(res, "text", nothing), "\"resource.text\""),
+            blob === nothing ? nothing : _decode_b64(blob, "resource"),
+            raw
+        )
     elseif kind == "resource_link"
-        return ResourceLink(want_string(get(raw, "uri", ""), "\"uri\" of a resource_link block"),
-                            want_string(get(raw, "name", ""), "\"name\" of a resource_link block"),
-                            want_string_or_nothing(get(raw, "description", nothing),
-                                                   "\"description\" of a resource_link block"),
-                            want_string_or_nothing(get(raw, "mimeType", nothing),
-                                                   "\"mimeType\" of a resource_link block"), raw)
+        return ResourceLink(
+            want_string(get(raw, "uri", ""), "\"uri\" of a resource_link block"),
+            want_string(get(raw, "name", ""), "\"name\" of a resource_link block"),
+            want_string_or_nothing(
+                get(raw, "description", nothing),
+                "\"description\" of a resource_link block"
+            ),
+            want_string_or_nothing(
+                get(raw, "mimeType", nothing),
+                "\"mimeType\" of a resource_link block"
+            ), raw
+        )
     end
     return UnknownContent(String(kind), raw)
 end
@@ -168,8 +184,8 @@ Use [`content_text`](@ref) for the text.
 struct ToolResult
     content::Vector{ContentBlock}
     is_error::Bool
-    structured_content::Union{Nothing,Dict{String,Any}}
-    raw::Dict{String,Any}
+    structured_content::Union{Nothing, Dict{String, Any}}
+    raw::Dict{String, Any}
 end
 
 function content_text(r::ToolResult)
@@ -192,20 +208,26 @@ function ToolResult(result::AbstractDict)
     elseif content !== nothing
         throw(MCPProtocolError("tool result \"content\" is not an array"))
     end
-    return ToolResult(blocks, get(raw, "isError", false) === true,
-                      want_object_or_nothing(get(raw, "structuredContent", nothing),
-                                             "\"structuredContent\" of a tool result"), raw)
+    return ToolResult(
+        blocks, get(raw, "isError", false) === true,
+        want_object_or_nothing(
+            get(raw, "structuredContent", nothing),
+            "\"structuredContent\" of a tool result"
+        ), raw
+    )
 end
 
 function Base.show(io::IO, r::ToolResult)
-    print(io, "ToolResult(", length(r.content), " block",
-          length(r.content) == 1 ? "" : "s", r.is_error ? ", isError" : "", ")")
+    return print(
+        io, "ToolResult(", length(r.content), " block",
+        length(r.content) == 1 ? "" : "s", r.is_error ? ", isError" : "", ")"
+    )
 end
 
 function Base.show(io::IO, ::MIME"text/plain", r::ToolResult)
     show(io, r)
     text = content_text(r)
-    isempty(text) || print(io, "\n", _snippet(text, 2000))
+    return isempty(text) || print(io, "\n", _snippet(text, 2000))
 end
 
 """
@@ -225,11 +247,11 @@ framework's tool type without unwrapping anything.
 struct MCPTool
     name::String
     description::String
-    input_schema::Dict{String,Any}
-    output_schema::Union{Nothing,Dict{String,Any}}
-    title::Union{Nothing,String}
-    annotations::Dict{String,Any}
-    raw::Dict{String,Any}
+    input_schema::Dict{String, Any}
+    output_schema::Union{Nothing, Dict{String, Any}}
+    title::Union{Nothing, String}
+    annotations::Dict{String, Any}
+    raw::Dict{String, Any}
 end
 
 function MCPTool(tool::AbstractDict)
@@ -240,16 +262,20 @@ function MCPTool(tool::AbstractDict)
     # one is a server whose arguments we would then get wrong, so it is an error.
     schema = get(raw, "inputSchema", nothing)
     annotations = get(raw, "annotations", nothing)
-    return MCPTool(String(name),
-                   want_string(get(raw, "description", ""), "\"description\" of tool \"$name\""),
-                   schema === nothing ? Dict{String,Any}("type" => "object") :
-                       want_object(schema, "\"inputSchema\" of tool \"$name\""),
-                   want_object_or_nothing(get(raw, "outputSchema", nothing),
-                                          "\"outputSchema\" of tool \"$name\""),
-                   want_string_or_nothing(get(raw, "title", nothing), "\"title\" of tool \"$name\""),
-                   annotations === nothing ? Dict{String,Any}() :
-                       want_object(annotations, "\"annotations\" of tool \"$name\""),
-                   raw)
+    return MCPTool(
+        String(name),
+        want_string(get(raw, "description", ""), "\"description\" of tool \"$name\""),
+        schema === nothing ? Dict{String, Any}("type" => "object") :
+            want_object(schema, "\"inputSchema\" of tool \"$name\""),
+        want_object_or_nothing(
+            get(raw, "outputSchema", nothing),
+            "\"outputSchema\" of tool \"$name\""
+        ),
+        want_string_or_nothing(get(raw, "title", nothing), "\"title\" of tool \"$name\""),
+        annotations === nothing ? Dict{String, Any}() :
+            want_object(annotations, "\"annotations\" of tool \"$name\""),
+        raw
+    )
 end
 
 Base.show(io::IO, t::MCPTool) = print(io, "MCPTool(\"", t.name, "\")")

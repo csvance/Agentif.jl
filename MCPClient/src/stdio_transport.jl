@@ -42,39 +42,43 @@ mutable struct StdioTransport <: AbstractTransport
     stderr::IO                           # the child's stderr; log stream only
     timeout::Float64
     close_grace::Float64
-    pending::Dict{Any,Deadline}          # JSON-RPC id -> the caller waiting for it
+    pending::Pending                 # in-flight requests, keyed by JSON-RPC id
     handler::Any
-    reader::Union{Nothing,Task}
-    stderr_reader::Union{Nothing,Task}
+    reader::Union{Nothing, Task}
+    stderr_reader::Union{Nothing, Task}
     stderr_lines::Int
     stderr_log::Vector{String}
-    failure::Union{Nothing,MCPTransportError}
+    failure::Union{Nothing, MCPTransportError}
     closed::Bool
     write_lock::ReentrantLock
     lock::ReentrantLock
 end
 
-function StdioTransport(command::Base.Cmd;
-                        env=nothing,
-                        dir=nothing,
-                        inherit_env::Bool=true,
-                        timeout::Real=DEFAULT_TIMEOUT,
-                        close_grace::Real=2.0,
-                        stderr_lines::Integer=50)
+function StdioTransport(
+        command::Base.Cmd;
+        env = nothing,
+        dir = nothing,
+        inherit_env::Bool = true,
+        timeout::Real = DEFAULT_TIMEOUT,
+        close_grace::Real = 2.0,
+        stderr_lines::Integer = 50
+    )
     cmd = _child_command(command, env, dir, inherit_env)
     # A fresh PipeEndpoint, not a `Pipe`: `pipeline` closes the child end at spawn,
     # which is what makes `eof` on stdout true once the child exits. Holding a
     # write end ourselves would make a dead child look like an idle one.
     child_stderr = Base.PipeEndpoint()
     process = try
-        open(pipeline(cmd; stderr=child_stderr), "r+")
+        open(pipeline(cmd; stderr = child_stderr), "r+")
     catch e
         throw(MCPTransportError("could not start the MCP server `$(cmd)`", e))
     end
-    t = StdioTransport(cmd, process, process.in, process.out, child_stderr,
-                       Float64(timeout), Float64(close_grace), Dict{Any,Deadline}(),
-                       nothing, nothing, nothing, Int(stderr_lines), String[],
-                       nothing, false, ReentrantLock(), ReentrantLock())
+    t = StdioTransport(
+        cmd, process, process.in, process.out, child_stderr,
+        Float64(timeout), Float64(close_grace), Pending(),
+        nothing, nothing, nothing, Int(stderr_lines), String[],
+        nothing, false, ReentrantLock(), ReentrantLock()
+    )
     # Both readers start before this returns: a server that logs during startup
     # blocks in `write` once the stderr pipe buffer fills, and that deadlock looks
     # exactly like a server that never answers the handshake.
@@ -86,24 +90,26 @@ end
 function _child_command(command::Base.Cmd, env, dir, inherit_env::Bool)
     cmd = command
     if env !== nothing || !inherit_env
-        merged = Dict{String,String}()
+        merged = Dict{String, String}()
         inherit_env && for (k, v) in ENV
             merged[String(k)] = String(v)
         end
         env === nothing || for (k, v) in _env_pairs(env)
             merged[String(k)] = String(v)
         end
-        cmd = Base.Cmd(cmd; env=merged)
+        cmd = Base.Cmd(cmd; env = merged)
     end
-    dir === nothing || (cmd = Base.Cmd(cmd; dir=String(dir)))
+    dir === nothing || (cmd = Base.Cmd(cmd; dir = String(dir)))
     return cmd
 end
 
 _env_pairs(env::NamedTuple) = pairs(env)
 _env_pairs(env) = env  # a dict, or a vector of `"K" => "V"` pairs
 
-Base.show(io::IO, t::StdioTransport) = print(io, "StdioTransport(", t.command,
-                                             _state_suffix(t), ")")
+Base.show(io::IO, t::StdioTransport) = print(
+    io, "StdioTransport(", t.command,
+    _state_suffix(t), ")"
+)
 
 function _state_suffix(t::StdioTransport)
     @lock t.lock begin
@@ -165,17 +171,17 @@ function _read_loop!(t::StdioTransport)
         # shutdown path the answer is already known, so skip the exit code and the
         # log tail rather than make `close` wait for them.
         err = @lock(t.lock, t.closed) ?
-              MCPTransportError("the stdio transport for `$(t.command)` was closed") :
-              _death_error(t)
+            MCPTransportError("the stdio transport for `$(t.command)` was closed") :
+            _death_error(t)
         _record_failure!(t, err)
-        _fail_pending!(t, err)
+        fail_pending!(t.pending, t.lock, err)
     end
     return nothing
 end
 
 function _route_incoming!(t::StdioTransport, msg::AbstractDict)
     if is_response(msg)
-        d = _take_pending!(t, get(msg, "id", nothing))
+        d = take_pending!(t.pending, t.lock, get(msg, "id", nothing))
         if d === nothing
             # Either the caller already timed out and stopped waiting, or the
             # server answered a request nobody made. Neither is fatal.
@@ -189,25 +195,6 @@ function _route_incoming!(t::StdioTransport, msg::AbstractDict)
     # contract is that nothing seen on the stream is dropped.
     dispatch!(t, msg)
     return nothing
-end
-
-# Ids are opaque, and a server may echo `1` as `1.0` or as `"1"`. The dictionary
-# lookup already covers the numeric case, so the scan is only reached for a
-# server that changed the type outright, which is rare enough to be worth a walk
-# over the handful of requests that are in flight.
-function _take_pending!(t::StdioTransport, id)
-    id === nothing && return nothing
-    @lock t.lock begin
-        d = pop!(t.pending, id, nothing)
-        d === nothing || return d
-        for (key, waiter) in t.pending
-            if ids_equal(key, id)
-                delete!(t.pending, key)
-                return waiter
-            end
-        end
-        return nothing
-    end
 end
 
 function _drain_stderr!(t::StdioTransport)
@@ -231,16 +218,22 @@ end
 
 # --- failure bookkeeping --------------------------------------------------
 
+# How long a dying child gets to be reaped (and its stderr drain to catch up)
+# before the error goes out without them: short enough that a dead child cannot
+# delay the error its callers are waiting for, long enough to catch one that
+# exits promptly. A heuristic, not a protocol value.
+const _EXIT_SETTLE = 0.25
+
 function _death_error(t::StdioTransport)
     # The child may not be reaped yet at the moment stdout hits EOF, so give it a
     # moment; but do not wait on it, because a server is allowed to close stdout
     # and keep running, and blocking here would hold back the errors that every
     # pending caller is waiting for.
-    exited = _wait_exit(t.process, 0.25)
+    exited = _wait_exit(t.process, _EXIT_SETTLE)
     # A server that logs why it is dying does so just before it dies, so the tail
     # is only useful if the drain has caught up. Its stderr is at EOF once the
     # child is gone, so this waits for the task to end rather than for a duration.
-    exited && t.stderr_reader !== nothing && _wait_task(t.stderr_reader, 0.25)
+    exited && t.stderr_reader !== nothing && _wait_task(t.stderr_reader, _EXIT_SETTLE)
     detail = if exited
         code = t.process.exitcode
         signal = t.process.termsignal
@@ -259,22 +252,12 @@ function _record_failure!(t::StdioTransport, err::MCPTransportError)
     return nothing
 end
 
-function _fail_pending!(t::StdioTransport, err::Exception)
-    waiters = @lock t.lock begin
-        ws = collect(values(t.pending))
-        empty!(t.pending)
-        ws
-    end
-    for d in waiters
-        deliver!(d, err)
-    end
-    return nothing
-end
-
 # --- sending --------------------------------------------------------------
 
-function send_request!(t::StdioTransport, message::AbstractDict, id;
-                       timeout::Real=t.timeout)
+function send_request!(
+        t::StdioTransport, message::AbstractDict, id;
+        timeout::Real = t.timeout
+    )
     method = _method_of(message)
     d = Deadline()
     # Registering the waiter and checking that the transport is still alive happen
@@ -284,14 +267,16 @@ function send_request!(t::StdioTransport, message::AbstractDict, id;
     err = @lock t.lock begin
         if t.closed || t.failure !== nothing
             _unusable(t, method)
-        elseif haskey(t.pending, id)
+        elseif haskey(t.pending.waiters, id)
             # Overwriting the entry would orphan whoever registered it, leaving
             # that caller to hang out its deadline for a response handed to
             # someone else. `Client` never reuses an id; raw JSON-RPC can.
-            MCPProtocolError("a request with id $(repr(id)) is already in flight; " *
-                             "JSON-RPC ids must be unique while a request is outstanding")
+            MCPProtocolError(
+                "a request with id $(repr(id)) is already in flight; " *
+                    "JSON-RPC ids must be unique while a request is outstanding"
+            )
         else
-            t.pending[id] = d
+            t.pending.waiters[id] = d
             nothing
         end
     end
@@ -303,12 +288,14 @@ function send_request!(t::StdioTransport, message::AbstractDict, id;
         # Covers all three exits: the response arrived, the deadline passed, or
         # the write failed. A waiter left behind would keep a dead id in the table
         # for the life of the session.
-        @lock t.lock delete!(t.pending, id)
+        unregister_pending!(t.pending, t.lock, id)
     end
 end
 
-function send_notification!(t::StdioTransport, message::AbstractDict;
-                            timeout::Real=t.timeout)
+function send_notification!(
+        t::StdioTransport, message::AbstractDict;
+        timeout::Real = t.timeout
+    )
     # `timeout` is accepted for signature parity with the HTTP transport, which
     # has to wait for the POST to be accepted. Here there is nothing to wait for:
     # a notification is one line written to a pipe and no reply will ever come.
@@ -320,7 +307,9 @@ function send_notification!(t::StdioTransport, message::AbstractDict;
 end
 
 # A response the client sends back to the server has no "method" member, so this
-# is only ever used to name the failure in an error message.
+# is only ever used to name the failure in an error message; its default names
+# that case itself, where the transports' outgoing requests and notifications
+# use "?" for a missing method.
 _method_of(message::AbstractDict) = String(get(message, "method", "a response"))
 
 # Call under `t.lock`: reports why the transport cannot carry `method`.
@@ -334,8 +323,12 @@ function _write_message!(t::StdioTransport, message::AbstractDict, method::Abstr
     # split one message into two invalid ones. `JSON.json` escapes newlines, so
     # this asserts rather than sanitises.
     occursin('\n', json) &&
-        throw(MCPProtocolError("refusing to send \"$method\": its JSON contains a newline, " *
-                               "which stdio framing cannot carry"))
+        throw(
+        MCPProtocolError(
+            "refusing to send \"$method\": its JSON contains a newline, " *
+                "which stdio framing cannot carry"
+        )
+    )
     try
         # The lock covers the payload and its terminator together: two tasks each
         # writing half a message produce two invalid lines the server cannot
@@ -349,8 +342,11 @@ function _write_message!(t::StdioTransport, message::AbstractDict, method::Abstr
         end
     catch e
         e isa MCPException && rethrow()
-        throw(MCPTransportError(
-            "could not write \"$method\" to the stdin of `$(t.command)`", e))
+        throw(
+            MCPTransportError(
+                "could not write \"$method\" to the stdin of `$(t.command)`", e
+            )
+        )
     end
     return nothing
 end
@@ -389,8 +385,11 @@ function Base.close(t::StdioTransport)
         end
     end
 
-    _fail_pending!(t, MCPTransportError(
-        "the stdio transport for `$(t.command)` was closed while the request was in flight"))
+    fail_pending!(
+        t.pending, t.lock, MCPTransportError(
+            "the stdio transport for `$(t.command)` was closed while the request was in flight"
+        )
+    )
 
     # Closing the read ends unblocks the readers even when a grandchild inherited
     # the pipes, the one case where the child exiting is not enough.

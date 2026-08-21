@@ -23,34 +23,37 @@ type directly unless you need to speak raw JSON-RPC.
 """
 mutable struct StreamableHTTPTransport <: AbstractTransport
     url::String
-    headers::Vector{Pair{String,String}}
+    headers::Vector{Pair{String, String}}
     timeout::Float64
-    session_id::Union{Nothing,String}
-    protocol_version::Union{Nothing,String}
+    session_id::Union{Nothing, String}
+    protocol_version::Union{Nothing, String}
     handler::Any
     closed::Bool
     terminate_on_close::Bool
     http_client::HTTP.Client
     # Every exchange currently waiting for a reply, so `close` can wake it. A
     # closed socket does not by itself unblock the caller: its `Deadline` lives
-    # on the worker task, so without this registry the caller waits out its full
+    # on the worker task, so without this table the caller waits out its full
     # timeout after `close` returns, and with `timeout <= 0` waits forever.
-    inflight::Dict{Int,Deadline}
-    next_inflight::Int
+    pending::Pending
     lock::ReentrantLock
 end
 
-function StreamableHTTPTransport(url::AbstractString;
-                                headers=Pair{String,String}[],
-                                timeout::Real=DEFAULT_TIMEOUT,
-                                terminate_on_close::Bool=true)
-    hs = Pair{String,String}[String(k) => String(v) for (k, v) in headers]
+function StreamableHTTPTransport(
+        url::AbstractString;
+        headers = Pair{String, String}[],
+        timeout::Real = DEFAULT_TIMEOUT,
+        terminate_on_close::Bool = true
+    )
+    hs = Pair{String, String}[String(k) => String(v) for (k, v) in headers]
     # One client per transport: its connection pool keeps a session's calls off a
     # fresh TCP (and TLS) handshake each time, which otherwise dominates the cost
     # of a small tools/call.
-    return StreamableHTTPTransport(String(url), hs, Float64(timeout), nothing, nothing,
-                                   nothing, false, terminate_on_close, HTTP.Client(),
-                                   Dict{Int,Deadline}(), 0, ReentrantLock())
+    return StreamableHTTPTransport(
+        String(url), hs, Float64(timeout), nothing, nothing,
+        nothing, false, terminate_on_close, HTTP.Client(),
+        Pending(), ReentrantLock()
+    )
 end
 
 session_id(t::StreamableHTTPTransport) = @lock t.lock t.session_id
@@ -68,7 +71,7 @@ Base.show(io::IO, t::StreamableHTTPTransport) =
     print(io, "StreamableHTTPTransport(", t.url, t.closed ? ", closed" : "", ")")
 
 function _request_headers(t::StreamableHTTPTransport)
-    hs = Pair{String,String}[
+    hs = Pair{String, String}[
         "Content-Type" => "application/json",
         # Both are advertised because the server chooses which one to answer with.
         "Accept" => "application/json, text/event-stream",
@@ -88,18 +91,25 @@ function _capture_session!(t::StreamableHTTPTransport, response)
     return nothing
 end
 
-function send_request!(t::StreamableHTTPTransport, message::AbstractDict, id;
-                       timeout::Real=t.timeout)
+function send_request!(
+        t::StreamableHTTPTransport, message::AbstractDict, id;
+        timeout::Real = t.timeout
+    )
     method = String(get(message, "method", "?"))
     is_open(t) || throw(MCPTransportError("transport for $(t.url) is closed"))
     reply = _exchange(t, message, id, timeout, method)
-    reply === nothing && throw(MCPProtocolError(
-        "the server accepted \"$method\" without answering it; a request must get a response"))
+    reply === nothing && throw(
+        MCPProtocolError(
+            "the server accepted \"$method\" without answering it; a request must get a response"
+        )
+    )
     return reply
 end
 
-function send_notification!(t::StreamableHTTPTransport, message::AbstractDict;
-                            timeout::Real=t.timeout)
+function send_notification!(
+        t::StreamableHTTPTransport, message::AbstractDict;
+        timeout::Real = t.timeout
+    )
     method = String(get(message, "method", "?"))
     is_open(t) || throw(MCPTransportError("transport for $(t.url) is closed"))
     _exchange(t, message, nothing, timeout, method)
@@ -109,8 +119,10 @@ end
 # Perform one POST. Returns the response matching `want_id`, or nothing when
 # there was none (the normal outcome for a notification, which servers answer
 # with 202 Accepted and an empty body).
-function _exchange(t::StreamableHTTPTransport, message::AbstractDict, want_id,
-                   timeout::Real, method::AbstractString)
+function _exchange(
+        t::StreamableHTTPTransport, message::AbstractDict, want_id,
+        timeout::Real, method::AbstractString
+    )
     payload = JSON.json(message)
     stream_ref = Ref{Any}(nothing)
     # A RequestContext is how HTTP.jl is told to abandon a request that is still
@@ -118,61 +130,63 @@ function _exchange(t::StreamableHTTPTransport, message::AbstractDict, want_id,
     ctx = HTTP.RequestContext()
     cleanup = function ()
         try
-            HTTP.cancel!(ctx; message="MCP request timed out")
+            HTTP.cancel!(ctx; message = "MCP request timed out")
         catch
         end
         s = stream_ref[]
         # Closing can itself block on a wedged connection, so never do it on the
         # caller's task.
-        s === nothing || @async (try close(s) catch end)
+        s === nothing || @async (
+            try
+                close(s)
+            catch end
+        )
         return nothing
     end
-    return run_with_deadline(timeout, method; cleanup=cleanup) do d
-        token = _register_inflight!(t, d, method)
+    d = Deadline()
+    # The worker owns the blocking read and registers itself just before it, so
+    # a request registered just after a close cannot be stranded. A worker that
+    # finishes without delivering saw no reply at all; the caller reports that
+    # as a protocol error.
+    @async begin
+        token = nothing
         try
+            token = _register_pending!(t, d, method)
             _post(t, payload, want_id, method, stream_ref, ctx, d)
+            deliver!(d, nothing)
+        catch e
+            deliver!(d, e isa Exception ? e : ErrorException(string(e)))
         finally
-            _unregister_inflight!(t, token)
+            token === nothing || unregister_pending!(t.pending, t.lock, token)
         end
     end
+    return await_deadline(d, timeout, method; cleanup = cleanup)
 end
 
-function _register_inflight!(t::StreamableHTTPTransport, d::Deadline, method::AbstractString)
+function _register_pending!(t::StreamableHTTPTransport, d::Deadline, method::AbstractString)
     # Registering the waiter and re-checking `closed` happen under one lock, and
-    # `close` empties the registry under the same one, so a request registered
+    # `close` empties the table under the same one, so a request registered
     # just after a close cannot be stranded.
     @lock t.lock begin
         t.closed && throw(MCPTransportError("transport for $(t.url) was closed before \"$method\" was sent"))
-        t.next_inflight += 1
-        token = t.next_inflight
-        t.inflight[token] = d
-        return token
+        t.pending.next += 1
+        t.pending.waiters[t.pending.next] = d
+        return t.pending.next
     end
 end
 
-_unregister_inflight!(t::StreamableHTTPTransport, token::Int) =
-    @lock t.lock delete!(t.inflight, token)
-
-function _fail_inflight!(t::StreamableHTTPTransport, err::Exception)
-    waiters = @lock t.lock begin
-        ws = collect(values(t.inflight))
-        empty!(t.inflight)
-        ws
-    end
-    for d in waiters
-        deliver!(d, err)
-    end
-    return nothing
-end
-
-function _post(t::StreamableHTTPTransport, payload::String, want_id, method::AbstractString,
-               stream_ref::Ref{Any}, ctx, d::Deadline)
+function _post(
+        t::StreamableHTTPTransport, payload::String, want_id, method::AbstractString,
+        stream_ref::Ref{Any}, ctx, d::Deadline
+    )
     # retry=false: a JSON-RPC request is not idempotent, and a retried tools/call
     # could run a side effect twice. status_exception=false: a non-2xx body often
     # explains what went wrong and is worth putting in the error message.
     try
-        HTTP.open("POST", t.url, _request_headers(t); retry=false, status_exception=false,
-                  context=ctx, client=t.http_client) do stream
+        HTTP.open(
+            "POST", t.url, _request_headers(t); retry = false, status_exception = false,
+            context = ctx, client = t.http_client
+        ) do stream
             stream_ref[] = stream
             write(stream, payload)
             HTTP.closewrite(stream)
@@ -212,8 +226,11 @@ function _throw_status(t::StreamableHTTPTransport, status::Integer, stream)
         ""
     end
     if status == 404 && session_id(t) !== nothing
-        throw(MCPTransportError(
-            "MCP session $(session_id(t)) is no longer valid (HTTP 404); open a new client"))
+        throw(
+            MCPTransportError(
+                "MCP session $(session_id(t)) is no longer valid (HTTP 404); open a new client"
+            )
+        )
     elseif status == 405
         throw(MCPTransportError("$(t.url) does not accept POST (HTTP 405)"))
     elseif status == 401 || status == 403
@@ -279,8 +296,11 @@ function Base.close(t::StreamableHTTPTransport)
     already && return nothing
     # Wake anyone mid-exchange before the session teardown, which itself performs
     # a request and can block.
-    _fail_inflight!(t, MCPTransportError(
-        "the transport for $(t.url) was closed while the request was in flight"))
+    fail_pending!(
+        t.pending, t.lock, MCPTransportError(
+            "the transport for $(t.url) was closed while the request was in flight"
+        )
+    )
     try
         _terminate_session(t)
     finally
@@ -297,15 +317,26 @@ end
 function _terminate_session(t::StreamableHTTPTransport)
     sid, version = @lock t.lock (t.session_id, t.protocol_version)
     (t.terminate_on_close && sid !== nothing) || return nothing
-    headers = Pair{String,String}["Mcp-Session-Id" => sid]
+    headers = Pair{String, String}["Mcp-Session-Id" => sid]
     version === nothing || push!(headers, "MCP-Protocol-Version" => version)
     append!(headers, t.headers)
+    # `timeout <= 0` means "wait forever" (see `await_deadline`), so the DELETE
+    # gets a capped deadline either way.
+    deadline = t.timeout > 0 ? min(t.timeout, 5.0) : 5.0
     try
-        run_with_deadline(t.timeout <= 0 ? 5.0 : min(t.timeout, 5.0), "DELETE") do d
-            HTTP.request("DELETE", t.url, headers; retry=false, status_exception=false,
-                         client=t.http_client)
-            deliver!(d, nothing)
+        d = Deadline()
+        @async begin
+            try
+                HTTP.request(
+                    "DELETE", t.url, headers; retry = false, status_exception = false,
+                    client = t.http_client
+                )
+                deliver!(d, nothing)
+            catch e
+                deliver!(d, e isa Exception ? e : ErrorException(string(e)))
+            end
         end
+        await_deadline(d, deadline, "DELETE")
     catch e
         @debug "could not terminate MCP session" exception = e
     end

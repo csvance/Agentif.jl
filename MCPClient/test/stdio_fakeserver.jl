@@ -30,19 +30,30 @@ raw(line) = @lock OUT_LOCK begin
 end
 
 result(id, r) = Dict("jsonrpc" => "2.0", "id" => id, "result" => r)
-text_result(id, text; is_error=false) =
-    result(id, Dict("content" => [Dict("type" => "text", "text" => text)],
-                    "isError" => is_error))
+text_result(id, text; is_error = false) =
+    result(
+    id, Dict(
+        "content" => [Dict("type" => "text", "text" => text)],
+        "isError" => is_error
+    )
+)
 
 const INITIALIZE_RESULT = Dict(
     "protocolVersion" => "2025-06-18",
     "capabilities" => Dict("tools" => Dict("listChanged" => true)),
     "serverInfo" => Dict("name" => "fake-stdio-mcp", "version" => "9.9.9"),
-    "instructions" => "be brief")
+    "instructions" => "be brief"
+)
 
-const TOOLS = [Dict("name" => "echo", "description" => "Echo text back",
-                    "inputSchema" => Dict("type" => "object",
-                                          "properties" => Dict("text" => Dict("type" => "string"))))]
+const TOOLS = [
+    Dict(
+        "name" => "echo", "description" => "Echo text back",
+        "inputSchema" => Dict(
+            "type" => "object",
+            "properties" => Dict("text" => Dict("type" => "string"))
+        )
+    ),
+]
 
 function handle_tool_call(id, params)
     name = get(params, "name", "")
@@ -78,8 +89,12 @@ function handle_tool_call(id, params)
         flush(stderr)
         send(text_result(id, "from stdout"))
     elseif name == "notify_then_answer"
-        send(Dict("jsonrpc" => "2.0", "method" => "notifications/message",
-                  "params" => Dict("level" => "info", "data" => "working on it")))
+        send(
+            Dict(
+                "jsonrpc" => "2.0", "method" => "notifications/message",
+                "params" => Dict("level" => "info", "data" => "working on it")
+            )
+        )
         sleep(0.05)
         send(text_result(id, "answered after notifying"))
     elseif name == "ask_then_answer"
@@ -96,9 +111,15 @@ function handle_tool_call(id, params)
         send(text_result("no-such-id", "nobody asked"))
         send(text_result(id, "orphan ignored"))
     else
-        send(Dict("jsonrpc" => "2.0", "id" => id,
-                  "error" => Dict("code" => -32602, "message" => "Unknown tool: $name",
-                                  "data" => Dict("tool" => name))))
+        send(
+            Dict(
+                "jsonrpc" => "2.0", "id" => id,
+                "error" => Dict(
+                    "code" => -32602, "message" => "Unknown tool: $name",
+                    "data" => Dict("tool" => name)
+                )
+            )
+        )
     end
     return nothing
 end
@@ -110,8 +131,12 @@ function handle(msg)
         # A notification. There is nothing to answer, but the test has no other
         # way to see that one arrived, so acknowledge it with a notification of
         # our own rather than adding a side channel.
-        send(Dict("jsonrpc" => "2.0", "method" => "notifications/ack",
-                  "params" => Dict("of" => method, "params" => get(msg, "params", nothing))))
+        send(
+            Dict(
+                "jsonrpc" => "2.0", "method" => "notifications/ack",
+                "params" => Dict("of" => method, "params" => get(msg, "params", nothing))
+            )
+        )
         return nothing
     end
     if method == "initialize"
@@ -128,8 +153,12 @@ function handle(msg)
         println(stderr, "client replied: ", JSON.json(msg))
         flush(stderr)
     else
-        send(Dict("jsonrpc" => "2.0", "id" => id,
-                  "error" => Dict("code" => -32601, "message" => "no such method: $method")))
+        send(
+            Dict(
+                "jsonrpc" => "2.0", "id" => id,
+                "error" => Dict("code" => -32601, "message" => "no such method: $method")
+            )
+        )
     end
     return nothing
 end

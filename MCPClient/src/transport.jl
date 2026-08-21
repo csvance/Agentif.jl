@@ -74,13 +74,14 @@ end
 # Deadline plumbing shared by transports.
 #
 # A transport must never block a caller forever, and neither `read` on a socket
-# nor `readline` on a pipe accepts a deadline. The pattern below runs the
-# blocking work in a task and waits on a one-slot channel that a `Timer` closes
-# with a sentinel exception, so the caller returns on the deadline whether or not
-# the worker ever notices. The worker is then abandoned, which is why every
-# transport also supplies a cleanup that tears its connection down.
+# nor `readline` on a pipe accepts a deadline. The pattern is a one-slot channel
+# that a `Timer` closes with a sentinel exception, so the caller returns on the
+# deadline whether or not the reply ever arrives. Anything that can still produce
+# the reply runs in a task (streamable HTTP) or on a shared reader (stdio) and
+# publishes to the channel with [`deliver!`](@ref); the caller simply
+# [`await_deadline`](@ref)s it.
 
-struct _Timeout <: Exception end
+struct DeadlineExpired <: Exception end
 
 struct Deadline
     channel::Channel{Any}
@@ -108,54 +109,34 @@ function deliver!(d::Deadline, value)
 end
 
 """
-    run_with_deadline(work, timeout, method; cleanup=() -> nothing) -> Any
+    await_deadline(d, timeout, method; cleanup=() -> nothing) -> Any
 
-Run `work(deadline)` in a task and return the first value it delivers, or throw
-[`MCPTimeoutError`](@ref) after `timeout` seconds. A delivered `Exception` is
-rethrown, so a worker reports failure by delivering it. `cleanup` runs only on
-the timeout path and should be cheap and non-blocking.
+Wait for whatever is delivered to `d`, for at most `timeout` seconds, and
+return it. A delivered `Exception` is rethrown, so a worker reports failure by
+delivering it. After `timeout` seconds the wait gives up and throws
+[`MCPTimeoutError`](@ref), first running `cleanup`, which should be cheap and
+non-blocking (for example, cancelling the in-flight request).
 
 `timeout <= 0` means wait indefinitely, which is occasionally what a caller
 wants for a long-running tool.
 """
-function run_with_deadline(work::Function, timeout::Real, method::AbstractString;
-                           cleanup::Function=() -> nothing)
-    d = Deadline()
-    @async begin
-        try
-            work(d)
-            # A worker that finishes without delivering saw no reply at all.
-            deliver!(d, nothing)
-        catch e
-            deliver!(d, e isa Exception ? e : ErrorException(string(e)))
-        end
-    end
-    return await_deadline(d, timeout, method; cleanup=cleanup)
-end
-
-"""
-    await_deadline(d, timeout, method; cleanup=() -> nothing) -> Any
-
-Wait for whatever is delivered to `d`, for at most `timeout` seconds. A transport
-whose replies arrive on a shared reader task (stdio, for instance) creates the
-`Deadline`, registers it under the request id and waits here, rather than pairing
-one worker task with one request the way [`run_with_deadline`](@ref) does.
-"""
-function await_deadline(d::Deadline, timeout::Real, method::AbstractString;
-                        cleanup::Function=() -> nothing)
+function await_deadline(
+        d::Deadline, timeout::Real, method::AbstractString;
+        cleanup::Function = () -> nothing
+    )
     value = if timeout <= 0
         take!(d.channel)
     else
         timer = Timer(timeout) do _
             try
-                close(d.channel, _Timeout())
+                close(d.channel, DeadlineExpired())
             catch
             end
         end
         try
             take!(d.channel)
         catch e
-            if e isa _Timeout
+            if e isa DeadlineExpired
                 try
                     cleanup()
                 catch
@@ -169,6 +150,69 @@ function await_deadline(d::Deadline, timeout::Real, method::AbstractString;
     end
     value isa Exception && throw(value)
     return value
+end
+
+# ---------------------------------------------------------------------------
+# Pending requests.
+#
+# The table of requests currently waiting for a reply, so that `close` can
+# fail them instead of leaving their callers to their deadlines (which, with
+# `timeout <= 0`, is forever). The transports key it differently -- streamable
+# HTTP pairs one worker task with one request and uses a private token, stdio
+# has one shared reader for every request and uses the JSON-RPC id -- but the
+# table and its operations are the same. Every operation takes the transport's
+# own lock, so a request registered just after a close is settled by that
+# transport's existing single-lock protocol.
+
+mutable struct Pending
+    waiters::Dict{Any, Deadline}
+    next::Int  # token source; stdio keys by id and never touches it
+end
+
+Pending() = Pending(Dict{Any, Deadline}(), 0)
+
+unregister_pending!(p::Pending, lock, key) = @lock lock delete!(p.waiters, key)
+
+"""
+    take_pending!(p, lock, id) -> Union{Nothing,Deadline}
+
+Remove and return the waiter registered under response id `id`. The direct
+lookup already covers the numeric case; a server that changed the id's type
+outright (echoing `1` as `"1"`) is rare enough to be worth a walk over the
+handful of in-flight requests with [`ids_equal`](@ref).
+"""
+function take_pending!(p::Pending, lock, id)
+    id === nothing && return nothing
+    @lock lock begin
+        d = pop!(p.waiters, id, nothing)
+        d === nothing || return d
+        for (key, waiter) in p.waiters
+            if ids_equal(key, id)
+                delete!(p.waiters, key)
+                return waiter
+            end
+        end
+        return nothing
+    end
+end
+
+"""
+    fail_pending!(p, lock, err)
+
+Fail every waiter still in `p` with `err`. The entries are collected under
+`lock` and the errors delivered outside it, in case a delivery re-enters the
+transport.
+"""
+function fail_pending!(p::Pending, lock, err::Exception)
+    waiters = @lock lock begin
+        ws = collect(values(p.waiters))
+        empty!(p.waiters)
+        ws
+    end
+    for d in waiters
+        deliver!(d, err)
+    end
+    return nothing
 end
 
 """
