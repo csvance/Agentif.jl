@@ -35,6 +35,15 @@ end
     id::String
     name::String
     arguments::ToolArguments
+    # What the model actually emitted, kept ONLY when it did not survive the parse into
+    # `arguments`. `ToolArguments` is a `Dict`, so a malformed argument string has nowhere to live
+    # in there: the parse yields an empty dict and the bytes are gone. That was invisible until the
+    # replay path re-serialized the dict, and then a call the model had made with truncated JSON
+    # was handed back to it as `{}` — which is not what it did. A model shown an empty call it never
+    # made copies the empty call, so one malformed generation became a loop of them. `nothing` when
+    # the arguments parsed, which is the ordinary case and also what previously persisted sessions
+    # load as.
+    raw::Union{Nothing, String} = nothing
     thoughtSignature::Union{Nothing, String} = nothing
 end
 
@@ -162,6 +171,7 @@ JSON.lower(x::ToolCallContent) = (;
     id = x.id,
     name = x.name,
     arguments = x.arguments,
+    raw = x.raw,
     thoughtSignature = x.thoughtSignature,
 )
 

@@ -469,7 +469,9 @@ function openai_codex_event_callback(
                 end
                 call = AgentToolCall(; call_id = compound_id, name = name, arguments = args)
                 push!(assistant_message.tool_calls, call)
-                push!(assistant_message.content, ToolCallContent(; id = compound_id, name, arguments = parse_tool_arguments(args)))
+                # Codex replays through `openai_responses_build_full_input`, which sends
+                # `arguments` as a string, so a malformed one can be carried verbatim.
+                push!(assistant_message.content, tool_call_content(compound_id, name, args))
                 findtool(agent.tools, call.name)
                 ptc = PendingToolCall(; call_id = call.call_id, name = call.name, arguments = call.arguments)
                 f(ToolCallRequestEvent(ptc))

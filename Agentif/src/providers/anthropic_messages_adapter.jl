@@ -547,6 +547,9 @@ function anthropic_should_resubmit_paused(reason::Union{Nothing, String}, attemp
 end
 
 function anthropic_stop_reason(reason::Union{Nothing, String}, tool_calls::Vector{AgentToolCall})
+    # A turn cut off mid-call still carries the call, so the truncation is read first. See
+    # `openai_completions_stop_reason`.
+    (reason == "max_tokens" || reason == "model_context_window_exceeded") && return :length
     if !isempty(tool_calls)
         return :tool_calls
     end

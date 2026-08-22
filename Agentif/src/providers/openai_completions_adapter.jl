@@ -177,7 +177,9 @@ function openai_completions_tool_call_from_content(call::ToolCallContent)
         id = call.id,
         var"function" = OpenAICompletions.ToolCallFunction(
             name = call.name,
-            arguments = JSON.json(call.arguments),
+            # `raw` is set only when the arguments never parsed, and it is then the only faithful
+            # account of the call there is: serializing the empty dict instead replays it as `{}`.
+            arguments = call.raw === nothing ? JSON.json(call.arguments) : call.raw,
         )
     )
 end
@@ -283,7 +285,7 @@ function openai_completions_build_messages(agent::Agent, state::AgentState, inpu
             end
             if isempty(tool_calls) && !isempty(msg.tool_calls)
                 for call in msg.tool_calls
-                    push!(tool_calls, ToolCallContent(; id = call.call_id, name = call.name, arguments = parse_tool_arguments(call.arguments)))
+                    push!(tool_calls, tool_call_content(call.call_id, call.name, call.arguments))
                 end
             end
 
@@ -432,6 +434,11 @@ function openai_completions_usage_from_response(u::Union{Nothing, OpenAICompleti
 end
 
 function openai_completions_stop_reason(reason::Union{Nothing, String}, tool_calls::Vector{AgentToolCall})
+    # Truncation outranks the tool calls rather than the other way round. A generation cut off
+    # mid-call still arrives AS a tool call, so testing the calls first reported `:tool_calls` for
+    # it, and the one signal saying why the arguments were malformed was gone. `codex_stop_reason`
+    # and `openai_responses_stop_reason` already read this way.
+    reason == "length" && return :length
     if !isempty(tool_calls)
         return :tool_calls
     end

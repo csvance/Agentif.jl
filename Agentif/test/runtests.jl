@@ -3930,3 +3930,67 @@ end
             content = [Agentif.TextContent(; text = "ok")], is_error = false)], model)
     @test only(m.reasoning_details for m in compacted_messages if m.role == "assistant") == current_details
 end
+
+@testset "a malformed tool call is replayed as the model wrote it" begin
+    # The bug this covers: a tool call whose arguments never parsed was rebuilt from the empty dict
+    # the parse fell back to, so the model was shown `{}` for a call it had made with truncated
+    # JSON. It could not see what went wrong, and what it did instead was emit `{}` on the retry.
+    truncated = "{\"member\": \"investigator\", \"obj\n</parameter\": "
+
+    block = Agentif.tool_call_content("call-1", "assign", truncated)
+    @test block.raw == truncated
+    @test isempty(block.arguments)
+
+    parsed = Agentif.tool_call_content("call-2", "assign", "{\"member\":\"investigator\"}")
+    @test parsed.raw === nothing
+    @test parsed.arguments == Dict("member" => "investigator")
+
+    # `raw` survives a round trip through the record, and an older session without the field loads.
+    revived = JSON.parse(JSON.json(block), Agentif.ContentBlock)
+    @test revived isa Agentif.ToolCallContent
+    @test revived.raw == truncated
+    legacy = JSON.parse("{\"type\":\"toolCall\",\"id\":\"call-3\",\"name\":\"assign\"," *
+                        "\"arguments\":{},\"thoughtSignature\":null}", Agentif.ContentBlock)
+    @test legacy.raw === nothing
+
+    model = dummy_model()
+    agent = Agent(prompt = "p", model = model, apikey = "k")
+    state = AgentState()
+    push!(state.messages, Agentif.UserMessage([Agentif.TextContent(; text = "plan the round")]))
+    push!(state.messages, AssistantMessage(;
+        provider = model.provider, api = model.api, model = model.id,
+        content = Agentif.AssistantContentBlock[block],
+        tool_calls = [Agentif.AgentToolCall(; call_id = "call-1", name = "assign",
+                                            arguments = truncated)]))
+    messages, _ = Agentif.openai_completions_build_messages(agent, state, [Agentif.ToolResultMessage(;
+        call_id = "call-1", name = "assign",
+        content = [Agentif.TextContent(; text = "not valid JSON")], is_error = true)], model)
+    replayed = only(m for m in messages if m.role == "assistant")
+    @test only(replayed.tool_calls).function.arguments == truncated
+
+    # A well-formed call still goes out as the normalized JSON, not as whatever string arrived.
+    ok_state = AgentState()
+    push!(ok_state.messages, Agentif.UserMessage([Agentif.TextContent(; text = "plan the round")]))
+    push!(ok_state.messages, AssistantMessage(;
+        provider = model.provider, api = model.api, model = model.id,
+        content = Agentif.AssistantContentBlock[parsed]))
+    ok_messages, _ = Agentif.openai_completions_build_messages(agent, ok_state, [Agentif.ToolResultMessage(;
+        call_id = "call-2", name = "assign",
+        content = [Agentif.TextContent(; text = "assigned")], is_error = false)], model)
+    ok_replayed = only(m for m in ok_messages if m.role == "assistant")
+    @test JSON.parse(only(ok_replayed.tool_calls).function.arguments) ==
+          Dict("member" => "investigator")
+end
+
+@testset "truncation outranks the tool calls in a stop reason" begin
+    # A generation cut off mid-call still arrives AS a tool call. Reporting `:tool_calls` for it
+    # threw away the one signal that said why the arguments were malformed.
+    calls = [Agentif.AgentToolCall(; call_id = "c", name = "assign", arguments = "{\"a\":")]
+    @test Agentif.openai_completions_stop_reason("length", calls) == :length
+    @test Agentif.openai_completions_stop_reason("tool_calls", calls) == :tool_calls
+    @test Agentif.openai_completions_stop_reason("stop", Agentif.AgentToolCall[]) == :stop
+    @test Agentif.google_stop_reason("MAX_TOKENS", calls) == :length
+    @test Agentif.google_stop_reason("STOP", calls) == :tool_calls
+    @test Agentif.anthropic_stop_reason("max_tokens", calls) == :length
+    @test Agentif.anthropic_stop_reason("tool_use", calls) == :tool_calls
+end

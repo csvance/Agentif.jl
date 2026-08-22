@@ -127,7 +127,8 @@ function openai_responses_input_from_message(msg::AgentMessage, model::Model)
                     "type" => "function_call",
                     "call_id" => call_id_raw,
                     "name" => block.name,
-                    "arguments" => JSON.json(block.arguments),
+                    # `raw` is set only when the arguments never parsed; see `tool_call_content`.
+                    "arguments" => block.raw === nothing ? JSON.json(block.arguments) : block.raw,
                 )
                 item_id !== nothing && (fc["id"] = item_id)
                 push!(parts, fc)
@@ -307,14 +308,13 @@ function openai_responses_event_callback(
                 item_id = item.id
                 # Compound callId|itemId format (matching pi-mono)
                 compound_id = item_id !== nothing ? "$(raw_call_id)|$(item_id)" : raw_call_id
-                args = parse_tool_arguments(item.arguments)
                 call = AgentToolCall(
                     call_id = compound_id,
                     name = item.name,
                     arguments = item.arguments,
                 )
                 push!(assistant_message.tool_calls, call)
-                push!(assistant_message.content, ToolCallContent(; id = compound_id, name = item.name, arguments = args))
+                push!(assistant_message.content, tool_call_content(compound_id, item.name, item.arguments))
                 findtool(agent.tools, call.name)
                 ptc = PendingToolCall(; call_id = call.call_id, name = call.name, arguments = call.arguments)
                 f(ToolCallRequestEvent(ptc))

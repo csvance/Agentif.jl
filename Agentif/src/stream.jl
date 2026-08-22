@@ -198,6 +198,28 @@ function parse_tool_arguments(arguments::String)::ToolArguments
     end
 end
 
+"""One tool call as a content block, keeping what the model emitted when it does not parse.
+
+`parse_tool_arguments` returns an empty `ToolArguments` for a malformed argument string, which is
+the right shape for a caller that only wants the fields it can read. It is the wrong thing to
+RECORD, because the record is what gets replayed: an empty dict re-serializes to `{}`, and the
+model is then shown an empty call in place of the truncated one it actually made. It cannot
+diagnose what it cannot see, and what it does instead is imitate the `{}`.
+
+So the raw text is carried alongside whenever the parse failed, and the replay paths that can send
+a string verbatim — the OpenAI-shaped APIs, where `arguments` IS a string — prefer it. Nothing is
+kept when the arguments parsed, which is every ordinary call."""
+function tool_call_content(id::AbstractString, name::AbstractString, arguments::String;
+                           thoughtSignature::Union{Nothing, String} = nothing)
+    parsed, raw = try
+        (JSON.parse(arguments, ToolArguments), nothing)
+    catch
+        (ToolArguments(), arguments)
+    end
+    return ToolCallContent(; id = String(id), name = String(name), arguments = parsed, raw,
+                           thoughtSignature)
+end
+
 function assistant_message_for_model(model::Model; response_id::Union{Nothing, String} = nothing)
     return AssistantMessage(;
         response_id = response_id,
@@ -283,7 +305,7 @@ function transform_messages(
                         tool_call_id_map[block.id] = normalized
                     end
                     thought_sig = is_same ? block.thoughtSignature : nothing
-                    push!(blocks, ToolCallContent(; id = normalized, name = block.name, arguments = block.arguments, thoughtSignature = thought_sig))
+                    push!(blocks, ToolCallContent(; id = normalized, name = block.name, arguments = block.arguments, raw = block.raw, thoughtSignature = thought_sig))
                 end
             end
             push!(transformed, AssistantMessage(;
@@ -719,7 +741,7 @@ function stream(
                     args = isempty(acc.arguments) ? "{}" : acc.arguments
                     call = AgentToolCall(; call_id, name = acc.name, arguments = args)
                     push!(assistant_message.tool_calls, call)
-                    push!(assistant_message.content, ToolCallContent(; id = call_id, name = acc.name, arguments = parse_tool_arguments(args)))
+                    push!(assistant_message.content, tool_call_content(call_id, acc.name, args))
                     findtool(agent.tools, call.name)
                     ptc = PendingToolCall(; call_id = call.call_id, name = call.name, arguments = call.arguments)
                     f(ToolCallRequestEvent(ptc))
@@ -779,7 +801,7 @@ function stream(
                     args = tc.function.arguments === nothing ? "{}" : tc.function.arguments
                     call = AgentToolCall(; call_id, name = tc.function.name, arguments = args)
                     push!(assistant_message.tool_calls, call)
-                    push!(assistant_message.content, ToolCallContent(; id = call_id, name = tc.function.name, arguments = parse_tool_arguments(args)))
+                    push!(assistant_message.content, tool_call_content(call_id, tc.function.name, args))
                     findtool(agent.tools, call.name)
                     ptc = PendingToolCall(; call_id = call.call_id, name = call.name, arguments = call.arguments)
                     f(ToolCallRequestEvent(ptc))

@@ -169,6 +169,9 @@ function google_gemini_cli_usage_from_response(u::Union{Nothing, GoogleGeminiCli
 end
 
 function google_stop_reason(reason::Union{Nothing, String}, tool_calls::Vector{AgentToolCall})
+    # A turn cut off mid-call still carries the call, so the truncation is read first. See
+    # `openai_completions_stop_reason`.
+    reason == "MAX_TOKENS" && return :length
     if !isempty(tool_calls)
         return :tool_calls
     end
