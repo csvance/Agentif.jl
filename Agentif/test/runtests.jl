@@ -3966,7 +3966,12 @@ end
         call_id = "call-1", name = "assign",
         content = [Agentif.TextContent(; text = "not valid JSON")], is_error = true)], model)
     replayed = only(m for m in messages if m.role == "assistant")
-    @test only(replayed.tool_calls).function.arguments == truncated
+    sent = only(replayed.tool_calls).function.arguments
+    # What goes out must be JSON a server can parse — vLLM `json.loads` every argument string in the
+    # history to render the chat template and answers 400 for the whole request if one fails, which
+    # poisons the conversation for good. So the raw text travels INSIDE valid JSON, not as it.
+    @test JSON.parse(sent) == Dict(Agentif.MALFORMED_ARGUMENTS_KEY => truncated)
+    @test occursin("</parameter", sent)
 
     # A well-formed call still goes out as the normalized JSON, not as whatever string arrived.
     ok_state = AgentState()
@@ -3980,6 +3985,12 @@ end
     ok_replayed = only(m for m in ok_messages if m.role == "assistant")
     @test JSON.parse(only(ok_replayed.tool_calls).function.arguments) ==
           Dict("member" => "investigator")
+
+    # The Responses builder replays a stored `tool_calls` entry as the string it holds, so it needs
+    # the same guarantee: valid JSON untouched, anything else wrapped.
+    @test Agentif.wire_arguments("{\"member\":\"investigator\"}") == "{\"member\":\"investigator\"}"
+    @test JSON.parse(Agentif.wire_arguments(truncated)) ==
+          Dict(Agentif.MALFORMED_ARGUMENTS_KEY => truncated)
 end
 
 @testset "truncation outranks the tool calls in a stop reason" begin
@@ -3993,4 +4004,7 @@ end
     @test Agentif.google_stop_reason("STOP", calls) == :tool_calls
     @test Agentif.anthropic_stop_reason("max_tokens", calls) == :length
     @test Agentif.anthropic_stop_reason("tool_use", calls) == :tool_calls
+    # A status error reaches the stop reason as "error"; reporting `:stop` for it made a refused
+    # request look like a model with nothing to say, which callers retry.
+    @test Agentif.openai_completions_stop_reason("error", Agentif.AgentToolCall[]) == :error
 end

@@ -177,9 +177,7 @@ function openai_completions_tool_call_from_content(call::ToolCallContent)
         id = call.id,
         var"function" = OpenAICompletions.ToolCallFunction(
             name = call.name,
-            # `raw` is set only when the arguments never parsed, and it is then the only faithful
-            # account of the call there is: serializing the empty dict instead replays it as `{}`.
-            arguments = call.raw === nothing ? JSON.json(call.arguments) : call.raw,
+            arguments = wire_arguments(call),
         )
     )
 end
@@ -450,6 +448,12 @@ function openai_completions_stop_reason(reason::Union{Nothing, String}, tool_cal
         return :stop
     elseif reason == "content_filter"
         return :content_filter
+    elseif reason == "error"
+        # `handle_sse_stream_error` sets this for a status error, and until it was read here nothing
+        # consumed it: a 400 fell through to `:stop` and was indistinguishable from a model that
+        # simply had nothing to say. A caller retrying an empty turn then retried a request the
+        # server will refuse every time. The other adapters already report `:error` for this.
+        return :error
     end
     return :stop
 end

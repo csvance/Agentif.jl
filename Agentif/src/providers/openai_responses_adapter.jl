@@ -127,8 +127,7 @@ function openai_responses_input_from_message(msg::AgentMessage, model::Model)
                     "type" => "function_call",
                     "call_id" => call_id_raw,
                     "name" => block.name,
-                    # `raw` is set only when the arguments never parsed; see `tool_call_content`.
-                    "arguments" => block.raw === nothing ? JSON.json(block.arguments) : block.raw,
+                    "arguments" => wire_arguments(block),
                 )
                 item_id !== nothing && (fc["id"] = item_id)
                 push!(parts, fc)
@@ -146,7 +145,7 @@ function openai_responses_input_from_message(msg::AgentMessage, model::Model)
                     "type" => "function_call",
                     "call_id" => call_id_raw,
                     "name" => tc.name,
-                    "arguments" => tc.arguments,
+                    "arguments" => wire_arguments(tc.arguments),
                 )
                 item_id !== nothing && (fc["id"] = item_id)
                 push!(parts, fc)

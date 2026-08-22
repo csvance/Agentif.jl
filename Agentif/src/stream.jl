@@ -206,9 +206,9 @@ RECORD, because the record is what gets replayed: an empty dict re-serializes to
 model is then shown an empty call in place of the truncated one it actually made. It cannot
 diagnose what it cannot see, and what it does instead is imitate the `{}`.
 
-So the raw text is carried alongside whenever the parse failed, and the replay paths that can send
-a string verbatim — the OpenAI-shaped APIs, where `arguments` IS a string — prefer it. Nothing is
-kept when the arguments parsed, which is every ordinary call."""
+So the raw text is carried alongside whenever the parse failed, and the replay paths hand it back
+through `wire_arguments`. Nothing is kept when the arguments parsed, which is every ordinary
+call."""
 function tool_call_content(id::AbstractString, name::AbstractString, arguments::String;
                            thoughtSignature::Union{Nothing, String} = nothing)
     parsed, raw = try
@@ -218,6 +218,41 @@ function tool_call_content(id::AbstractString, name::AbstractString, arguments::
     end
     return ToolCallContent(; id = String(id), name = String(name), arguments = parsed, raw,
                            thoughtSignature)
+end
+
+"""The key a malformed argument string is replayed under. See `wire_arguments`."""
+const MALFORMED_ARGUMENTS_KEY = "__malformed_arguments__"
+
+"""What goes on the wire for one tool call's arguments.
+
+`arguments` is a JSON string in the OpenAI-shaped APIs, and it is a string servers PARSE: vLLM
+calls `json.loads` on every one in the history to render the chat template, and answers 400 for the
+whole request when one of them fails. A `raw` string is by definition not valid JSON, so sending it
+as the arguments does not show the model what it emitted — it makes every later request in that
+conversation a 400, and poisons the conversation for good rather than for one turn. Measured against
+a vLLM Qwen endpoint: `Expecting value: line 1 column 48 (char 47)`, the exact column of the raw
+text, on every attempt until the call was abandoned.
+
+So the raw text is not sent AS the arguments. It is sent INSIDE them, under a key that says what it
+is. That is valid JSON, it survives the template, and it still shows the model the bytes it actually
+emitted in the place it emitted them — which is the whole point, and the thing an empty `{}` cannot
+do. Same endpoint, same history, with the raw text wrapped this way: 200, and the model's next call
+was well formed."""
+function wire_arguments(call::ToolCallContent)
+    call.raw === nothing && return JSON.json(call.arguments)
+    return JSON.json(Dict(MALFORMED_ARGUMENTS_KEY => call.raw))
+end
+
+"""The same guarantee for a raw argument string replayed straight from `AssistantMessage.tool_calls`,
+which is what the Responses input builder falls back to when a stored message kept no content
+blocks. Valid JSON goes out untouched, so a call that parsed is byte-identical to what arrived."""
+function wire_arguments(arguments::String)
+    try
+        JSON.parse(arguments)
+        return arguments
+    catch
+        return JSON.json(Dict(MALFORMED_ARGUMENTS_KEY => arguments))
+    end
 end
 
 function assistant_message_for_model(model::Model; response_id::Union{Nothing, String} = nothing)
