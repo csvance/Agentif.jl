@@ -118,6 +118,40 @@ function pending_tool_calls_from_message(message::AssistantMessage)
     return pending_tool_calls
 end
 
+# An already-resolved Future for a pre-built ToolResultMessage, so synthesized
+# results (e.g. an unknown tool name) flow through the same futures collection
+# as real tool executions, preserving call order.
+function resolved_tool_result_future(trm::ToolResultMessage)
+    fut = Future{ToolResultMessage}()
+    notify(fut, trm)
+    return fut
+end
+
+# Synthesizes the is_error ToolResultMessage a model receives when it calls a
+# tool whose name is not in the agent's tool list. Same shape as the execution
+# failures `call_function_tool!` already produces, so the model sees one error
+# contract and self-corrects (typically by calling the closest match) instead
+# of the turn dying with an ArgumentError out of `findtool`.
+function invalid_tool_result(agent::Agent, tc::PendingToolCall)
+    names = [String(tool.name) for tool in agent.tools]
+    suggestion = closest_tool_match(names, tc.name)
+    output = render_tool_error_json(
+        ;
+        error_kind = "invalid_tool_name",
+        message = "Unknown tool: `$(tc.name)` is not in this agent's tool list.",
+        tool = tc.name,
+        call_id = tc.call_id,
+        suggested_fix = suggestion === nothing ?
+            "Call one of the available tools listed in available_tools." :
+            "Did you mean `$suggestion`? Call that tool instead.",
+        extra = Dict{String, Any}(
+            "available_tools" => names,
+            "closest_match" => suggestion,
+        ),
+    )
+    return ToolResultMessage(tc.call_id, tc.name, output; is_error = true)
+end
+
 function call_function_tool!(f, tool::AgentTool, tc::PendingToolCall)
     return Future{ToolResultMessage}() do
         f(ToolExecutionStartEvent(tc))

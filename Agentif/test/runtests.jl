@@ -362,6 +362,199 @@ end
     @test isempty(result_state.pending_tool_calls)
 end
 
+# Unit coverage for the unknown-tool-name recovery helpers.
+@testset "tryfindtool and closest_tool_match" begin
+    tool_a = @tool "Tool a." findtool_a() = "a"
+    tool_b = @tool "Tool b." findtool_b() = "b"
+    tools = [tool_a, tool_b]
+    @test Agentif.tryfindtool(tools, "findtool_a") === tool_a
+    @test Agentif.tryfindtool(tools, "nope") === nothing
+    # findtool still throws for an unknown name (existing contract)
+    @test_throws ArgumentError Agentif.findtool(tools, "nope")
+
+    names = ["findtool_a", "findtool_b"]
+    @test Agentif.closest_tool_match(names, "findtool_a") == "findtool_a"
+    # Production failure mode: a model copied the short name out of an in-band
+    # message while the registered name carries a server prefix.
+    @test Agentif.closest_tool_match(["kaimon__check_eval", "kaimon__run_eval"], "check_eval") == "kaimon__check_eval"
+    # Substring in the other direction (model emitted a superset of the name)
+    @test Agentif.closest_tool_match(names, "findtool_a_now") == "findtool_a"
+    # Edit-distance fallback for a typo (no substring relation either way)
+    @test Agentif.closest_tool_match(names, "findtoal_a") == "findtool_a"
+    # Nothing close enough -> no suggestion rather than a misleading one
+    @test Agentif.closest_tool_match(names, "zzz") === nothing
+    @test Agentif.closest_tool_match(String[], "anything") === nothing
+end
+
+# Regression: a tool call whose name is not in the agent tool list (e.g. a
+# squad member copying `check_eval` verbatim out of an in-band Kaimon MCP
+# message while the registered name is `kaimon__check_eval`) used to throw
+# ArgumentError out of findtool and kill the whole round. It must instead come
+# back to the model as an is_error tool result listing the available tools.
+@testset "unknown tool call returns error tool result" begin
+    tool_a = @tool "First tool." unknown_tool_a() = "a"
+    tool_b = @tool "Second tool." unknown_tool_b() = "b"
+    agent = make_agent(; tools = [tool_a, tool_b])
+
+    call_counter = Ref(0)
+    inputs = Agentif.AgentTurnInput[]
+    base_handler = function (f, agent::Agent, state::AgentState, current_input::Agentif.AgentTurnInput, abort::Agentif.Abort; kw...)
+        call_counter[] += 1
+        push!(inputs, current_input)
+        msg = AssistantMessage(; provider = "test", api = "test", model = "test")
+        if call_counter[] == 1
+            # The model is told to call a nonexistent tool
+            call = AgentToolCall(; call_id = "call-unknown", name = "unknown_tool_b2", arguments = "{}")
+            push!(msg.tool_calls, call)
+        end
+        Agentif.append_state!(state, current_input, msg, Usage())
+        state.pending_tool_calls = call_counter[] == 1 ?
+            Agentif.PendingToolCall[Agentif.PendingToolCall(; call_id = "call-unknown", name = "unknown_tool_b2", arguments = "{}")] :
+            Agentif.PendingToolCall[]
+        state.most_recent_stop_reason = call_counter[] == 1 ? :tool_calls : :stop
+        return state
+    end
+    handler = tool_call_middleware(base_handler)
+    events = Agentif.AgentEvent[]
+    state = AgentState()
+    # No exception may escape; the turn must complete.
+    result_state = handler(ev -> (push!(events, ev); ev), agent, state, "go", Abort())
+    @test call_counter[] == 2
+    @test result_state.most_recent_stop_reason == :stop
+    @test isempty(result_state.pending_tool_calls)
+
+    # The error result was handed back to the model on the next call
+    @test length(inputs) == 2
+    @test inputs[2] isa Vector{ToolResultMessage}
+    tool_results = inputs[2]
+    @test length(tool_results) == 1
+    trm = tool_results[1]
+    @test trm.is_error
+    @test trm.call_id == "call-unknown"
+    @test trm.name == "unknown_tool_b2"
+    payload = JSON.parse(message_text(trm))
+    @test payload["ok"] == false
+    @test payload["error_kind"] == "invalid_tool_name"
+    @test payload["tool"] == "unknown_tool_b2"
+    @test payload["call_id"] == "call-unknown"
+    @test payload["available_tools"] == ["unknown_tool_a", "unknown_tool_b"]
+    @test payload["closest_match"] == "unknown_tool_b"
+    @test occursin("unknown_tool_b2", payload["message"])
+    @test occursin("unknown_tool_b", payload["suggested_fix"])
+
+    # The final state records the error result too.
+    trms_state = [m for m in result_state.messages if m isa ToolResultMessage]
+    @test length(trms_state) == 1
+    @test trms_state[1].is_error
+    @test trms_state[1].call_id == "call-unknown"
+
+    # Execution events are still emitted for the unknown call
+    exec_starts = [ev for ev in events if ev isa Agentif.ToolExecutionStartEvent]
+    exec_ends = [ev for ev in events if ev isa Agentif.ToolExecutionEndEvent]
+    @test length(exec_starts) == 1
+    @test length(exec_ends) == 1
+    @test exec_starts[1].tool_call.call_id == "call-unknown"
+    @test exec_ends[1].tool_call.call_id == "call-unknown"
+    @test exec_ends[1].result.is_error
+
+    # Valid tool names still execute normally in the same middleware
+    tool_echo = @tool "Echo a string." echo(text::String) = text
+    agent_c = make_agent(; tools = [tool_echo])
+    base_handler_c = make_base_handler(; with_tool_call = true)
+    handler_c = tool_call_middleware(base_handler_c)
+    result_state_c = handler_c(identity, agent_c, AgentState(), "hello", Abort())
+    @test result_state_c.most_recent_stop_reason == :stop
+    trms_c = [m for m in result_state_c.messages if m isa ToolResultMessage]
+    @test length(trms_c) == 1
+    @test !trms_c[1].is_error
+    @test message_text(trms_c[1]) == "hi"
+end
+
+# Regression for the stream side: with the real `stream` base handler and a
+# mock openai-completions server, a response naming an unregistered tool used
+# to throw ArgumentError out of the stream finalizer. The round must complete
+# and the model must receive the error tool result.
+@testset "unknown tool name survives a full stream round trip" begin
+    hits = Ref(0)
+    server = HTTP.serve!("127.0.0.1", 0) do req
+        hits[] += 1
+        body = if hits[] == 1
+            # The model calls a tool that was never registered
+            Dict(
+                "id" => "chatcmpl-1",
+                "choices" => [Dict(
+                    "index" => 0,
+                    "message" => Dict(
+                        "role" => "assistant",
+                        "content" => nothing,
+                        "tool_calls" => [Dict(
+                            "id" => "call-bad",
+                            "type" => "function",
+                            "function" => Dict("name" => "check_eval", "arguments" => "{}"),
+                        )],
+                    ),
+                    "finish_reason" => "tool_calls",
+                )],
+                "usage" => Dict("prompt_tokens" => 10, "completion_tokens" => 5, "total_tokens" => 15),
+            )
+        else
+            Dict(
+                "id" => "chatcmpl-2",
+                "choices" => [Dict(
+                    "index" => 0,
+                    "message" => Dict("role" => "assistant", "content" => "retried"),
+                    "finish_reason" => "stop",
+                )],
+                "usage" => Dict("prompt_tokens" => 12, "completion_tokens" => 3, "total_tokens" => 15),
+            )
+        end
+        return HTTP.Response(200, ["Content-Type" => "application/json"], JSON.json(body))
+    end
+    try
+        port = test_server_port(server)
+        model = Model(
+            id = "unknown-tool-test",
+            name = "unknown-tool-test",
+            api = "openai-completions",
+            provider = "test",
+            baseUrl = "http://127.0.0.1:$port",
+            reasoning = false,
+            input = ["text"],
+            cost = Dict("input" => 0.0, "output" => 0.0, "cacheRead" => 0.0, "cacheWrite" => 0.0),
+            contextWindow = 200000,
+            maxTokens = 4096,
+        )
+        kaimon_tool = @tool "Check the eval status." kaimon__check_eval() = "ok"
+        agent = Agent(
+            id = "unknown-tool-agent",
+            prompt = "test prompt",
+            model = model,
+            apikey = "test-key",
+            tools = [kaimon_tool],
+        )
+        # The full default stack: stream base handler + tool_call_middleware.
+        # No exception may escape; the model gets one more turn to retry.
+        result_state = evaluate(identity, agent, "run the check"; base_handler = Agentif.stream, compaction_config = nothing, stream = false)
+        @test hits[] == 2
+        @test result_state.most_recent_stop_reason == :stop
+        @test isempty(result_state.pending_tool_calls)
+        trms = [m for m in result_state.messages if m isa ToolResultMessage]
+        @test length(trms) == 1
+        @test trms[1].is_error
+        @test trms[1].call_id == "call-bad"
+        payload = JSON.parse(message_text(trms[1]))
+        @test payload["ok"] == false
+        @test payload["error_kind"] == "invalid_tool_name"
+        @test payload["tool"] == "check_eval"
+        @test payload["available_tools"] == ["kaimon__check_eval"]
+        @test payload["closest_match"] == "kaimon__check_eval"
+        # The assistant's final text from the retry made it through
+        @test Agentif.message_text(Agentif.last_assistant_message(result_state)) == "retried"
+    finally
+        close(server)
+    end
+end
+
 @testset "tool result truncation" begin
     # Save and override the limit for testing
     original_limit = Agentif.MAX_TOOL_RESULT_BYTES[]

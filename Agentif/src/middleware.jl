@@ -49,8 +49,18 @@ function tool_call_middleware(agent_handler::AgentHandler)
                 @debug "Agent requested tool calls" turn_id tool_call_count = length(current_state.pending_tool_calls) tool_names = [tc.name for tc in current_state.pending_tool_calls]
                 for tc in current_state.pending_tool_calls
                     check_abort(abort)
-                    tool = findtool(agent.tools, tc.name)
-                    push!(futures, call_function_tool!(f, tool, tc))
+                    tool = tryfindtool(agent.tools, tc.name)
+                    if tool === nothing
+                        # A name miss must reach the model as an error tool
+                        # result, not as an ArgumentError that kills the turn.
+                        @warn "Model called unknown tool; returning error tool result" tool = tc.name call_id = tc.call_id
+                        trm = invalid_tool_result(agent, tc)
+                        f(ToolExecutionStartEvent(tc))
+                        f(ToolExecutionEndEvent(tc, trm, 0))
+                        push!(futures, resolved_tool_result_future(trm))
+                    else
+                        push!(futures, call_function_tool!(f, tool, tc))
+                    end
                 end
                 empty!(current_state.pending_tool_calls) # pending have been moved to futures, empty
                 empty!(tool_results) # empty tool_results before we wait on futures

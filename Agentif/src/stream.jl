@@ -777,7 +777,8 @@ function stream(
                     call = AgentToolCall(; call_id, name = acc.name, arguments = args)
                     push!(assistant_message.tool_calls, call)
                     push!(assistant_message.content, tool_call_content(call_id, acc.name, args))
-                    findtool(agent.tools, call.name)
+                    tryfindtool(agent.tools, call.name) === nothing &&
+                        @debug "Model called unknown tool; error tool result will be returned" tool = call.name call_id = call_id
                     ptc = PendingToolCall(; call_id = call.call_id, name = call.name, arguments = call.arguments)
                     f(ToolCallRequestEvent(ptc))
                 end
@@ -837,7 +838,8 @@ function stream(
                     call = AgentToolCall(; call_id, name = tc.function.name, arguments = args)
                     push!(assistant_message.tool_calls, call)
                     push!(assistant_message.content, tool_call_content(call_id, tc.function.name, args))
-                    findtool(agent.tools, call.name)
+                    tryfindtool(agent.tools, call.name) === nothing &&
+                        @debug "Model called unknown tool; error tool result will be returned" tool = call.name call_id = call_id
                     ptc = PendingToolCall(; call_id = call.call_id, name = call.name, arguments = call.arguments)
                     f(ToolCallRequestEvent(ptc))
                 end
@@ -1054,7 +1056,8 @@ function stream(
                         push!(assistant_message.content, tool_block)
                         call = AgentToolCall(; call_id = block.id, name = tool_name, arguments = JSON.json(args))
                         push!(assistant_message.tool_calls, call)
-                        findtool(agent.tools, call.name)
+                        tryfindtool(agent.tools, call.name) === nothing &&
+                            @debug "Model called unknown tool; error tool result will be returned" tool = call.name call_id = call.call_id
                         ptc = PendingToolCall(; call_id = call.call_id, name = call.name, arguments = call.arguments)
                         f(ToolCallRequestEvent(ptc))
                     end
@@ -1538,7 +1541,8 @@ function stream(
                 call = AgentToolCall(; call_id = call_id, name = acc.name, arguments = args)
                 if !any(tc -> tc.call_id == call_id, assistant_message.tool_calls)
                     push!(assistant_message.tool_calls, call)
-                    findtool(agent.tools, call.name)
+                    tryfindtool(agent.tools, call.name) === nothing &&
+                        @debug "Model called unknown tool; error tool result will be returned" tool = call.name call_id = call_id
                     ptc = PendingToolCall(; call_id = call.call_id, name = call.name, arguments = call.arguments)
                     f(ToolCallRequestEvent(ptc))
                 end
