@@ -105,10 +105,20 @@ function ensure_base_dir(base_dir::AbstractString)
     return base
 end
 
-function ensure_relative_path(path::String)
+function ensure_relative_path(path::String; contained::Bool = true)
     isempty(path) && throw(ArgumentError("path is required"))
-    startswith(path, "~") && throw(ArgumentError("home paths are not allowed: $path"))
+    contained && startswith(path, "~") && throw(ArgumentError("home paths are not allowed: $path"))
     return nothing
+end
+
+# Expand a leading `~` to the current user's home. Only `~` on its own and
+# `~/rest` are resolved; `~other` names someone else's home, which the tools
+# do not look up.
+function expand_home_path(path::String)
+    path == "~" && return homedir()
+    startswith(path, "~/") && return joinpath(homedir(), path[3:end])
+    startswith(path, "~") && throw(ArgumentError("unsupported home path: $path"))
+    return path
 end
 
 # Canonicalize for containment checks: realpath the deepest existing ancestor
@@ -141,17 +151,23 @@ end
 # Resolve a tool-supplied path against the base directory. Relative paths are
 # joined to base; absolute paths are accepted as long as they stay within base
 # (models routinely pass absolute paths — rejecting them just costs a retry).
-function resolve_relative_path(base_dir::AbstractString, path::String)
-    ensure_relative_path(path)
+# With `contained = false` the within-base refusal is skipped and `~` is
+# expanded against homedir(); relative paths are still joined to base, so the
+# working directory keeps its meaning for them.
+function resolve_relative_path(base_dir::AbstractString, path::String; contained::Bool = true)
+    ensure_relative_path(path; contained = contained)
     base = abspath(base_dir)
-    resolved = isabspath(path) ? abspath(path) : abspath(joinpath(base, path))
-    is_within_base(resolved, base) || throw(ArgumentError("path resolves outside the working directory: $path"))
+    candidate = contained ? path : expand_home_path(path)
+    resolved = isabspath(candidate) ? abspath(candidate) : abspath(joinpath(base, candidate))
+    if contained
+        is_within_base(resolved, base) || throw(ArgumentError("path resolves outside the working directory: $path"))
+    end
     return resolved
 end
 
-function resolve_search_path(base_dir::AbstractString, path::Union{Nothing, String})
+function resolve_search_path(base_dir::AbstractString, path::Union{Nothing, String}; contained::Bool = true)
     local_path = (path === nothing || isempty(path)) ? "." : path
-    return resolve_relative_path(base_dir, local_path)
+    return resolve_relative_path(base_dir, local_path; contained = contained)
 end
 
 normalize_relpath(path::AbstractString) = replace(path, '\\' => '/')
@@ -159,8 +175,36 @@ normalize_relpath(path::AbstractString) = replace(path, '\\' => '/')
 # One matcher covers any directory under `base`: GitIgnore loads each directory's
 # rules on first use. `includeIgnored` asks for an unfiltered view, which is a
 # matcher holding no rules at all rather than a flag threaded through the walk.
-ignore_matcher(base::AbstractString, includeIgnored::Union{Nothing, Bool}) =
-    includeIgnored === true ? IgnoreMatcher(base, ()) : IgnoreMatcher(base)
+# A non-contained tool may resolve a path outside `base`, where the base's
+# ignore files do not apply; the matcher is then rooted at that path itself,
+# which gives it its own gitignore treatment and keeps GitIgnore happy (it
+# rejects queries that leave its root).
+function search_matcher(base::AbstractString, resolved::AbstractString, includeIgnored::Union{Nothing, Bool}; contained::Bool = true)
+    root = base
+    if !contained && !is_within_base(resolved, base)
+        root = resolved
+    end
+    return includeIgnored === true ? IgnoreMatcher(root, ()) : IgnoreMatcher(root)
+end
+
+# Model-facing scope wording for a path argument. A contained tool accepts only
+# paths that resolve inside the working directory; a non-contained one accepts
+# relative, absolute, and `~` paths alike — the operator's sandbox is the
+# boundary there, so the description must not claim working-directory-only.
+const UNCONTAINED_PATH_SCOPE =
+    "relative to the working directory, absolute, or starting with `~` (expanded to your home directory)"
+
+# `@tool` takes a literal description, so the model-facing text is written for
+# the contained default; a non-contained tool gets its wording by swapping the
+# path-scope phrase in the built tool. The phrase differs between file tools
+# ("...or absolute within it") and search tools (the bare scope), so each
+# creator passes its own. The swap is checked: if the phrase is missing the
+# text has drifted, and the throw keeps that failure loud.
+function reword_path_scope(tool::AgentTool{F, T}, old_phrase::String) where {F, T}
+    new_desc = replace(tool.description, old_phrase => UNCONTAINED_PATH_SCOPE; count = 1)
+    new_desc == tool.description && throw(ArgumentError("path scope phrase not found in $(tool.name) description"))
+    return AgentTool{F, T}(name = tool.name, description = new_desc, strict = tool.strict, func = tool.func)
+end
 
 function glob_to_regex(pattern::String)
     normalized = replace(pattern, '\\' => '/')
@@ -204,9 +248,9 @@ function strip_dir_suffix(entry::String)
     return endswith(entry, "/") ? entry[1:prevind(entry, lastindex(entry))] : entry
 end
 
-function create_read_tool(base_dir::AbstractString)
+function create_read_tool(base_dir::AbstractString; contained::Bool = true)
     base = ensure_base_dir(base_dir)
-    return @tool(
+    tool = @tool(
         """Read the contents of a file and return its text.
 
 Use `read` when you know the file path and want to see its contents. For searching across many files, use `grep` instead. For listing directory contents, use `ls`.
@@ -224,7 +268,7 @@ Examples:
 
 Errors if the file does not exist.""",
         read(path::String, offset::Union{Nothing, Int} = nothing, limit::Union{Nothing, Int} = nothing) = begin
-            resolved = resolve_relative_path(base, path)
+            resolved = resolve_relative_path(base, path; contained = contained)
             isfile(resolved) || throw(ArgumentError("file not found: $path"))
             content = Base.read(resolved, String)
             lines = split(content, "\n"; keepempty = true)
@@ -255,12 +299,13 @@ Errors if the file does not exist.""",
             return output
         end,
     )
+    return contained ? tool : reword_path_scope(tool, "relative to the working directory, or absolute within it")
 end
 
 
-function create_write_tool(base_dir::AbstractString)
+function create_write_tool(base_dir::AbstractString; contained::Bool = true)
     base = ensure_base_dir(base_dir)
-    return @tool(
+    tool = @tool(
         """Write content to a file, creating it if it doesn't exist.
 
 WARNING: This completely overwrites the file. To change specific parts of an existing file, use `edit` instead — it is safer and more precise.
@@ -273,7 +318,7 @@ Examples:
 - `write("config.toml", "[settings]\\nverbose = true")` — create a new config file
 - `write("src/new_module.jl", "module NewModule\\nend")` — create a new source file""",
         write(path::String, content::String) = begin
-            resolved = resolve_relative_path(base, path)
+            resolved = resolve_relative_path(base, path; contained = contained)
             mkpath(dirname(resolved))
             open(resolved, "w") do io
                 Base.write(io, content)
@@ -281,12 +326,13 @@ Examples:
             return "Successfully wrote $(ncodeunits(content)) bytes to $(path)"
         end,
     )
+    return contained ? tool : reword_path_scope(tool, "relative to the working directory, or absolute within it")
 end
 
 
-function create_edit_tool(base_dir::AbstractString)
+function create_edit_tool(base_dir::AbstractString; contained::Bool = true)
     base = ensure_base_dir(base_dir)
-    return @tool(
+    tool = @tool(
         """Edit a file by replacing an exact text match with new text. Preferred over `write` for modifying existing files.
 
 The match is whitespace-sensitive and must be unique — if `oldText` appears more than once in the file, the call fails. Include enough surrounding context (nearby lines) to make the match unique.
@@ -302,7 +348,7 @@ Examples:
 
 Errors if: file not found, oldText not found, oldText matches more than once, or newText equals oldText.""",
         edit(path::String, oldText::String, newText::String) = begin
-            resolved = resolve_relative_path(base, path)
+            resolved = resolve_relative_path(base, path; contained = contained)
             isfile(resolved) || throw(ArgumentError("file not found: $path"))
             content = read(resolved, String)
             occursin(oldText, content) || throw(ArgumentError("could not find the exact text in $(path)"))
@@ -323,12 +369,13 @@ Errors if: file not found, oldText not found, oldText matches more than once, or
             return "Successfully replaced text in $(path). Changed $(ncodeunits(oldText)) bytes to $(ncodeunits(newText)) bytes."
         end,
     )
+    return contained ? tool : reword_path_scope(tool, "relative to the working directory, or absolute within it")
 end
 
 
-function create_ls_tool(base_dir::AbstractString)
+function create_ls_tool(base_dir::AbstractString; contained::Bool = true)
     base = ensure_base_dir(base_dir)
-    return @tool(
+    tool = @tool(
         """List the contents of a single directory (non-recursive).
 
 Use `ls` to see what's in a directory. For recursive file search by name pattern, use `find`. For searching file contents, use `grep`.
@@ -345,9 +392,9 @@ Examples:
 - `ls("src", 20)` — list first 20 entries in src/
 - `ls("build", nothing, true)` — list build/ including gitignored entries""",
         ls(path::Union{Nothing, String}, limit::Union{Nothing, Int} = nothing, includeIgnored::Union{Nothing, Bool} = nothing) = begin
-            dir_path = resolve_search_path(base, path)
+            dir_path = resolve_search_path(base, path; contained = contained)
             isdir(dir_path) || throw(ArgumentError("not a directory: $(path === nothing ? "." : path)"))
-            matcher = ignore_matcher(base, includeIgnored)
+            matcher = search_matcher(base, dir_path, includeIgnored; contained = contained)
             # `isignored` applies git's rule that an excluded directory takes
             # everything below it, so naming an ignored directory would otherwise
             # report every entry as hidden. A caller who names a path has asked for
@@ -402,6 +449,7 @@ Examples:
             return output
         end,
     )
+    return contained ? tool : reword_path_scope(tool, "relative to the working directory")
 end
 
 function subagent_evaluate(child::Agent, input_message::String)
@@ -468,9 +516,9 @@ Gotchas:
     )
 end
 
-function create_find_tool(base_dir::AbstractString)
+function create_find_tool(base_dir::AbstractString; contained::Bool = true)
     base = ensure_base_dir(base_dir)
-    return @tool(
+    tool = @tool(
         """Recursively search for files and directories by glob pattern. Returns matching paths relative to the search directory.
 
 Use `find` to locate files by name or path pattern. For searching file contents, use `grep`. For listing a single directory, use `ls`.
@@ -489,10 +537,10 @@ Examples:
 - `find("*.o", nothing, nothing, true)` — find object files, including gitignored ones""",
         find(pattern::String, path::Union{Nothing, String} = nothing, limit::Union{Nothing, Int} = nothing, includeIgnored::Union{Nothing, Bool} = nothing) = begin
             isempty(pattern) && throw(ArgumentError("pattern is required"))
-            search_dir = resolve_search_path(base, path)
+            search_dir = resolve_search_path(base, path; contained = contained)
             isdir(search_dir) || throw(ArgumentError("not a directory: $(path === nothing ? "." : path)"))
             regex = glob_to_regex(pattern)
-            matcher = ignore_matcher(base, includeIgnored)
+            matcher = search_matcher(base, search_dir, includeIgnored; contained = contained)
             effective_limit = limit === nothing ? DEFAULT_FIND_LIMIT : max(1, limit)
             results = String[]
             limit_reached = false
@@ -542,12 +590,13 @@ Examples:
             return output
         end,
     )
+    return contained ? tool : reword_path_scope(tool, "relative to the working directory")
 end
 
 
-function create_grep_tool(base_dir::AbstractString)
+function create_grep_tool(base_dir::AbstractString; contained::Bool = true)
     base = ensure_base_dir(base_dir)
-    return @tool(
+    tool = @tool(
         """Search file contents for a text pattern. Returns matching lines with file paths and line numbers.
 
 Use `grep` to find specific text or patterns inside files. For finding files by name, use `find`. For reading a known file, use `read`.
@@ -579,7 +628,7 @@ Examples:
             includeIgnored::Union{Nothing, Bool} = nothing,
         ) = begin
             isempty(pattern) && throw(ArgumentError("pattern is required"))
-            search_path = resolve_search_path(base, path)
+            search_path = resolve_search_path(base, path; contained = contained)
             isdir(search_path) || isfile(search_path) || throw(ArgumentError("path not found: $(path === nothing ? "." : path)"))
             effective_limit = limit === nothing ? DEFAULT_GREP_LIMIT : max(1, limit)
             context_value = context === nothing ? 0 : max(0, context)
@@ -653,7 +702,7 @@ Examples:
             end
             skipped = 0
             if isdir(search_path)
-                matcher = ignore_matcher(base, includeIgnored)
+                matcher = search_matcher(base, search_path, includeIgnored; contained = contained)
                 walk = walkfiltered(matcher, search_path) do root, _dirs, files
                     for file in files
                         file_path = joinpath(root, file)
@@ -687,6 +736,7 @@ Examples:
             return output
         end,
     )
+    return contained ? tool : reword_path_scope(tool, "relative to the working directory")
 end
 
 
@@ -702,32 +752,32 @@ function insert_terminal_tools!(tools::Dict{String, AgentTool}, base_dir::Abstra
     return tools
 end
 
-function coding_tools(base_dir::AbstractString = pwd())
+function coding_tools(base_dir::AbstractString = pwd(); contained::Bool = true)
     tools = AgentTool[
-        create_read_tool(base_dir),
-        create_edit_tool(base_dir),
-        create_write_tool(base_dir),
+        create_read_tool(base_dir; contained = contained),
+        create_edit_tool(base_dir; contained = contained),
+        create_write_tool(base_dir; contained = contained),
     ]
     return append_terminal_tools!(tools, base_dir)
 end
 
-function read_only_tools(base_dir::AbstractString = pwd())
+function read_only_tools(base_dir::AbstractString = pwd(); contained::Bool = true)
     return AgentTool[
-        create_read_tool(base_dir),
-        create_grep_tool(base_dir),
-        create_find_tool(base_dir),
-        create_ls_tool(base_dir),
+        create_read_tool(base_dir; contained = contained),
+        create_grep_tool(base_dir; contained = contained),
+        create_find_tool(base_dir; contained = contained),
+        create_ls_tool(base_dir; contained = contained),
     ]
 end
 
-function all_tools(base_dir::AbstractString = pwd(); parent::Union{Nothing, Agent, Function} = nothing, workers::Bool = false)
+function all_tools(base_dir::AbstractString = pwd(); parent::Union{Nothing, Agent, Function} = nothing, workers::Bool = false, contained::Bool = true)
     tools = Dict(
-        "read" => create_read_tool(base_dir),
-        "edit" => create_edit_tool(base_dir),
-        "write" => create_write_tool(base_dir),
-        "grep" => create_grep_tool(base_dir),
-        "find" => create_find_tool(base_dir),
-        "ls" => create_ls_tool(base_dir),
+        "read" => create_read_tool(base_dir; contained = contained),
+        "edit" => create_edit_tool(base_dir; contained = contained),
+        "write" => create_write_tool(base_dir; contained = contained),
+        "grep" => create_grep_tool(base_dir; contained = contained),
+        "find" => create_find_tool(base_dir; contained = contained),
+        "ls" => create_ls_tool(base_dir; contained = contained),
     )
     parent !== nothing && (tools["subagent"] = create_subagent_tool(parent))
     insert_terminal_tools!(tools, base_dir)

@@ -39,6 +39,21 @@ function reload_skills!(registry::SkillRegistry, paths::Vector{String} = default
     return registry
 end
 
+"""Discover skill bundles under `paths`, one level deep.
+
+Flat by design (the Claude Code layout): a skill is a directory holding a `SKILL.md`
+directly under a base path. A subdirectory that also contains a `SKILL.md` is not a
+skill — it is a bundled file in the tree, reached by the model's file tools like any
+other resource a SKILL.md might reference. Recursing would silently turn such directories
+into name-claiming skills that shadow their neighbors, so the walk stays one sorted
+`readdir` per base path, exactly as it has always been.
+
+Name collisions resolve first-found-wins across the whole `paths` list, so the caller's
+path order IS the precedence order (project before user in `default_skill_dirs`, which
+is what "project skills override user skills" means in code). A shadowed duplicate and
+an unparseable or invalid bundle each warn and are skipped — one bad bundle must not
+take its neighbors down.
+"""
 function discover_skills(paths::Vector{String} = default_skill_dirs(); warn::Bool = true)
     skills = SkillMetadata[]
     seen = Dict{String, SkillMetadata}()
@@ -83,6 +98,8 @@ function create_skill_loader_tool(registry::SkillRegistry)
 
 Use this tool when you see a relevant skill listed in <available_skills> in the system prompt and need its complete instructions before executing. This is a two-step pattern: (1) identify the skill from the system prompt listing, (2) call this tool to load its full instructions.
 
+A skill is a directory, not just a file: SKILL.md plus whatever it bundles — helper scripts, reference docs, templates, or per-environment sub-skill notes. SKILL.md refers to those files with paths relative to the skill's own directory; that directory is the parent of this file's path (the <location> in the listing). Read a referenced file with your file tools at the absolute path: skill directory + the relative reference.
+
 Arguments:
 - `name::String` (required): Exact skill name in kebab-case (e.g., "code-review", "my-skill"). Must match a name from <available_skills> exactly — case-sensitive.
 
@@ -106,6 +123,17 @@ Examples:
     )
 end
 
+"""Render the <available_skills> catalog the system prompt teaches the model about.
+
+`include_location` defaults to `true` because the Agent Skills integration guide says the
+catalog carries each skill's location unless the activation tool's own result names the
+skill directory — ours returns the raw file, so the catalog is where the model learns it.
+`<location>` is the SKILL.md path; its directory is the anchor every relative resource
+reference in the skill body resolves against. A harness that opts out does so knowing the
+model then has no way to resolve those references from the catalog — the skill directory is
+otherwise only visible in the loader's truncation hint — so opting out is for harnesses that
+tell the model the skill locations by some other means.
+"""
 function build_available_skills_xml(skills; include_location::Bool = true)
     skill_list = skills isa AbstractDict ? collect(values(skills)) : collect(skills)
     sort!(skill_list, by = skill -> skill.name)
@@ -123,6 +151,8 @@ function build_available_skills_xml(skills; include_location::Bool = true)
     return join(lines, "\n")
 end
 
+"""Append the rendered <available_skills> catalog to a prompt. The `include_location`
+contract is `build_available_skills_xml`'s."""
 function append_available_skills(prompt::String, skills; include_location::Bool = true)
     xml = build_available_skills_xml(skills; include_location)
     return prompt * "\n\n" * xml

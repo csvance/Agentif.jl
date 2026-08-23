@@ -1982,6 +1982,97 @@ end
           "Do the thing, and the other thing. Invoke when the thing needs doing."
 end
 
+function write_test_skill(dir::String, name::String = basename(dir); desc::String = "test skill")
+    mkpath(dir)
+    write(joinpath(dir, "SKILL.md"), "---\nname: $name\ndescription: $desc\n---\n\nbody\n")
+end
+
+@testset "flat discovery: a nested SKILL.md is a file, not a skill" begin
+    base = mktempdir()
+    # one real bundle, plus freeform files and directories that contain a SKILL.md of
+    # their own — none of the nested ones may become a skill
+    write_test_skill(joinpath(base, "foo"))
+    write_test_skill(joinpath(base, "foo", "bar"))    # nested: a bundled file, not a skill
+    write_test_skill(joinpath(base, "foo", ".git"))   # nested hidden: never even scanned
+    mkpath(joinpath(base, "foo", "scripts"))
+    write(joinpath(base, "foo", "scripts", "run.sh"), "echo hi")
+    write(joinpath(base, "foo", "reference.md"), "bundled doc")
+    write(joinpath(base, "loose.txt"), "stray at top level")
+
+    found = Agentif.discover_skills([base]; warn = false)
+    # exactly the one top-level bundle; the nested SKILL.md directories are not discovered
+    @test [s.name for s in found] == ["foo"]
+    @test only(found).path == joinpath(base, "foo")
+    # the bundle loads exactly as before, resources or no resources
+    reg = Agentif.create_skill_registry([base]; warn = false)
+    @test Agentif.load_skill(reg, "foo") == "---\nname: foo\ndescription: test skill\n---\n\nbody\n"
+
+    # a top-level hidden dir is still scanned (the flat walk never pruned it); its name
+    # cannot pass the name rule, so it warns and is skipped, taking nothing else down
+    hbase = mktempdir()
+    write_test_skill(joinpath(hbase, ".badtop"))
+    write_test_skill(joinpath(hbase, "vis"))
+    found_h = @test_logs (:warn, "Skipping invalid skill") Agentif.discover_skills([hbase])
+    @test [s.name for s in found_h] == ["vis"]
+    @test only(found_h).path == joinpath(hbase, "vis")
+
+    # a collision across base paths: the earlier base wins, with the standing warning
+    b1 = mktempdir()
+    b2 = mktempdir()
+    write_test_skill(joinpath(b1, "foo"), "foo"; desc = "from b1")
+    write_test_skill(joinpath(b2, "foo"), "foo"; desc = "from b2")
+    let
+        found_b = @test_logs (:warn, "Skipping duplicate skill name") Agentif.discover_skills([b1, b2])
+        @test length(found_b) == 1
+        @test only(found_b).path == joinpath(b1, "foo")
+    end
+end
+
+@testset "flat discovery order and top-level contract" begin
+    base = mktempdir()
+    for n in ["b-skill", "a-skill", "c-skill"]
+        write_test_skill(joinpath(base, n), n; desc = "d-$n")
+    end
+    found = Agentif.discover_skills([base]; warn = false)
+    # top-level order is exactly what the single sorted readdir produces
+    @test [s.name for s in found] == ["a-skill", "b-skill", "c-skill"]
+    @test [s.path for s in found] == [joinpath(base, n) for n in ["a-skill", "b-skill", "c-skill"]]
+    reg = Agentif.create_skill_registry([base]; warn = false)
+    @test Agentif.load_skill(reg, "a-skill") == "---\nname: a-skill\ndescription: d-a-skill\n---\n\nbody\n"
+
+    # the order is the readdir order, not a full-path sort: "a" before "a-b"
+    # (a full-path sort would put "a-b" first, since "-" sorts before "/")
+    abase = mktempdir()
+    write_test_skill(joinpath(abase, "a"), "a")
+    write_test_skill(joinpath(abase, "a-b"), "a-b")
+    found_ab = Agentif.discover_skills([abase]; warn = false)
+    @test [s.name for s in found_ab] == ["a", "a-b"]
+end
+
+@testset "available_skills catalog location" begin
+    meta = SkillMetadata(
+        "demo",
+        "demo skill",
+        nothing,
+        nothing,
+        Dict{String, String}(),
+        nothing,
+        "/tmp/demo",
+        "/tmp/demo/SKILL.md",
+    )
+    # the default carries the location: it tells the model the skill's directory, which is
+    # the anchor every relative reference in the skill body resolves against — the same
+    # way Claude Code's model finds a skill's bundled files
+    xml = Agentif.build_available_skills_xml([meta])
+    @test occursin("<location>/tmp/demo/SKILL.md</location>", xml)
+    xml_noloc = Agentif.build_available_skills_xml([meta]; include_location = false)
+    @test !occursin("<location>", xml_noloc)
+    @test occursin("<available_skills>", Agentif.append_available_skills("base", [meta]))
+    @test !occursin(
+        "<location>",
+        Agentif.append_available_skills("base", [meta]; include_location = false))
+end
+
 @testset "skill metadata unquoting is UTF-8 safe" begin
     @test Agentif.unquote("\"café\"") == "café"
     @test Agentif.unquote("'😀'") == "😀"
