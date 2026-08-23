@@ -2180,6 +2180,66 @@ function write_test_skill(dir::String, name::String = basename(dir); desc::Strin
     write(joinpath(dir, "SKILL.md"), "---\nname: $name\ndescription: $desc\n---\n\nbody\n")
 end
 
+@testset "the unlisted pool: loadable, catalogued nowhere" begin
+    listed = mktempdir()
+    pooled = mktempdir()
+    write_test_skill(joinpath(listed, "index"); desc = "names the pooled ones")
+    write_test_skill(joinpath(pooled, "deep-one"); desc = "a long-tail page")
+    write_test_skill(joinpath(pooled, "deep-two"); desc = "another")
+
+    reg = Agentif.create_skill_registry([listed]; pool_paths = [pooled], warn = false)
+
+    # the listed tier is what a catalog sees, and the pool is absent from it
+    @test sort(collect(keys(reg.skills))) == ["index"]
+    @test sort(collect(keys(reg.pool))) == ["deep-one", "deep-two"]
+    xml = Agentif.build_available_skills_xml(values(reg.skills))
+    @test occursin("index", xml)
+    @test !occursin("deep-one", xml)
+
+    # but a pooled name loads by exact name, which is the whole point
+    @test occursin("body", Agentif.load_skill(reg, "deep-one"))
+    @test occursin("body", Agentif.load_skill(reg, "index"))
+    @test_throws ArgumentError Agentif.load_skill(reg, "never-registered")
+
+    # the loader TOOL reaches the pool too, not just the direct call
+    tool = Agentif.create_skill_loader_tool(reg)
+    @test occursin("body", tool.func("deep-two"))
+end
+
+@testset "the unlisted pool: precedence, dedup, and reload" begin
+    listed = mktempdir()
+    pooled = mktempdir()
+    write_test_skill(joinpath(listed, "both"), "both"; desc = "from the listed tier")
+    write_test_skill(joinpath(pooled, "both"), "both"; desc = "from the pool")
+    write_test_skill(joinpath(pooled, "only-pooled"); desc = "pool only")
+
+    reg = Agentif.create_skill_registry([listed]; pool_paths = [pooled], warn = false)
+    # a name claimed by the listed tier is not duplicated into the pool
+    @test !haskey(reg.pool, "both")
+    @test reg.skills["both"].description == "from the listed tier"
+    @test occursin("from the listed tier", Agentif.load_skill(reg, "both"))
+
+    # a reload with no pool_paths must NOT empty a pool the caller built
+    Agentif.reload_skills!(reg, [listed]; warn = false)
+    @test haskey(reg.pool, "only-pooled")
+    @test occursin("body", Agentif.load_skill(reg, "only-pooled"))
+
+    # and passing pool_paths rebuilds it
+    empty_dir = mktempdir()
+    Agentif.reload_skills!(reg, [listed]; pool_paths = [empty_dir], warn = false)
+    @test isempty(reg.pool)
+    @test_throws ArgumentError Agentif.load_skill(reg, "only-pooled")
+end
+
+@testset "the unlisted pool: two-argument SkillRegistry still constructs" begin
+    # every caller that predates the pool passes two positional arguments
+    meta = Agentif.SkillMetadata("demo", "d", nothing, nothing, Dict{String, String}(),
+                                 nothing, "/tmp/demo", "/tmp/demo/SKILL.md")
+    reg = Agentif.SkillRegistry(Dict("demo" => meta), Dict{String, String}())
+    @test isempty(reg.pool)
+    @test haskey(reg.skills, "demo")
+end
+
 @testset "flat discovery: a nested SKILL.md is a file, not a skill" begin
     base = mktempdir()
     # one real bundle, plus freeform files and directories that contain a SKILL.md of

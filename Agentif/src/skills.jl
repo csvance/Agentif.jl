@@ -9,10 +9,34 @@ struct SkillMetadata
     skill_file::String
 end
 
+"""A skill registry: what the loader can fetch, in two tiers.
+
+`skills` is the LISTED tier. It is what `skills_middleware` renders into `<available_skills>`,
+so every entry costs its description in the prompt on every turn.
+
+`pool` is the UNLISTED tier: loadable by exact name, catalogued nowhere. It exists because the
+two tiers have very different costs. A description is paid every turn; a body is paid only when
+loaded. A harness with a long tail of skills therefore faces a bad trade, either pay for every
+description forever or make the page unreachable, and the second is what a routing rule usually
+picks. The pool removes the choice: the tail stays fetchable at no recurring cost.
+
+The harness owes the model some way to learn a pooled name, since nothing in the prompt will
+name one. An index skill in the LISTED tier is the natural form, and progressive disclosure is
+already the standard's model for skills; this simply extends it one step, from "metadata now,
+body on activation" to "an index now, metadata and body on activation".
+
+A name present in both tiers resolves to `skills`, matching the rest of this file: the more
+deliberate placement wins.
+"""
 mutable struct SkillRegistry
     skills::Dict{String, SkillMetadata}
     loaded::Dict{String, String}
+    pool::Dict{String, SkillMetadata}
 end
+
+# Two-argument form, so every caller that predates the pool keeps working unchanged.
+SkillRegistry(skills::Dict{String, SkillMetadata}, loaded::Dict{String, String}) =
+    SkillRegistry(skills, loaded, Dict{String, SkillMetadata}())
 
 function default_skill_dirs(cwd::AbstractString = pwd())
     project_dir = joinpath(abspath(cwd), ".agentif", "skills")
@@ -20,20 +44,51 @@ function default_skill_dirs(cwd::AbstractString = pwd())
     return [project_dir, user_dir]
 end
 
-function create_skill_registry(paths::Vector{String} = default_skill_dirs(); warn::Bool = true)
-    skills = discover_skills(paths; warn)
+"""Build a registry from `paths` (listed) and, optionally, `pool_paths` (loadable, unlisted).
+
+A bundle discovered under both is LISTED only, never duplicated into the pool, so `pool` holds
+exactly the names that no catalog will mention.
+"""
+function create_skill_registry(paths::Vector{String} = default_skill_dirs();
+                               pool_paths::Vector{String} = String[], warn::Bool = true)
     skill_map = Dict{String, SkillMetadata}()
-    for skill in skills
+    for skill in discover_skills(paths; warn)
         skill_map[skill.name] = skill
     end
-    return SkillRegistry(skill_map, Dict{String, String}())
+    return SkillRegistry(skill_map, Dict{String, String}(),
+                         _discover_pool(pool_paths, skill_map; warn))
 end
 
-function reload_skills!(registry::SkillRegistry, paths::Vector{String} = default_skill_dirs(); warn::Bool = true)
+"""The unlisted tier, minus anything the listed tier already claims."""
+function _discover_pool(pool_paths::Vector{String}, listed::Dict{String, SkillMetadata};
+                        warn::Bool = true)
+    pool = Dict{String, SkillMetadata}()
+    isempty(pool_paths) && return pool
+    for skill in discover_skills(pool_paths; warn)
+        haskey(listed, skill.name) || (pool[skill.name] = skill)
+    end
+    return pool
+end
+
+"""Rediscover the listed tier. `pool_paths === nothing` leaves the unlisted tier untouched,
+which is what keeps this from silently emptying a pool a caller built by hand; pass a vector to
+rebuild it too.
+"""
+function reload_skills!(registry::SkillRegistry, paths::Vector{String} = default_skill_dirs();
+                        pool_paths::Union{Nothing, Vector{String}} = nothing, warn::Bool = true)
     skills = discover_skills(paths; warn)
     empty!(registry.skills)
     for skill in skills
         registry.skills[skill.name] = skill
+    end
+    if pool_paths !== nothing
+        empty!(registry.pool)
+        merge!(registry.pool, _discover_pool(pool_paths, registry.skills; warn))
+    else
+        # A name that just became listed must not also sit in the pool.
+        for name in collect(keys(registry.pool))
+            haskey(registry.skills, name) && delete!(registry.pool, name)
+        end
     end
     empty!(registry.loaded)
     return registry
@@ -80,8 +135,14 @@ function discover_skills(paths::Vector{String} = default_skill_dirs(); warn::Boo
     return skills
 end
 
+"""Load a skill's `SKILL.md` by exact name, from the listed tier or the unlisted pool.
+
+Listed wins a name present in both. The pool is checked second and silently, so a caller that
+never populated one behaves exactly as before.
+"""
 function load_skill(registry::SkillRegistry, name::String; refresh::Bool = false)
     meta = get(() -> nothing, registry.skills, name)
+    meta === nothing && (meta = get(() -> nothing, registry.pool, name))
     meta === nothing && throw(ArgumentError("unknown skill: $name"))
     if !refresh
         cached = get(() -> nothing, registry.loaded, name)
@@ -98,19 +159,23 @@ function create_skill_loader_tool(registry::SkillRegistry)
 
 Use this tool when you see a relevant skill listed in <available_skills> in the system prompt and need its complete instructions before executing. This is a two-step pattern: (1) identify the skill from the system prompt listing, (2) call this tool to load its full instructions.
 
+<available_skills> is not necessarily the whole set. A harness may keep further skills loadable but uncatalogued, to avoid spending prompt space on a long tail, and it is then expected to tell you their names some other way, typically an index skill that lists them. So if you have a name from such an index, or from another skill's text, pass it: this tool resolves any skill the harness registered, listed or not. Do not guess names, and do not treat absence from <available_skills> as proof a skill does not exist.
+
 A skill is a directory, not just a file: SKILL.md plus whatever it bundles — helper scripts, reference docs, templates, or per-environment sub-skill notes. SKILL.md refers to those files with paths relative to the skill's own directory; that directory is the parent of this file's path (the <location> in the listing). Read a referenced file with your file tools at the absolute path: skill directory + the relative reference.
 
 Arguments:
-- `name::String` (required): Exact skill name in kebab-case (e.g., "code-review", "my-skill"). Must match a name from <available_skills> exactly — case-sensitive.
+- `name::String` (required): Exact skill name in kebab-case (e.g., "code-review", "my-skill"). Case-sensitive, and matched exactly: a name from <available_skills>, or any other registered name you have been given.
 
 Throws `ArgumentError` if the skill name is not found. Output may be truncated for very large skill files; if so, the response includes a hint for loading more content via the read tool with offset/limit.
 
 Examples:
 - `skill_loader("code-review")` — load full instructions for the code-review skill
-- `skill_loader("deploy-staging")` — load instructions before executing a deployment skill""",
+- `skill_loader("deploy-staging")` — load instructions before executing a deployment skill
+- `skill_loader("nitro-metrics")`: load a skill an index named, which <available_skills> did not""",
         skill_loader(name::String) = begin
             content = load_skill(registry, name)
             meta = get(() -> nothing, registry.skills, name)
+            meta === nothing && (meta = get(() -> nothing, registry.pool, name))
             max_bytes = MAX_TOOL_RESULT_BYTES[]
             if max_bytes > 0 && sizeof(content) > max_bytes
                 hint = meta === nothing ? "" :
