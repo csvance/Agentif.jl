@@ -4337,6 +4337,37 @@ end
           Dict(Agentif.MALFORMED_ARGUMENTS_KEY => truncated)
 end
 
+@testset "an empty tool result is not described as an attached image" begin
+    # Every empty result (empty grep, command with no stdout, stripped println) used to reach the
+    # model as "(see attached image)" with no image anywhere. In one squad run that hit all three
+    # member roles 13 times and produced a "bash is broken" diagnosis of a healthy tool.
+    model = dummy_model()
+    agent = Agent(prompt = "p", model = model, apikey = "k")
+    state = AgentState()
+    push!(state.messages, Agentif.UserMessage([Agentif.TextContent(; text = "go")]))
+    push!(state.messages, AssistantMessage(;
+        provider = model.provider, api = model.api, model = model.id,
+        content = Agentif.AssistantContentBlock[],
+        tool_calls = [Agentif.AgentToolCall(; call_id = "empty-1", name = "bash",
+                                            arguments = "{\"command\":\"true\"}")]))
+    messages, _ = Agentif.openai_completions_build_messages(agent, state, [Agentif.ToolResultMessage(;
+        call_id = "empty-1", name = "bash", content = Agentif.ToolResultContentBlock[], is_error = false)], model)
+    tool_msg = only(m for m in messages if m.role == "tool")
+    @test tool_msg.content == Agentif.empty_tool_result_placeholder(false)
+    @test !occursin("image", tool_msg.content)
+
+    # The image wording survives only when an image block is actually attached and the model takes images.
+    @test Agentif.empty_tool_result_placeholder(true) == "(see attached image)"
+    img_result = Agentif.ToolResultMessage(; call_id = "img-1", name = "describe",
+        content = Agentif.ToolResultContentBlock[Agentif.ImageContent(; data = "AA==", mimeType = "image/png")],
+        is_error = false)
+    blocks = Agentif.anthropic_tool_result_content(img_result.content)
+    @test first(blocks).text == "(see attached image)"
+    # Text-only results travel as a plain string on this API, so an empty one is the placeholder string.
+    @test Agentif.anthropic_tool_result_content(Agentif.ToolResultContentBlock[]) ==
+          Agentif.empty_tool_result_placeholder(false)
+end
+
 @testset "truncation outranks the tool calls in a stop reason" begin
     # A generation cut off mid-call still arrives AS a tool call. Reporting `:tool_calls` for it
     # threw away the one signal that said why the arguments were malformed.

@@ -358,16 +358,17 @@ function openai_completions_build_messages(agent::Agent, state::AgentState, inpu
             while j <= length(transformed) && transformed[j] isa ToolResultMessage
                 tool_msg = transformed[j]::ToolResultMessage
                 text_result = provider_tool_result_output(tool_msg)
-                has_text = !isempty(text_result)
+                has_image = any(block -> block isa ImageContent && "image" in model.input, tool_msg.content)
+                content = isempty(text_result) ? empty_tool_result_placeholder(has_image) : text_result
                 tool_result_msg = OpenAICompletions.Message(;
                     role = "tool",
-                    content = has_text ? text_result : "(see attached image)",
+                    content,
                     tool_call_id = tool_msg.call_id,
                 )
                 if compat.requiresToolResultName
                     tool_result_msg = OpenAICompletions.Message(;
                         role = "tool",
-                        content = has_text ? text_result : "(see attached image)",
+                        content,
                         tool_call_id = tool_msg.call_id,
                         name = tool_msg.name,
                     )

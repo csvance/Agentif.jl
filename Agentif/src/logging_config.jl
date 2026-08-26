@@ -73,6 +73,17 @@ function render_tool_error_json(
     return JSON.json(payload)
 end
 
+"""
+    empty_tool_result_placeholder(has_image::Bool) -> String
+
+What a provider adapter sends in place of a tool result that carried no text. The two cases must
+read differently: a result whose only payload is an image is described as such, while a result with
+nothing at all (an empty grep, a command with no stdout, a stripped `println`) is stated plainly, so
+the model never infers a phantom image or a broken tool from an ordinary empty output.
+"""
+empty_tool_result_placeholder(has_image::Bool) =
+    has_image ? "(see attached image)" : "(the tool returned no output)"
+
 function provider_tool_result_output(result::ToolResultMessage)
     output = message_text(result)
     result.is_error || return output

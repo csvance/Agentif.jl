@@ -115,7 +115,7 @@ function google_build_contents(P::Module, agent::Agent, state::AgentState, input
             text_result = join(text_blocks, "\n")
             has_text = !isempty(text_result)
             has_images = !isempty(image_blocks)
-            response_value = has_text ? text_result : (has_images ? "(see attached image)" : "")
+            response_value = has_text ? text_result : empty_tool_result_placeholder(has_images)
             image_parts = P.Part[
                 P.Part(; inlineData = P.InlineData(; mimeType = block.mimeType, data = block.data)) for block in image_blocks
             ]

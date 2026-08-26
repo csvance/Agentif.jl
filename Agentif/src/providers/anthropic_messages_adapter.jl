@@ -26,7 +26,8 @@ function anthropic_tool_result_content(blocks::Vector{ToolResultContentBlock})
         for block in blocks
             block isa TextContent && push!(parts, block.text)
         end
-        return join(parts, "\n")
+        joined = join(parts, "\n")
+        return isempty(joined) ? empty_tool_result_placeholder(false) : joined
     end
     content = AnthropicMessages.ToolResultContentBlock[]
     for block in blocks
@@ -38,7 +39,8 @@ function anthropic_tool_result_content(blocks::Vector{ToolResultContentBlock})
         end
     end
     has_text = any(block -> block isa AnthropicMessages.TextBlock, content)
-    has_text || pushfirst!(content, AnthropicMessages.TextBlock(; text = "(see attached image)"))
+    has_image = any(block -> block isa AnthropicMessages.ImageBlock, content)
+    has_text || pushfirst!(content, AnthropicMessages.TextBlock(; text = empty_tool_result_placeholder(has_image)))
     return content
 end
 
