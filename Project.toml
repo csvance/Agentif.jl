@@ -30,7 +30,6 @@ Agentif = {path = "Agentif"}
 Claw = {path = "Claw"}
 ConcurrentUtilities = {rev = "main", url = "https://github.com/JuliaServices/ConcurrentUtilities.jl.git"}
 Encid = {url = "https://github.com/JuliaServices/Encid.jl.git"}
-GitIgnore = {rev = "b409dc1eced184f284122d44bdd8e79b3f2feb1d", url = "https://github.com/csvance/GitIgnore.jl.git"}
 HTTP = {rev = "master", url = "https://github.com/JuliaWeb/HTTP.jl.git"}
 JSONSchema = {rev = "4076c12e69f8191b611580744c42579f95e92974", url = "https://github.com/JuliaIO/JSONSchema.jl.git"}
 Juco = {path = "Juco"}
@@ -49,4 +48,5 @@ Telegram = {url = "https://github.com/quinnj/Telegram.jl.git"}
 Tempus = {rev = "main", url = "https://github.com/JuliaServices/Tempus.jl.git"}
 
 [compat]
+GitIgnore = "0.1"
 julia = "1.11"

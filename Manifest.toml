@@ -2,7 +2,7 @@
 
 julia_version = "1.12.6"
 manifest_format = "2.0"
-project_hash = "e7080bcdf9b8b6bcc0c0813023db56961cc498a9"
+project_hash = "8d8275f138e377607d14fe470b0ff19f3bd08696"
 
 [[deps.AbstractStores]]
 deps = ["Base64", "Dates", "Serialization"]
@@ -158,11 +158,9 @@ uuid = "bc5e4493-9b4d-5f90-b8aa-2b2bcaad7a26"
 version = "5.13.0"
 
 [[deps.GitIgnore]]
-git-tree-sha1 = "35ddd9dfe497f8ca97ea35232960a641b009a7e8"
-repo-rev = "b409dc1eced184f284122d44bdd8e79b3f2feb1d"
-repo-url = "https://github.com/csvance/GitIgnore.jl.git"
+git-tree-sha1 = "55daea4f28753322302c1ccf03990cf6e9502264"
 uuid = "a0010394-fc0d-43eb-a3e0-33caa976912f"
-version = "0.1.0"
+version = "0.1.1"
 
 [[deps.HTTP]]
 deps = ["Base64", "CodecZlib", "Dates", "EnumX", "PrecompileTools", "Random", "Reseau", "SHA", "URIs", "UUIDs", "Zlib_jll"]
